@@ -110,10 +110,13 @@ class Registry:
     @classmethod
     def from_environment(cls) -> Registry:
         state_home = os.environ.get("XDG_STATE_HOME")
-        if state_home:
-            root = Path(state_home).expanduser()
+        if state_home and Path(state_home).is_absolute():
+            root = Path(state_home)
         else:
-            root = Path.home() / ".local" / "state"
+            home = Path.home()
+            if not home.is_absolute():
+                raise RegistryError("HOME must be an absolute path")
+            root = home / ".local" / "state"
         return cls(root / "fangorn" / "registry.sqlite3")
 
     def adopt(self, observation: WorktreeObservation) -> tuple[WorkspaceRecord, bool]:

@@ -30,6 +30,7 @@ def run_fangorn(
     state_home: Path,
     *arguments: str,
     environment_overrides: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["XDG_STATE_HOME"] = str(state_home)
@@ -43,6 +44,7 @@ def run_fangorn(
         capture_output=True,
         text=True,
         env=environment,
+        cwd=cwd,
     )
 
 
@@ -570,6 +572,66 @@ def test_human_output_escapes_terminal_controls_but_json_stays_exact(
     workspace = cast(dict[str, object], cast(list[object], payload["workspaces"])[0])
     assert workspace["path"] == unsafe_path
     assert workspace["branch"] == unsafe_branch
+
+
+def test_cli_errors_escape_terminal_controls_for_every_command(tmp_path: Path) -> None:
+    unsafe_suffix = "line\nansi\x1b[31m"
+    missing = tmp_path / f"missing-{unsafe_suffix}"
+    adopt_error = run_fangorn(tmp_path / "adopt-state", "adopt", "--json", str(missing))
+
+    repository = tmp_path / f"repository-{unsafe_suffix}"
+    create_repository(repository)
+    info_error = run_fangorn(tmp_path / "info-state", "info", "--json", str(repository))
+
+    list_state = tmp_path / f"state-{unsafe_suffix}"
+    list_state.mkdir()
+    (list_state / "fangorn").write_text("not a directory\n", encoding="utf-8")
+    list_error = run_fangorn(list_state, "list", "--json")
+
+    for result in (adopt_error, info_error, list_error):
+        assert result.returncode != 0
+        assert result.stdout == ""
+        assert "\\x0a" in result.stderr
+        assert "\\x1b" in result.stderr
+        assert "\x1b" not in result.stderr
+        assert result.stderr.count("\n") == 1
+        assert "Traceback" not in result.stderr
+
+
+def test_relative_xdg_state_home_uses_home_fallback_across_working_directories(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    first_cwd = tmp_path / "first-cwd"
+    second_cwd = tmp_path / "second-cwd"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    home = tmp_path / "home"
+    environment = {"XDG_STATE_HOME": "relative-state", "HOME": str(home)}
+
+    adopted = run_fangorn(
+        tmp_path / "unused-state",
+        "adopt",
+        "--json",
+        str(repository),
+        environment_overrides=environment,
+        cwd=first_cwd,
+    )
+    inspected = run_fangorn(
+        tmp_path / "unused-state",
+        "info",
+        "--json",
+        str(repository),
+        environment_overrides=environment,
+        cwd=second_cwd,
+    )
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert inspected.returncode == 0, inspected.stderr
+    assert (home / ".local" / "state" / "fangorn" / "registry.sqlite3").is_file()
+    assert not (first_cwd / "relative-state").exists()
+    assert not (second_cwd / "relative-state").exists()
 
 
 def test_registry_migration_enforces_immutable_binding_and_foreign_keys(

@@ -29,7 +29,7 @@ def adopt(path: Path, as_json: bool) -> None:
         observation = observe_worktree(path)
         workspace, created = Registry.from_environment().adopt(observation)
     except (GitError, RegistryError) as error:
-        raise click.ClickException(str(error)) from error
+        raise click.ClickException(_human(str(error))) from error
 
     if as_json:
         _echo_json(
@@ -58,7 +58,7 @@ def info(path: Path, as_json: bool) -> None:
         observation = observe_worktree(path)
         workspace = Registry.from_environment().get_by_worktree(observation)
     except (GitError, RegistryError) as error:
-        raise click.ClickException(str(error)) from error
+        raise click.ClickException(_human(str(error))) from error
 
     if as_json:
         _echo_json({"schema_version": 1, "workspace": workspace.as_dict()})
@@ -82,7 +82,7 @@ def list_workspaces(as_json: bool, as_ndjson: bool) -> None:
     try:
         workspaces = Registry.from_environment().list_workspaces()
     except RegistryError as error:
-        raise click.ClickException(str(error)) from error
+        raise click.ClickException(_human(str(error))) from error
 
     if as_json:
         _echo_json(
