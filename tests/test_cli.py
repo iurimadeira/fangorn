@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -19,11 +20,17 @@ def fangorn_executable() -> Path:
     return executable
 
 
-def run_fangorn(state_home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def run_fangorn(
+    state_home: Path,
+    *arguments: str,
+    environment_overrides: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["XDG_STATE_HOME"] = str(state_home)
     environment["HOME"] = str(state_home.parent / "home")
     environment.pop("XDG_CONFIG_HOME", None)
+    if environment_overrides is not None:
+        environment.update(environment_overrides)
     return subprocess.run(
         [fangorn_executable(), *arguments],
         check=False,
@@ -110,6 +117,183 @@ def test_adopt_json_binds_and_reuses_git_identity(tmp_path: Path) -> None:
     assert (state_home / "fangorn" / "registry.sqlite3").is_file()
     assert git(repository, "status", "--porcelain") == ""
     assert git(repository, "rev-parse", "HEAD") == adopted_head
+
+
+def test_adopt_target_wins_over_inherited_repository_git_environment(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target_head = create_repository(target)
+    contaminating_repository = tmp_path / "contaminating"
+    create_repository(contaminating_repository)
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "adopt",
+        "--json",
+        str(target),
+        environment_overrides={
+            "GIT_DIR": str(contaminating_repository / ".git"),
+            "GIT_WORK_TREE": str(contaminating_repository),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = cast(dict[str, object], json.loads(result.stdout))
+    workspace = cast(dict[str, object], payload["workspace"])
+    assert workspace["path"] == str(target.resolve())
+    assert workspace["git_dir"] == str((target / ".git").resolve())
+    assert workspace["head"] == target_head
+
+
+def test_adopt_preserves_whitespace_in_git_reported_paths(tmp_path: Path) -> None:
+    repository = tmp_path / "  repository  "
+    create_repository(repository)
+
+    result = run_fangorn(tmp_path / "state", "adopt", "--json", str(repository))
+
+    assert result.returncode == 0, result.stderr
+    payload = cast(dict[str, object], json.loads(result.stdout))
+    workspace = cast(dict[str, object], payload["workspace"])
+    assert workspace["path"] == str(repository.resolve())
+    assert workspace["git_dir"] == str((repository / ".git").resolve())
+
+
+def test_adopt_revalidates_a_deterministic_concurrent_branch_change(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    wrapper_directory = tmp_path / "bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "git"
+    marker = tmp_path / "branch-changed"
+    real_git = subprocess.run(
+        ["sh", "-c", "command -v git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wrapper.write_text(
+        """#!/bin/sh
+if [ "$*" = "-C $FANGORN_TEST_REPOSITORY rev-parse HEAD" ] \
+    && [ ! -e "$FANGORN_TEST_MARKER" ]; then
+    "$FANGORN_TEST_REAL_GIT" "$@"
+    : > "$FANGORN_TEST_MARKER"
+    "$FANGORN_TEST_REAL_GIT" -C "$FANGORN_TEST_REPOSITORY" branch -m observed-later
+    exit 0
+fi
+exec "$FANGORN_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "adopt",
+        "--json",
+        str(repository),
+        environment_overrides={
+            "PATH": f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}",
+            "FANGORN_TEST_MARKER": str(marker),
+            "FANGORN_TEST_REAL_GIT": real_git,
+            "FANGORN_TEST_REPOSITORY": str(repository),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = cast(dict[str, object], json.loads(result.stdout))
+    workspace = cast(dict[str, object], payload["workspace"])
+    assert marker.is_file()
+    assert workspace["branch"] == "observed-later"
+    assert git(repository, "branch", "--show-current") == "observed-later"
+
+
+def test_adopt_reports_symbolic_ref_and_subprocess_os_failures(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    wrapper_directory = tmp_path / "wrapper-bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "git"
+    real_git = subprocess.run(
+        ["sh", "-c", "command -v git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wrapper.write_text(
+        """#!/bin/sh
+case "$*" in
+    *"symbolic-ref --quiet --short HEAD")
+        echo "forced symbolic-ref failure" >&2
+        exit 2
+        ;;
+esac
+exec "$FANGORN_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    symbolic_ref_failure = run_fangorn(
+        tmp_path / "state-symbolic",
+        "adopt",
+        str(repository),
+        environment_overrides={
+            "PATH": f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}",
+            "FANGORN_TEST_REAL_GIT": real_git,
+        },
+    )
+
+    assert symbolic_ref_failure.returncode != 0
+    assert symbolic_ref_failure.stdout == ""
+    assert "forced symbolic-ref failure" in symbolic_ref_failure.stderr
+
+    blocked_directory = tmp_path / "blocked-bin"
+    blocked_directory.mkdir()
+    blocked_git = blocked_directory / "git"
+    blocked_git.write_text("not executable\n", encoding="utf-8")
+    blocked_git.chmod(0o644)
+    os_failure = run_fangorn(
+        tmp_path / "state-os",
+        "adopt",
+        str(repository),
+        environment_overrides={"PATH": str(blocked_directory)},
+    )
+
+    assert os_failure.returncode != 0
+    assert os_failure.stdout == ""
+    assert "Cannot run Git: Permission denied" in os_failure.stderr
+
+
+def test_adopt_represents_only_detached_head_as_no_branch(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    git(repository, "checkout", "--detach")
+
+    result = run_fangorn(tmp_path / "state", "adopt", "--json", str(repository))
+
+    assert result.returncode == 0, result.stderr
+    payload = cast(dict[str, object], json.loads(result.stdout))
+    workspace = cast(dict[str, object], payload["workspace"])
+    assert workspace["branch"] is None
+
+
+def test_adopt_distinguishes_missing_paths_from_resolution_failures(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    missing_result = run_fangorn(tmp_path / "state-missing", "adopt", str(missing))
+    assert missing_result.returncode != 0
+    assert "Path does not exist" in missing_result.stderr
+
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    loop_result = run_fangorn(tmp_path / "state-loop", "adopt", str(loop))
+    assert loop_result.returncode != 0
+    assert loop_result.stdout == ""
+    assert "Cannot resolve path" in loop_result.stderr
 
 
 def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -> None:
