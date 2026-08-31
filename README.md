@@ -48,6 +48,12 @@ Pass another worktree path to `adopt` or `info`. Adoption is idempotent: an
 equivalent retry returns the existing Workspace instead of creating another
 identity.
 
+Fangorn records the Git administrative directory's filesystem device and inode
+as a non-mutating generation witness. It refuses a later directory instance at
+the same canonical path. A filesystem that reuses both values after deletion
+can defeat that witness; Fangorn does not write marker files into Git metadata
+to manufacture a stronger identity.
+
 Human-readable output is the default. `adopt` and `info` accept `--json`;
 `list` accepts `--json` or `--ndjson`. Every machine record includes
 `schema_version: 1`, and errors go to stderr with a nonzero exit status.

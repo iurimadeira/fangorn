@@ -7,11 +7,15 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 from uuid import UUID
 
 import pytest
+
+from fangorn.git import observe_worktree
+from fangorn.registry import Registry
 
 
 def fangorn_executable() -> Path:
@@ -332,6 +336,78 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     assert "Worktree is not adopted" in unregistered.stderr
 
 
+def test_recreated_linked_worktree_admin_directory_is_ambiguous(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    linked = tmp_path / "linked"
+    git(repository, "worktree", "add", "-b", "first-generation", str(linked))
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(linked))
+    assert adopted.returncode == 0, adopted.stderr
+    adopted_payload = cast(dict[str, object], json.loads(adopted.stdout))
+    adopted_workspace = cast(dict[str, object], adopted_payload["workspace"])
+    old_generation = adopted_workspace["git_dir_generation"]
+    old_observed_at = adopted_workspace["last_observed_at"]
+    old_git_dir = cast(str, adopted_workspace["git_dir"])
+
+    git(repository, "worktree", "remove", str(linked))
+    git(repository, "worktree", "prune", "--expire", "now")
+    git(repository, "branch", "-D", "first-generation")
+    for index in range(8):
+        (tmp_path / f"inode-consumer-{index}").mkdir()
+    git(repository, "worktree", "add", "-b", "second-generation", str(linked))
+    new_git_dir = git(linked, "rev-parse", "--path-format=absolute", "--git-dir")
+    metadata = Path(new_git_dir).stat()
+    new_generation = f"{metadata.st_dev}:{metadata.st_ino}"
+    assert new_git_dir == old_git_dir
+    assert new_generation != old_generation
+
+    inspected = run_fangorn(state_home, "info", "--json", str(linked))
+    readopted = run_fangorn(state_home, "adopt", "--json", str(linked))
+
+    for result in (inspected, readopted):
+        assert result.returncode != 0
+        assert result.stdout == ""
+        assert "generation changed" in result.stderr
+        assert "ambiguous" in result.stderr
+    listed = run_fangorn(state_home, "list", "--json")
+    listed_payload = cast(dict[str, object], json.loads(listed.stdout))
+    listed_workspace = cast(
+        dict[str, object], cast(list[object], listed_payload["workspaces"])[0]
+    )
+    assert listed_workspace["git_dir_generation"] == old_generation
+    assert listed_workspace["last_observed_at"] == old_observed_at
+    assert listed_workspace["branch"] == "first-generation"
+
+
+def test_older_observation_cannot_overwrite_newer_workspace_facts(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    older = replace(
+        observe_worktree(repository), observed_at="2026-01-01T00:00:00.000001Z"
+    )
+    created, was_created = registry.adopt(older)
+    assert was_created is True
+    assert created.last_observed_at == older.observed_at
+    git(repository, "branch", "-m", "newer-branch")
+    newer = replace(
+        observe_worktree(repository), observed_at="2026-01-01T00:00:00.000002Z"
+    )
+
+    refreshed = registry.get_by_worktree(newer)
+    reversed_write = registry.get_by_worktree(older)
+
+    assert refreshed.branch == "newer-branch"
+    assert refreshed.last_observed_at == newer.observed_at
+    assert reversed_write.branch == "newer-branch"
+    assert reversed_write.head == newer.head
+    assert reversed_write.path == str(newer.path)
+    assert reversed_write.last_observed_at == newer.observed_at
+
+
 def test_list_emits_deterministic_human_json_and_ndjson(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -389,6 +465,10 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
     state_home = tmp_path / "state"
     adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
     assert adopted.returncode == 0, adopted.stderr
+    other_repository = tmp_path / "other-repository"
+    create_repository(other_repository)
+    other_adopted = run_fangorn(state_home, "adopt", "--json", str(other_repository))
+    assert other_adopted.returncode == 0, other_adopted.stderr
     database = state_home / "fangorn" / "registry.sqlite3"
 
     connection = sqlite3.connect(database)
@@ -397,37 +477,98 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall() == [(1,)]
+        repository_columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(repositories)")
+        }
+        workspace_columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(workspaces)")
+        }
+        assert repository_columns["id"][3] == 1
+        assert workspace_columns["id"][3] == 1
+        repositories = connection.execute(
+            "SELECT id, git_common_dir FROM repositories ORDER BY git_common_dir"
+        ).fetchall()
+        assert len(repositories) == 2
         workspace = connection.execute(
             """
-            SELECT repository_id, git_dir, path, head
+            SELECT id, repository_id, git_dir, git_dir_generation, path, head
             FROM workspaces
-            """
+            WHERE path = ?
+            """,
+            (str(repository.resolve()),),
         ).fetchone()
         assert workspace is not None
-        repository_id, git_dir, path, head = workspace
+        workspace_id, repository_id, git_dir, _generation, path, head = workspace
+        other_repository_id = next(
+            row[0] for row in repositories if row[0] != repository_id
+        )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
                 INSERT INTO workspaces (
-                    id, repository_id, git_dir, path, branch, head,
+                    id, repository_id, git_dir, git_dir_generation,
+                    path, branch, head,
                     adopted_head, created_at, last_observed_at
-                ) VALUES ('duplicate', ?, ?, ?, 'main', ?, ?, 'now', 'now')
+                ) VALUES (
+                    'duplicate', ?, ?, 'different-generation', ?,
+                    'main', ?, ?, 'now', 'now'
+                )
                 """,
-                (repository_id, git_dir, path, head, head),
+                (other_repository_id, git_dir, path, head, head),
             )
         connection.rollback()
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
                 INSERT INTO workspaces (
-                    id, repository_id, git_dir, path, branch, head,
+                    id, repository_id, git_dir, git_dir_generation,
+                    path, branch, head,
                     adopted_head, created_at, last_observed_at
                 ) VALUES (
-                    'orphan', 'missing', '/git/orphan', '/worktree/orphan',
-                    NULL, 'head', 'head', 'now', 'now'
+                    'orphan', 'missing', '/git/orphan', '1:2',
+                    '/worktree/orphan', NULL, 'head', 'head', 'now', 'now'
                 )
                 """
             )
+        connection.rollback()
+        workspace_updates = (
+            ("id", "changed-id"),
+            ("repository_id", other_repository_id),
+            ("git_dir", "/different/git-dir"),
+            ("git_dir_generation", "different-generation"),
+        )
+        for column, value in workspace_updates:
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(
+                    f"UPDATE workspaces SET {column} = ? WHERE id = ?",
+                    (value, workspace_id),
+                )
+            connection.rollback()
+        repository_common_dir = next(
+            row[1] for row in repositories if row[0] == repository_id
+        )
+        for column, value in (
+            ("id", "changed-repository-id"),
+            ("git_common_dir", f"{repository_common_dir}-changed"),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(
+                    f"UPDATE repositories SET {column} = ? WHERE id = ?",
+                    (value, repository_id),
+                )
+            connection.rollback()
+        unique_indexes = []
+        for index in connection.execute("PRAGMA index_list(workspaces)").fetchall():
+            if index[2] != 1:
+                continue
+            columns = [
+                row[2]
+                for row in connection.execute(
+                    f"PRAGMA index_info('{index[1]}')"
+                ).fetchall()
+            ]
+            unique_indexes.append(columns)
+        assert ["repository_id", "git_dir"] not in unique_indexes
     finally:
         connection.close()
 

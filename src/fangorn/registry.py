@@ -25,6 +25,7 @@ class WorkspaceRecord:
     repository_id: str
     repository_common_dir: str
     git_dir: str
+    git_dir_generation: str
     path: str
     branch: str | None
     head: str
@@ -38,6 +39,7 @@ class WorkspaceRecord:
             "repository_id": self.repository_id,
             "repository_common_dir": self.repository_common_dir,
             "git_dir": self.git_dir,
+            "git_dir_generation": self.git_dir_generation,
             "path": self.path,
             "branch": self.branch,
             "head": self.head,
@@ -53,24 +55,47 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         (
             """
             CREATE TABLE repositories (
-                id TEXT PRIMARY KEY,
+                id TEXT PRIMARY KEY NOT NULL,
                 git_common_dir TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL
             )
             """,
             """
             CREATE TABLE workspaces (
-                id TEXT PRIMARY KEY,
+                id TEXT PRIMARY KEY NOT NULL,
                 repository_id TEXT NOT NULL REFERENCES repositories(id),
                 git_dir TEXT NOT NULL UNIQUE,
+                git_dir_generation TEXT NOT NULL,
                 path TEXT NOT NULL,
                 branch TEXT,
                 head TEXT NOT NULL,
                 adopted_head TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                last_observed_at TEXT NOT NULL,
-                UNIQUE (repository_id, git_dir)
+                last_observed_at TEXT NOT NULL
             )
+            """,
+            """
+            CREATE TRIGGER repositories_immutable_identity
+            BEFORE UPDATE OF id, git_common_dir ON repositories
+            FOR EACH ROW
+            WHEN NEW.id IS NOT OLD.id
+                OR NEW.git_common_dir IS NOT OLD.git_common_dir
+            BEGIN
+                SELECT RAISE(ABORT, 'repository identity is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspaces_immutable_binding
+            BEFORE UPDATE OF id, repository_id, git_dir, git_dir_generation
+            ON workspaces
+            FOR EACH ROW
+            WHEN NEW.id IS NOT OLD.id
+                OR NEW.repository_id IS NOT OLD.repository_id
+                OR NEW.git_dir IS NOT OLD.git_dir
+                OR NEW.git_dir_generation IS NOT OLD.git_dir_generation
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace binding is immutable');
+            END
             """,
         ),
     ),
@@ -93,7 +118,7 @@ class Registry:
     def adopt(self, observation: WorktreeObservation) -> tuple[WorkspaceRecord, bool]:
         with self._connection() as connection:
             self._migrate(connection)
-            now = _timestamp()
+            created_at = _timestamp()
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 repository = connection.execute(
@@ -107,7 +132,11 @@ class Registry:
                         INSERT INTO repositories (id, git_common_dir, created_at)
                         VALUES (?, ?, ?)
                         """,
-                        (repository_id, str(observation.repository_common_dir), now),
+                        (
+                            repository_id,
+                            str(observation.repository_common_dir),
+                            created_at,
+                        ),
                     )
                 else:
                     repository_id = str(repository["id"])
@@ -122,41 +151,44 @@ class Registry:
                     connection.execute(
                         """
                         INSERT INTO workspaces (
-                            id, repository_id, git_dir, path, branch, head,
-                            adopted_head, created_at, last_observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            id, repository_id, git_dir, git_dir_generation,
+                            path, branch, head, adopted_head, created_at,
+                            last_observed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             workspace_id,
                             repository_id,
                             str(observation.git_dir),
+                            observation.git_dir_generation,
                             str(observation.path),
                             observation.branch,
                             observation.head,
                             observation.head,
-                            now,
-                            now,
+                            created_at,
+                            observation.observed_at,
                         ),
                     )
                 else:
-                    if str(workspace["repository_id"]) != repository_id:
-                        raise RegistryError(
-                            "Git administrative directory is already bound to "
-                            "another repository"
-                        )
+                    _validate_worktree_binding(
+                        workspace,
+                        repository_id=repository_id,
+                        observation=observation,
+                    )
                     workspace_id = str(workspace["id"])
                     connection.execute(
                         """
                         UPDATE workspaces
                         SET path = ?, branch = ?, head = ?, last_observed_at = ?
-                        WHERE id = ?
+                        WHERE id = ? AND last_observed_at < ?
                         """,
                         (
                             str(observation.path),
                             observation.branch,
                             observation.head,
-                            now,
+                            observation.observed_at,
                             workspace_id,
+                            observation.observed_at,
                         ),
                     )
                 connection.commit()
@@ -199,18 +231,24 @@ class Registry:
                     raise RegistryError(
                         "Git identity is ambiguous; refusing to change the binding"
                     )
+                _validate_worktree_binding(
+                    row,
+                    repository_id=str(row["repository_id"]),
+                    observation=observation,
+                )
                 connection.execute(
                     """
                     UPDATE workspaces
                     SET path = ?, branch = ?, head = ?, last_observed_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND last_observed_at < ?
                     """,
                     (
                         str(observation.path),
                         observation.branch,
                         observation.head,
-                        _timestamp(),
+                        observation.observed_at,
                         str(row["id"]),
+                        observation.observed_at,
                     ),
                 )
                 connection.commit()
@@ -316,6 +354,7 @@ def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
         repository_id=str(row["repository_id"]),
         repository_common_dir=str(row["git_common_dir"]),
         git_dir=str(row["git_dir"]),
+        git_dir_generation=str(row["git_dir_generation"]),
         path=str(row["path"]),
         branch=str(row["branch"]) if row["branch"] is not None else None,
         head=str(row["head"]),
@@ -323,6 +362,23 @@ def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
         created_at=str(row["created_at"]),
         last_observed_at=str(row["last_observed_at"]),
     )
+
+
+def _validate_worktree_binding(
+    row: sqlite3.Row,
+    *,
+    repository_id: str,
+    observation: WorktreeObservation,
+) -> None:
+    if str(row["repository_id"]) != repository_id:
+        raise RegistryError(
+            "Git administrative directory is already bound to another repository"
+        )
+    if str(row["git_dir_generation"]) != observation.git_dir_generation:
+        raise RegistryError(
+            "Git administrative directory generation changed; Workspace binding "
+            "is ambiguous"
+        )
 
 
 def _timestamp() -> str:
