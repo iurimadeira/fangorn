@@ -102,7 +102,7 @@ def list_workspaces(as_json: bool, as_ndjson: bool) -> None:
     click.echo("Workspace ID\tBranch\tPath")
     for workspace in workspaces:
         branch = workspace.branch if workspace.branch is not None else "(detached)"
-        click.echo(f"{workspace.id}\t{branch}\t{workspace.path}")
+        click.echo(f"{workspace.id}\t{_human(branch)}\t{_human(workspace.path)}")
 
 
 def _echo_json(payload: dict[str, object]) -> None:
@@ -111,6 +111,16 @@ def _echo_json(payload: dict[str, object]) -> None:
 
 def _echo_workspace(workspace: WorkspaceRecord) -> None:
     branch = workspace.branch if workspace.branch is not None else "(detached)"
-    click.echo(f"Path: {workspace.path}")
-    click.echo(f"Branch: {branch}")
+    click.echo(f"Path: {_human(workspace.path)}")
+    click.echo(f"Branch: {_human(branch)}")
     click.echo(f"HEAD: {workspace.head}")
+
+
+def _human(value: str) -> str:
+    return "".join(
+        f"\\x{code_point:02x}"
+        if code_point < 0x20 or 0x7F <= code_point <= 0x9F
+        else character
+        for character in value
+        for code_point in (ord(character),)
+    )

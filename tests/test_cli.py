@@ -458,6 +458,41 @@ def test_list_emits_deterministic_human_json_and_ndjson(tmp_path: Path) -> None:
         )
 
 
+def test_human_output_escapes_terminal_controls_but_json_stays_exact(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
+    database = state_home / "fangorn" / "registry.sqlite3"
+    unsafe_path = "/workspace/line\nansi\x1b[31m/tab\t/del\x7f/c1\x85"
+    unsafe_branch = "topic\r\n\x01\x1b]0;title\x07\x9f"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "UPDATE workspaces SET path = ?, branch = ?", (unsafe_path, unsafe_branch)
+    )
+    connection.commit()
+    connection.close()
+
+    human = run_fangorn(state_home, "list")
+    machine = run_fangorn(state_home, "list", "--json")
+
+    assert human.returncode == 0, human.stderr
+    assert machine.returncode == 0, machine.stderr
+    assert (
+        "topic\\x0d\\x0a\\x01\\x1b]0;title\\x07\\x9f\t"
+        "/workspace/line\\x0aansi\\x1b[31m/tab\\x09/del\\x7f/c1\\x85\n" in human.stdout
+    )
+    for control in ("\r", "\x01", "\x1b", "\x07", "\x7f", "\x85"):
+        assert control not in human.stdout
+    payload = cast(dict[str, object], json.loads(machine.stdout))
+    workspace = cast(dict[str, object], cast(list[object], payload["workspaces"])[0])
+    assert workspace["path"] == unsafe_path
+    assert workspace["branch"] == unsafe_branch
+
+
 def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
     tmp_path: Path,
 ) -> None:
