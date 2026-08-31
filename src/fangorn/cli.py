@@ -121,10 +121,16 @@ def _echo_workspace(workspace: WorkspaceRecord) -> None:
 
 
 def _human(value: str) -> str:
-    return "".join(
-        f"\\x{code_point:02x}"
-        if code_point < 0x20 or 0x7F <= code_point <= 0x9F
-        else character
-        for character in value
-        for code_point in (ord(character),)
-    )
+    rendered: list[str] = []
+    for character in value:
+        code_point = ord(character)
+        if code_point < 0x20 or 0x7F <= code_point <= 0x9F:
+            rendered.append(f"\\x{code_point:02x}")
+        elif not character.isprintable():
+            if code_point <= 0xFFFF:
+                rendered.append(f"\\u{code_point:04x}")
+            else:
+                rendered.append(f"\\U{code_point:08x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)

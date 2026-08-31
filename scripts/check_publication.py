@@ -50,6 +50,22 @@ def _require(condition: bool, message: str) -> None:
         raise CheckFailure(message)
 
 
+def _terminal_safe(value: str) -> str:
+    rendered: list[str] = []
+    for character in value:
+        code_point = ord(character)
+        if code_point < 0x20 or 0x7F <= code_point <= 0x9F:
+            rendered.append(f"\\x{code_point:02x}")
+        elif not character.isprintable():
+            if code_point <= 0xFFFF:
+                rendered.append(f"\\u{code_point:04x}")
+            else:
+                rendered.append(f"\\U{code_point:08x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
 def _text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -379,7 +395,10 @@ def main() -> int:
         for artifact in arguments.artifacts:
             validate_artifact(artifact.resolve(strict=True))
     except (CheckFailure, OSError) as error:
-        print(f"Publication check failed: {error}", file=sys.stderr)
+        print(
+            f"Publication check failed: {_terminal_safe(str(error))}",
+            file=sys.stderr,
+        )
         return 1
 
     checked = "source tree"

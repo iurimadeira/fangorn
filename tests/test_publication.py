@@ -105,7 +105,7 @@ def test_publication_gate_accepts_the_public_source_tree() -> None:
         "dist/sensitive.pem",
         "nested/build/sensitive.pem",
         ".venv/sensitive.pem",
-        ".pytest_cache/line\nsensitive.pem",
+        ".pytest_cache/line\nansi\x1b\u202esensitive.pem",
     ],
 )
 def test_publication_gate_scans_force_tracked_files_in_excluded_directories(
@@ -123,6 +123,31 @@ def test_publication_gate_scans_force_tracked_files_in_excluded_directories(
     assert result.returncode != 0
     assert result.stdout == ""
     assert "Sensitive file type included" in result.stderr
+    if "\n" in relative_name:
+        assert result.stderr.count("\n") == 1
+        assert "\\x0a" in result.stderr
+        assert "\\x1b" in result.stderr
+        assert "\\u202e" in result.stderr
+        assert "\x1b" not in result.stderr
+        assert "\u202e" not in result.stderr
+
+
+def test_publication_gate_renders_dynamic_error_paths_on_one_safe_line(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "artifact\nansi\x1b\u202e.invalid"
+    artifact.write_text("unsupported\n", encoding="utf-8")
+
+    result = run_publication_gate(artifact)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr.count("\n") == 1
+    assert "\\x0a" in result.stderr
+    assert "\\x1b" in result.stderr
+    assert "\\u202e" in result.stderr
+    assert "\x1b" not in result.stderr
+    assert "\u202e" not in result.stderr
 
 
 @pytest.mark.parametrize("header", PRIVATE_KEY_HEADERS)
