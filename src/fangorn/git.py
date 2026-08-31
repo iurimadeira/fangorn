@@ -42,7 +42,10 @@ REPOSITORY_LOCAL_ENVIRONMENT = (
     "GIT_CEILING_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
     "GIT_DIR",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     "GIT_GRAFT_FILE",
@@ -94,8 +97,7 @@ def observe_worktree(
     path: Path, *, create_generation: bool = False
 ) -> WorktreeObservation:
     requested_path = _resolve_requested_path(path)
-    last_error: GitError | None = None
-    saw_mismatch = False
+    last_failure: GitError | None = None
 
     for _ in range(OBSERVATION_ATTEMPTS):
         observed_at = _timestamp()
@@ -107,7 +109,7 @@ def observe_worktree(
                 requested_path, create_generation=create_generation
             )
         except GitError as error:
-            last_error = error
+            last_failure = error
             continue
         if first == second:
             return WorktreeObservation(
@@ -119,12 +121,12 @@ def observe_worktree(
                 head=second.head,
                 observed_at=observed_at,
             )
-        saw_mismatch = True
+        last_failure = GitError(
+            "Git worktree changed during observation; retry the command"
+        )
 
-    if saw_mismatch:
-        raise GitError("Git worktree changed during observation; retry the command")
-    if last_error is not None:
-        raise last_error
+    if last_failure is not None:
+        raise last_failure
     raise GitError("Git worktree could not be observed consistently")
 
 

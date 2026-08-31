@@ -17,9 +17,10 @@ from typing import cast
 from uuid import UUID
 
 import pytest
+from git_helpers import git, initialize_repository
 
 import fangorn.git as git_adapter
-from fangorn.git import observe_worktree
+from fangorn.git import GitError, observe_worktree
 from fangorn.registry import Registry, RegistryError
 
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
@@ -53,26 +54,8 @@ def run_fangorn(
     )
 
 
-def git(repository: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", repository, *arguments],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
-
-
 def create_repository(path: Path) -> str:
-    path.mkdir()
-    subprocess.run(
-        ["git", "init", "--initial-branch=main", path],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    git(path, "config", "user.name", "Fangorn Test")
-    git(path, "config", "user.email", "fangorn@example.invalid")
+    initialize_repository(path)
     (path / "README.md").write_text("temporary repository\n", encoding="utf-8")
     git(path, "add", "README.md")
     git(path, "commit", "-m", "Initial commit")
@@ -319,20 +302,147 @@ exec "$FANGORN_TEST_REAL_GIT" "$@"
             assert recorded_events[index + 1] == "git"
 
 
-def test_adopt_rejects_non_utf8_git_path_text_without_a_traceback(
+def test_adopt_rejects_non_utf8_git_output_without_a_traceback(
     tmp_path: Path,
 ) -> None:
-    original = tmp_path / "repository"
-    create_repository(original)
-    repository = tmp_path / os.fsdecode(b"repository-\xff")
-    os.rename(os.fsencode(original), os.fsencode(repository))
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    wrapper_directory = tmp_path / "bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "git"
+    real_git = subprocess.run(
+        ["sh", "-c", "command -v git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wrapper.write_text(
+        """#!/bin/sh
+case "$*" in
+    *"rev-parse --show-toplevel")
+        printf 'repository-\\377\\n'
+        exit 0
+        ;;
+esac
+exec "$FANGORN_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
 
-    result = run_fangorn(tmp_path / "state", "adopt", "--json", str(repository))
+    result = run_fangorn(
+        tmp_path / "state",
+        "adopt",
+        "--json",
+        str(repository),
+        environment_overrides={
+            "PATH": f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}",
+            "FANGORN_TEST_REAL_GIT": real_git,
+        },
+    )
 
     assert result.returncode != 0
     assert result.stdout == ""
     assert "Git output is not valid UTF-8" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_adopt_ignores_inherited_git_config_source_overrides(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    target_head = create_repository(repository)
+    contaminating_worktree = tmp_path / "contaminating-worktree"
+    create_repository(contaminating_worktree)
+    config = tmp_path / "contaminating.gitconfig"
+    config.write_text(
+        f"[core]\n\tworktree = {contaminating_worktree}\n",
+        encoding="utf-8",
+    )
+    wrapper_directory = tmp_path / "bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "git"
+    real_git = subprocess.run(
+        ["sh", "-c", "command -v git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wrapper.write_text(
+        """#!/bin/sh
+if [ -n "$GIT_CONFIG_GLOBAL" ] \
+    || [ -n "$GIT_CONFIG_SYSTEM" ] \
+    || [ -n "$GIT_CONFIG_NOSYSTEM" ]; then
+    echo "Git config-source overrides reached child" >&2
+    exit 2
+fi
+exec "$FANGORN_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "adopt",
+        "--json",
+        str(repository),
+        environment_overrides={
+            "GIT_CONFIG_GLOBAL": str(config),
+            "GIT_CONFIG_SYSTEM": str(config),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PATH": f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}",
+            "FANGORN_TEST_REAL_GIT": real_git,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(result.stdout))["workspace"],
+    )
+    assert workspace["path"] == str(repository.resolve())
+    assert workspace["head"] == target_head
+
+
+def test_git_fixture_ignores_inherited_commit_signing_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "signing.gitconfig"
+    config.write_text("[commit]\n\tgpgSign = true\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    repository = tmp_path / "repository"
+    head = create_repository(repository)
+
+    assert git(repository, "rev-parse", "HEAD") == head
+
+
+def test_observation_reports_the_latest_failure_after_an_earlier_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    snapshot = git_adapter._capture_snapshot(repository)
+    changed = replace(snapshot, branch="changed-during-observation")
+    outcomes: list[git_adapter._Snapshot | GitError] = [
+        snapshot,
+        changed,
+        GitError("middle Git failure"),
+        GitError("final Git failure"),
+    ]
+
+    def capture_snapshot(
+        _path: Path, *, create_generation: bool = False
+    ) -> git_adapter._Snapshot:
+        del create_generation
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, GitError):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(git_adapter, "_capture_snapshot", capture_snapshot)
+
+    with pytest.raises(GitError, match="final Git failure"):
+        observe_worktree(repository)
 
 
 def test_adopt_preserves_whitespace_in_git_reported_paths(tmp_path: Path) -> None:

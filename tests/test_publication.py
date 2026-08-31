@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from git_helpers import git, initialize_repository
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,18 +53,8 @@ def copy_source_to_temporary_repository(tmp_path: Path) -> Path:
             "dist",
         ),
     )
-    subprocess.run(
-        ["git", "init", "--initial-branch=main", source],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "-C", source, "add", "--all"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    initialize_repository(source)
+    git(source, "add", "--all")
     return source
 
 
@@ -125,12 +116,7 @@ def test_publication_gate_scans_force_tracked_files_in_excluded_directories(
     sensitive = source / relative_name
     sensitive.parent.mkdir(parents=True, exist_ok=True)
     sensitive.write_text("sensitive\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "-C", source, "add", "-f", "--", relative_name],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    git(source, "add", "-f", "--", relative_name)
 
     result = run_publication_gate(source=source)
 
@@ -147,12 +133,7 @@ def test_publication_gate_rejects_private_key_headers_in_tracked_source(
     source = copy_source_to_temporary_repository(tmp_path)
     payload = source / "private-key-header.txt"
     payload.write_text(f"{header}\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "-C", source, "add", "--", payload.name],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    git(source, "add", "--", payload.name)
 
     result = run_publication_gate(source=source)
 
