@@ -233,6 +233,22 @@ class Registry:
                 raise RegistryError("Workspace disappeared from the registry")
             return _workspace_from_row(refreshed)
 
+    def list_workspaces(self) -> list[WorkspaceRecord]:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT workspaces.*, repositories.git_common_dir
+                    FROM workspaces
+                    JOIN repositories ON repositories.id = workspaces.repository_id
+                    ORDER BY workspaces.path, workspaces.id
+                    """
+                ).fetchall()
+            except sqlite3.Error as error:
+                raise _registry_error(error) from error
+            return [_workspace_from_row(row) for row in rows]
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True)

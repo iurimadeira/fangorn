@@ -68,9 +68,41 @@ def info(path: Path, as_json: bool) -> None:
 
 
 @main.command(name="list")
-def list_workspaces() -> None:
+@click.option("--json", "as_json", is_flag=True, help="Emit versioned JSON.")
+@click.option(
+    "--ndjson",
+    "as_ndjson",
+    is_flag=True,
+    help="Emit one versioned JSON object per Workspace.",
+)
+def list_workspaces(as_json: bool, as_ndjson: bool) -> None:
     """List registered Workspaces."""
-    raise click.ClickException("list is not implemented")
+    if as_json and as_ndjson:
+        raise click.UsageError("Choose only one of --json or --ndjson")
+    try:
+        workspaces = Registry.from_environment().list_workspaces()
+    except RegistryError as error:
+        raise click.ClickException(str(error)) from error
+
+    if as_json:
+        _echo_json(
+            {
+                "schema_version": 1,
+                "workspaces": [workspace.as_dict() for workspace in workspaces],
+            }
+        )
+        return
+    if as_ndjson:
+        for workspace in workspaces:
+            _echo_json({"schema_version": 1, "workspace": workspace.as_dict()})
+        return
+    if not workspaces:
+        click.echo("No Workspaces adopted.")
+        return
+    click.echo("Workspace ID\tBranch\tPath")
+    for workspace in workspaces:
+        branch = workspace.branch if workspace.branch is not None else "(detached)"
+        click.echo(f"{workspace.id}\t{branch}\t{workspace.path}")
 
 
 def _echo_json(payload: dict[str, object]) -> None:

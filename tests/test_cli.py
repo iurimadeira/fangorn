@@ -142,3 +142,52 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     assert unregistered.returncode != 0
     assert unregistered.stdout == ""
     assert "Worktree is not adopted" in unregistered.stderr
+
+
+def test_list_emits_deterministic_human_json_and_ndjson(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    linked = tmp_path / "linked"
+    git(repository, "worktree", "add", "-b", "topic", str(linked))
+    state_home = tmp_path / "state"
+    main_adopt = run_fangorn(state_home, "adopt", "--json", str(repository))
+    linked_adopt = run_fangorn(state_home, "adopt", "--json", str(linked))
+    main_workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(main_adopt.stdout))["workspace"],
+    )
+    linked_workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(linked_adopt.stdout))["workspace"],
+    )
+
+    machine = run_fangorn(state_home, "list", "--json")
+    stream = run_fangorn(state_home, "list", "--ndjson")
+    human = run_fangorn(state_home, "list")
+
+    assert machine.returncode == 0, machine.stderr
+    assert stream.returncode == 0, stream.stderr
+    assert human.returncode == 0, human.stderr
+    assert machine.stderr == stream.stderr == human.stderr == ""
+    machine_payload = cast(dict[str, object], json.loads(machine.stdout))
+    assert machine_payload["schema_version"] == 1
+    workspaces = cast(list[dict[str, object]], machine_payload["workspaces"])
+    assert [workspace["path"] for workspace in workspaces] == sorted(
+        [str(repository.resolve()), str(linked.resolve())]
+    )
+    assert main_workspace["id"] != linked_workspace["id"]
+    assert main_workspace["repository_id"] == linked_workspace["repository_id"]
+    stream_payloads = [
+        cast(dict[str, object], json.loads(line)) for line in stream.stdout.splitlines()
+    ]
+    assert [payload["schema_version"] for payload in stream_payloads] == [1, 1]
+    assert [
+        cast(dict[str, object], payload["workspace"])["id"]
+        for payload in stream_payloads
+    ] == [workspace["id"] for workspace in workspaces]
+    assert human.stdout.startswith("Workspace ID\tBranch\tPath\n")
+    for workspace in workspaces:
+        assert (
+            f"{workspace['id']}\t{workspace['branch']}\t{workspace['path']}\n"
+            in human.stdout
+        )
