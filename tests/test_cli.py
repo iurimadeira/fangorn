@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import cast
 from uuid import UUID
+
+import pytest
 
 
 def fangorn_executable() -> Path:
@@ -191,3 +195,103 @@ def test_list_emits_deterministic_human_json_and_ndjson(tmp_path: Path) -> None:
             f"{workspace['id']}\t{workspace['branch']}\t{workspace['path']}\n"
             in human.stdout
         )
+
+
+def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
+    database = state_home / "fangorn" / "registry.sqlite3"
+
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,)]
+        workspace = connection.execute(
+            """
+            SELECT repository_id, git_dir, path, head
+            FROM workspaces
+            """
+        ).fetchone()
+        assert workspace is not None
+        repository_id, git_dir, path, head = workspace
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO workspaces (
+                    id, repository_id, git_dir, path, branch, head,
+                    adopted_head, created_at, last_observed_at
+                ) VALUES ('duplicate', ?, ?, ?, 'main', ?, ?, 'now', 'now')
+                """,
+                (repository_id, git_dir, path, head, head),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO workspaces (
+                    id, repository_id, git_dir, path, branch, head,
+                    adopted_head, created_at, last_observed_at
+                ) VALUES (
+                    'orphan', 'missing', '/git/orphan', '/worktree/orphan',
+                    NULL, 'head', 'head', 'now', 'now'
+                )
+                """
+            )
+    finally:
+        connection.close()
+
+
+def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
+    state_home = tmp_path / "state"
+    database = state_home / "fangorn" / "registry.sqlite3"
+    database.parent.mkdir(parents=True)
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE repositories (broken TEXT)")
+    connection.commit()
+    connection.close()
+
+    result = run_fangorn(state_home, "list", "--json")
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    connection = sqlite3.connect(database)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+    assert "schema_migrations" not in tables
+
+
+def test_registry_contention_fails_after_a_bounded_wait(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
+    database = state_home / "fangorn" / "registry.sqlite3"
+    connection = sqlite3.connect(database, isolation_level=None)
+    connection.execute("BEGIN IMMEDIATE")
+    started = time.monotonic()
+    try:
+        result = run_fangorn(state_home, "list", "--json")
+    finally:
+        elapsed = time.monotonic() - started
+        connection.rollback()
+        connection.close()
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Registry remained busy for 2 seconds" in result.stderr
+    assert 1.5 <= elapsed < 6
