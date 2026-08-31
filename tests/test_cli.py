@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -620,3 +621,55 @@ def test_registry_contention_fails_after_a_bounded_wait(tmp_path: Path) -> None:
     assert result.stdout == ""
     assert "Registry remained busy for 2 seconds" in result.stderr
     assert 1.5 <= elapsed < 6
+
+
+def test_registry_repairs_private_state_and_database_permissions(
+    tmp_path: Path,
+) -> None:
+    state_home = tmp_path / "state"
+    state_directory = state_home / "fangorn"
+    state_directory.mkdir(parents=True, mode=0o777)
+    state_directory.chmod(0o777)
+    database = state_directory / "registry.sqlite3"
+    database.touch(mode=0o666)
+    database.chmod(0o666)
+
+    result = run_fangorn(state_home, "list", "--json")
+
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+
+
+def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> None:
+    blocked_state = tmp_path / "blocked-state"
+    blocked_state.mkdir()
+    (blocked_state / "fangorn").write_text("not a directory\n", encoding="utf-8")
+
+    directory_failure = run_fangorn(blocked_state, "list", "--json")
+
+    assert directory_failure.returncode != 0
+    assert directory_failure.stdout == ""
+    assert "Registry state directory unavailable" in directory_failure.stderr
+    assert "Traceback" not in directory_failure.stderr
+
+    database_state = tmp_path / "database-state"
+    database_path = database_state / "fangorn" / "registry.sqlite3"
+    database_path.mkdir(parents=True)
+    database_failure = run_fangorn(database_state, "list", "--json")
+    assert database_failure.returncode != 0
+    assert database_failure.stdout == ""
+    assert "Registry database unavailable" in database_failure.stderr
+    assert "Traceback" not in database_failure.stderr
+
+    symlink_state = tmp_path / "symlink-state"
+    symlink_state.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    (symlink_state / "fangorn").symlink_to(redirected, target_is_directory=True)
+    symlink_failure = run_fangorn(symlink_state, "list", "--json")
+    assert symlink_failure.returncode != 0
+    assert symlink_failure.stdout == ""
+    assert "Registry state directory unavailable" in symlink_failure.stderr
+    assert "symlink" in symlink_failure.stderr
+    assert "Traceback" not in symlink_failure.stderr

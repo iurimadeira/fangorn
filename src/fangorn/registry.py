@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -289,7 +290,8 @@ class Registry:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_state_directory(self.path.parent)
+        _prepare_database_file(self.path)
         try:
             connection = sqlite3.connect(
                 self.path,
@@ -297,14 +299,13 @@ class Registry:
                 isolation_level=None,
             )
         except sqlite3.Error as error:
-            raise _registry_error(error) from error
+            raise RegistryError(f"Registry database unavailable: {error}") from error
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(
-                f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_SECONDS * 1000)}"
-            )
             yield connection
+        except sqlite3.Error as error:
+            raise _registry_error(error) from error
         finally:
             connection.close()
 
@@ -383,6 +384,62 @@ def _validate_worktree_binding(
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _prepare_state_directory(path: Path) -> None:
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RegistryError(
+                f"Registry state directory unavailable: symlink is not allowed: {path}"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RegistryError(
+                f"Registry state directory unavailable: not a directory: {path}"
+            )
+        if metadata.st_uid != os.geteuid():
+            raise RegistryError(
+                "Registry state directory unavailable: not owned by current user: "
+                f"{path}"
+            )
+        path.chmod(0o700)
+    except RegistryError:
+        raise
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise RegistryError(
+            f"Registry state directory unavailable: {path}: {detail}"
+        ) from error
+
+
+def _prepare_database_file(path: Path) -> None:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RegistryError(
+                f"Registry database unavailable: not a regular file: {path}"
+            )
+        if metadata.st_uid != os.geteuid():
+            raise RegistryError(
+                f"Registry database unavailable: not owned by current user: {path}"
+            )
+        os.fchmod(descriptor, 0o600)
+    except RegistryError:
+        raise
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise RegistryError(
+            f"Registry database unavailable: {path}: {detail}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _registry_error(error: sqlite3.Error) -> RegistryError:
