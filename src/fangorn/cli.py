@@ -28,9 +28,15 @@ def adopt(path: Path, as_json: bool) -> None:
     try:
         registry = Registry.from_environment()
         observation = observe_worktree(path)
-        if observation.git_dir_generation is None:
-            create_generation = not registry.has_worktree(observation)
-            observation = observe_worktree(path, create_generation=create_generation)
+        create_repository_generation, create_worktree_generation = (
+            registry.marker_creation_requirements(observation)
+        )
+        if create_repository_generation or create_worktree_generation:
+            observation = observe_worktree(
+                path,
+                create_repository_generation=create_repository_generation,
+                create_worktree_generation=create_worktree_generation,
+            )
         workspace, created = registry.adopt(observation)
     except (GitError, RegistryError) as error:
         raise click.ClickException(_human(str(error))) from error

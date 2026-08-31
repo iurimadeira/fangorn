@@ -25,6 +25,7 @@ class WorkspaceRecord:
     id: str
     repository_id: str
     repository_common_dir: str
+    git_common_dir_generation: str
     git_dir: str
     git_dir_generation: str
     path: str
@@ -39,6 +40,7 @@ class WorkspaceRecord:
             "id": self.id,
             "repository_id": self.repository_id,
             "repository_common_dir": self.repository_common_dir,
+            "git_common_dir_generation": self.git_common_dir_generation,
             "git_dir": self.git_dir,
             "git_dir_generation": self.git_dir_generation,
             "path": self.path,
@@ -58,6 +60,10 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             CREATE TABLE repositories (
                 id TEXT PRIMARY KEY NOT NULL,
                 git_common_dir TEXT NOT NULL UNIQUE,
+                git_common_dir_generation TEXT NOT NULL CHECK (
+                    length(git_common_dir_generation) = 64
+                    AND git_common_dir_generation NOT GLOB '*[^0-9a-f]*'
+                ),
                 created_at TEXT NOT NULL
             )
             """,
@@ -80,10 +86,13 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
             """
             CREATE TRIGGER repositories_immutable_identity
-            BEFORE UPDATE OF id, git_common_dir ON repositories
+            BEFORE UPDATE OF id, git_common_dir, git_common_dir_generation
+            ON repositories
             FOR EACH ROW
             WHEN NEW.id IS NOT OLD.id
                 OR NEW.git_common_dir IS NOT OLD.git_common_dir
+                OR NEW.git_common_dir_generation
+                    IS NOT OLD.git_common_dir_generation
             BEGIN
                 SELECT RAISE(ABORT, 'repository identity is immutable');
             END
@@ -123,9 +132,15 @@ class Registry:
         return cls(root / "fangorn" / "registry.sqlite3")
 
     def adopt(self, observation: WorktreeObservation) -> tuple[WorkspaceRecord, bool]:
+        if observation.git_common_dir_generation is None:
+            raise RegistryError(
+                "Fangorn repository generation marker is missing; "
+                "Repository identity drifted"
+            )
         if observation.git_dir_generation is None:
             raise RegistryError(
-                "Fangorn generation marker is missing; Workspace identity drifted"
+                "Fangorn worktree generation marker is missing; "
+                "Workspace identity drifted"
             )
         with self._connection() as connection:
             self._migrate(connection)
@@ -133,23 +148,29 @@ class Registry:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 repository = connection.execute(
-                    "SELECT id FROM repositories WHERE git_common_dir = ?",
+                    """
+                    SELECT id, git_common_dir_generation
+                    FROM repositories WHERE git_common_dir = ?
+                    """,
                     (str(observation.repository_common_dir),),
                 ).fetchone()
                 if repository is None:
                     repository_id = str(uuid4())
                     connection.execute(
                         """
-                        INSERT INTO repositories (id, git_common_dir, created_at)
-                        VALUES (?, ?, ?)
+                        INSERT INTO repositories (
+                            id, git_common_dir, git_common_dir_generation, created_at
+                        ) VALUES (?, ?, ?, ?)
                         """,
                         (
                             repository_id,
                             str(observation.repository_common_dir),
+                            observation.git_common_dir_generation,
                             created_at,
                         ),
                     )
                 else:
+                    _validate_repository_binding(repository, observation)
                     repository_id = str(repository["id"])
 
                 workspace = connection.execute(
@@ -211,7 +232,8 @@ class Registry:
 
             row = connection.execute(
                 """
-                SELECT workspaces.*, repositories.git_common_dir
+                SELECT workspaces.*, repositories.git_common_dir,
+                    repositories.git_common_dir_generation
                 FROM workspaces
                 JOIN repositories ON repositories.id = workspaces.repository_id
                 WHERE workspaces.id = ?
@@ -222,17 +244,42 @@ class Registry:
                 raise RegistryError("Adopted Workspace disappeared from the registry")
             return _workspace_from_row(row), created
 
-    def has_worktree(self, observation: WorktreeObservation) -> bool:
+    def marker_creation_requirements(
+        self, observation: WorktreeObservation
+    ) -> tuple[bool, bool]:
         with self._connection() as connection:
             self._migrate(connection)
             try:
-                row = connection.execute(
-                    "SELECT 1 FROM workspaces WHERE git_dir = ?",
+                repository = connection.execute(
+                    """
+                    SELECT id, git_common_dir_generation
+                    FROM repositories WHERE git_common_dir = ?
+                    """,
+                    (str(observation.repository_common_dir),),
+                ).fetchone()
+                workspace = connection.execute(
+                    "SELECT * FROM workspaces WHERE git_dir = ?",
                     (str(observation.git_dir),),
                 ).fetchone()
             except sqlite3.Error as error:
                 raise _registry_error(error) from error
-            return row is not None
+            if repository is not None:
+                _validate_repository_binding(repository, observation)
+            if workspace is not None:
+                repository_id = (
+                    str(repository["id"])
+                    if repository is not None
+                    else str(workspace["repository_id"])
+                )
+                _validate_worktree_binding(
+                    workspace,
+                    repository_id=repository_id,
+                    observation=observation,
+                )
+            return (
+                repository is None and observation.git_common_dir_generation is None,
+                workspace is None and observation.git_dir_generation is None,
+            )
 
     def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
         with self._connection() as connection:
@@ -241,7 +288,8 @@ class Registry:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
-                    SELECT workspaces.*, repositories.git_common_dir
+                    SELECT workspaces.*, repositories.git_common_dir,
+                        repositories.git_common_dir_generation
                     FROM workspaces
                     JOIN repositories ON repositories.id = workspaces.repository_id
                     WHERE workspaces.git_dir = ?
@@ -254,6 +302,7 @@ class Registry:
                     raise RegistryError(
                         "Git identity is ambiguous; refusing to change the binding"
                     )
+                _validate_repository_binding(row, observation)
                 _validate_worktree_binding(
                     row,
                     repository_id=str(row["repository_id"]),
@@ -283,7 +332,8 @@ class Registry:
 
             refreshed = connection.execute(
                 """
-                SELECT workspaces.*, repositories.git_common_dir
+                SELECT workspaces.*, repositories.git_common_dir,
+                    repositories.git_common_dir_generation
                 FROM workspaces
                 JOIN repositories ON repositories.id = workspaces.repository_id
                 WHERE workspaces.id = ?
@@ -300,7 +350,8 @@ class Registry:
             try:
                 rows = connection.execute(
                     """
-                    SELECT workspaces.*, repositories.git_common_dir
+                    SELECT workspaces.*, repositories.git_common_dir,
+                        repositories.git_common_dir_generation
                     FROM workspaces
                     JOIN repositories ON repositories.id = workspaces.repository_id
                     ORDER BY workspaces.path, workspaces.id
@@ -376,6 +427,7 @@ def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
         id=str(row["id"]),
         repository_id=str(row["repository_id"]),
         repository_common_dir=str(row["git_common_dir"]),
+        git_common_dir_generation=str(row["git_common_dir_generation"]),
         git_dir=str(row["git_dir"]),
         git_dir_generation=str(row["git_dir_generation"]),
         path=str(row["path"]),
@@ -399,11 +451,25 @@ def _validate_worktree_binding(
         )
     if observation.git_dir_generation is None:
         raise RegistryError(
-            "Fangorn generation marker is missing; Workspace identity drifted"
+            "Fangorn worktree generation marker is missing; Workspace identity drifted"
         )
     if str(row["git_dir_generation"]) != observation.git_dir_generation:
         raise RegistryError(
-            "Fangorn generation marker changed; Workspace identity drifted"
+            "Fangorn worktree generation marker changed; Workspace identity drifted"
+        )
+
+
+def _validate_repository_binding(
+    row: sqlite3.Row, observation: WorktreeObservation
+) -> None:
+    if observation.git_common_dir_generation is None:
+        raise RegistryError(
+            "Fangorn repository generation marker is missing; "
+            "Repository identity drifted"
+        )
+    if str(row["git_common_dir_generation"]) != observation.git_common_dir_generation:
+        raise RegistryError(
+            "Fangorn repository generation marker changed; Repository identity drifted"
         )
 
 

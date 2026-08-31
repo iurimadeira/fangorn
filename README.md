@@ -48,10 +48,11 @@ Pass another worktree path to `adopt` or `info`. Adoption is idempotent: an
 equivalent retry returns the existing Workspace instead of creating another
 identity.
 
-During adoption, Fangorn atomically creates one private random generation marker
-inside that worktree's canonical Git administrative directory. It stores the
-same generation in the registry and refuses missing, malformed, or changed
-markers later. Fangorn does not modify worktree files, branches, the index, or
+During adoption, Fangorn atomically creates two distinct private random
+generation markers: one in the repository's canonical Git common directory and
+one in the worktree's canonical Git administrative directory. It stores both
+generations in the registry and refuses missing, malformed, or changed markers
+later. Fangorn does not modify worktree files, branches, the index, or
 repository content.
 
 Human-readable output is the default. `adopt` and `info` accept `--json`;

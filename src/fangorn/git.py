@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import secrets
 import stat
 import subprocess
-import tempfile
-from contextlib import suppress
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +18,7 @@ class GitError(RuntimeError):
 @dataclass(frozen=True)
 class WorktreeObservation:
     repository_common_dir: Path
+    git_common_dir_generation: str | None
     git_dir: Path
     git_dir_generation: str | None
     path: Path
@@ -29,6 +30,7 @@ class WorktreeObservation:
 @dataclass(frozen=True)
 class _Snapshot:
     repository_common_dir: Path
+    git_common_dir_generation: str | None
     git_dir: Path
     git_dir_generation: str | None
     path: Path
@@ -60,6 +62,7 @@ REPOSITORY_LOCAL_ENVIRONMENT = (
 )
 OBSERVATION_ATTEMPTS = 3
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
+REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
 
 def _run_git(
@@ -94,26 +97,50 @@ def _run_git(
 
 
 def observe_worktree(
-    path: Path, *, create_generation: bool = False
+    path: Path,
+    *,
+    create_generation: bool = False,
+    create_repository_generation: bool | None = None,
+    create_worktree_generation: bool | None = None,
 ) -> WorktreeObservation:
     requested_path = _resolve_requested_path(path)
     last_failure: GitError | None = None
+    if create_repository_generation is None:
+        create_repository_generation = create_generation
+    if create_worktree_generation is None:
+        create_worktree_generation = create_generation
 
     for _ in range(OBSERVATION_ATTEMPTS):
         observed_at = _timestamp()
         try:
-            first = _capture_snapshot(
-                requested_path, create_generation=create_generation
-            )
-            second = _capture_snapshot(
-                requested_path, create_generation=create_generation
-            )
+            if (
+                create_repository_generation == create_generation
+                and create_worktree_generation == create_generation
+            ):
+                first = _capture_snapshot(
+                    requested_path, create_generation=create_generation
+                )
+                second = _capture_snapshot(
+                    requested_path, create_generation=create_generation
+                )
+            else:
+                first = _capture_snapshot(
+                    requested_path,
+                    create_repository_generation=create_repository_generation,
+                    create_worktree_generation=create_worktree_generation,
+                )
+                second = _capture_snapshot(
+                    requested_path,
+                    create_repository_generation=create_repository_generation,
+                    create_worktree_generation=create_worktree_generation,
+                )
         except GitError as error:
             last_failure = error
             continue
         if first == second:
             return WorktreeObservation(
                 repository_common_dir=second.repository_common_dir,
+                git_common_dir_generation=second.git_common_dir_generation,
                 git_dir=second.git_dir,
                 git_dir_generation=second.git_dir_generation,
                 path=second.path,
@@ -148,8 +175,16 @@ def _resolve_requested_path(path: Path) -> Path:
 
 
 def _capture_snapshot(
-    requested_path: Path, *, create_generation: bool = False
+    requested_path: Path,
+    *,
+    create_generation: bool = False,
+    create_repository_generation: bool | None = None,
+    create_worktree_generation: bool | None = None,
 ) -> _Snapshot:
+    if create_repository_generation is None:
+        create_repository_generation = create_generation
+    if create_worktree_generation is None:
+        create_worktree_generation = create_generation
     inside = _run_git(requested_path, "rev-parse", "--is-inside-work-tree")
     if inside != "true":
         raise GitError(f"Path is not inside a Git worktree: {requested_path}")
@@ -176,8 +211,20 @@ def _capture_snapshot(
         ),
         "Git administrative directory",
     )
-    directory_before = _directory_identity(git_dir)
-    generation_before = _worktree_generation(git_dir, create=create_generation)
+    common_directory_before = _directory_identity(common_dir)
+    git_directory_before = _directory_identity(git_dir)
+    repository_generation_before = _generation(
+        common_dir,
+        marker_name=REPOSITORY_GENERATION_MARKER_NAME,
+        identity="repository",
+        create=create_repository_generation,
+    )
+    worktree_generation_before = _generation(
+        git_dir,
+        marker_name=GENERATION_MARKER_NAME,
+        identity="worktree",
+        create=create_worktree_generation,
+    )
     branch = _run_git(
         requested_path,
         "symbolic-ref",
@@ -189,17 +236,40 @@ def _capture_snapshot(
     head = _run_git(requested_path, "rev-parse", "HEAD")
     if head is None:
         raise GitError("Git did not report HEAD")
-    generation_after = _worktree_generation(git_dir, create=create_generation)
-    directory_after = _directory_identity(git_dir)
-    if directory_before != directory_after:
+    repository_generation_after = _generation(
+        common_dir,
+        marker_name=REPOSITORY_GENERATION_MARKER_NAME,
+        identity="repository",
+        create=create_repository_generation,
+    )
+    worktree_generation_after = _generation(
+        git_dir,
+        marker_name=GENERATION_MARKER_NAME,
+        identity="worktree",
+        create=create_worktree_generation,
+    )
+    common_directory_after = _directory_identity(common_dir)
+    git_directory_after = _directory_identity(git_dir)
+    if common_directory_before != common_directory_after:
+        raise GitError("Git common directory changed during observation")
+    if git_directory_before != git_directory_after:
         raise GitError("Git administrative directory changed during observation")
-    if generation_before != generation_after:
-        raise GitError("Fangorn generation marker changed during observation")
+    if repository_generation_before != repository_generation_after:
+        raise GitError(
+            "Fangorn repository generation marker changed during observation; "
+            "repository identity cannot be trusted"
+        )
+    if worktree_generation_before != worktree_generation_after:
+        raise GitError(
+            "Fangorn worktree generation marker changed during observation; "
+            "worktree identity cannot be trusted"
+        )
 
     return _Snapshot(
         repository_common_dir=common_dir,
+        git_common_dir_generation=repository_generation_after,
         git_dir=git_dir,
-        git_dir_generation=generation_after,
+        git_dir_generation=worktree_generation_after,
         path=worktree_path,
         branch=branch,
         head=head,
@@ -230,15 +300,26 @@ def _directory_identity(path: Path) -> str:
     return f"{metadata.st_dev}:{metadata.st_ino}"
 
 
-def _worktree_generation(git_dir: Path, *, create: bool) -> str | None:
-    generation = _read_generation_marker(git_dir)
+def _generation(
+    directory: Path, *, marker_name: str, identity: str, create: bool
+) -> str | None:
+    generation = _read_generation_marker(
+        directory, marker_name=marker_name, identity=identity
+    )
     if generation is not None or not create:
         return generation
-    return _create_generation_marker(git_dir)
+    return _create_generation_marker(
+        directory, marker_name=marker_name, identity=identity
+    )
 
 
-def _read_generation_marker(git_dir: Path) -> str | None:
-    marker = git_dir / GENERATION_MARKER_NAME
+def _read_generation_marker(
+    directory: Path,
+    *,
+    marker_name: str = GENERATION_MARKER_NAME,
+    identity: str = "worktree",
+) -> str | None:
+    marker = directory / marker_name
     try:
         metadata = marker.lstat()
     except FileNotFoundError:
@@ -246,13 +327,13 @@ def _read_generation_marker(git_dir: Path) -> str | None:
     except OSError as error:
         detail = error.strerror or str(error)
         raise GitError(
-            f"Cannot inspect Fangorn generation marker {marker}: {detail}; "
-            "worktree identity cannot be trusted"
+            f"Cannot inspect Fangorn {identity} generation marker {marker}: "
+            f"{detail}; {identity} identity cannot be trusted"
         ) from error
     if not stat.S_ISREG(metadata.st_mode):
         raise GitError(
-            "Fangorn generation marker is not a regular file; "
-            "worktree identity cannot be trusted"
+            f"Fangorn {identity} generation marker is not a regular file; "
+            f"{identity} identity cannot be trusted"
         )
 
     flags = os.O_RDONLY
@@ -264,8 +345,8 @@ def _read_generation_marker(git_dir: Path) -> str | None:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise GitError(
-                "Fangorn generation marker is not a regular file; "
-                "worktree identity cannot be trusted"
+                f"Fangorn {identity} generation marker is not a regular file; "
+                f"{identity} identity cannot be trusted"
             )
         content = b""
         while len(content) < 66:
@@ -278,12 +359,16 @@ def _read_generation_marker(git_dir: Path) -> str | None:
     except OSError as error:
         detail = error.strerror or str(error)
         raise GitError(
-            f"Cannot read Fangorn generation marker {marker}: {detail}; "
-            "worktree identity cannot be trusted"
+            f"Cannot read Fangorn {identity} generation marker {marker}: {detail}; "
+            f"{identity} identity cannot be trusted"
         ) from error
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            _close_descriptor(
+                descriptor,
+                context="generation marker read",
+                ignore_errors=sys.exc_info()[0] is not None,
+            )
 
     value = content[:-1]
     if (
@@ -292,53 +377,110 @@ def _read_generation_marker(git_dir: Path) -> str | None:
         or any(byte not in b"0123456789abcdef" for byte in value)
     ):
         raise GitError(
-            "Fangorn generation marker is malformed; "
-            "worktree identity cannot be trusted"
+            f"Fangorn {identity} generation marker is malformed; "
+            f"{identity} identity cannot be trusted"
         )
     return value.decode("ascii")
 
 
-def _create_generation_marker(git_dir: Path) -> str:
-    marker = git_dir / GENERATION_MARKER_NAME
-    generation = secrets.token_hex(32)
-    descriptor: int | None = None
-    temporary: Path | None = None
+def _create_generation_marker(
+    directory: Path,
+    *,
+    marker_name: str = GENERATION_MARKER_NAME,
+    identity: str = "worktree",
+) -> str:
+    marker = directory / marker_name
+    pending = directory / f".{marker_name}.pending"
+    directory_descriptor: int | None = None
+    pending_descriptor: int | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{GENERATION_MARKER_NAME}.", dir=git_dir
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(directory, flags)
+        if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
+            raise GitError(
+                f"Git {identity} administrative path is not a directory: {directory}"
+            )
+        fcntl.flock(directory_descriptor, fcntl.LOCK_EX)
+
+        winner = _read_generation_marker(
+            directory, marker_name=marker_name, identity=identity
         )
-        temporary = Path(temporary_name)
+        if winner is not None:
+            _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=False)
+            os.fsync(directory_descriptor)
+            return winner
+
+        _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=False)
+        generation = secrets.token_hex(32)
         payload = f"{generation}\n".encode("ascii")
+        pending_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            pending_flags |= os.O_NOFOLLOW
+        pending_descriptor = os.open(pending, pending_flags, 0o600)
         written = 0
         while written < len(payload):
-            written += os.write(descriptor, payload[written:])
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        try:
-            os.link(temporary, marker, follow_symlinks=False)
-        except FileExistsError:
-            winner = _read_generation_marker(git_dir)
-            if winner is None:
-                raise GitError(
-                    "Fangorn generation marker disappeared during creation; "
-                    "worktree identity cannot be trusted"
-                ) from None
-            return winner
+            written += os.write(pending_descriptor, payload[written:])
+        os.fsync(pending_descriptor)
+        os.close(pending_descriptor)
+        pending_descriptor = None
+        os.replace(pending, marker)
+        os.fsync(directory_descriptor)
         return generation
     except GitError:
+        if directory_descriptor is not None:
+            _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=True)
         raise
     except OSError as error:
+        if directory_descriptor is not None:
+            _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=True)
         detail = error.strerror or str(error)
         raise GitError(
-            f"Cannot create Fangorn generation marker {marker}: {detail}"
+            f"Cannot create Fangorn {identity} generation marker {marker}: {detail}"
         ) from error
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if temporary is not None:
-            with suppress(FileNotFoundError):
-                temporary.unlink()
+        primary_active = sys.exc_info()[0] is not None
+        if pending_descriptor is not None:
+            _close_descriptor(
+                pending_descriptor,
+                context="generation marker publication",
+                ignore_errors=primary_active,
+            )
+        if directory_descriptor is not None:
+            _close_descriptor(
+                directory_descriptor,
+                context="Git administrative directory",
+                ignore_errors=primary_active,
+            )
+
+
+def _cleanup_pending_marker(
+    pending: Path, directory_descriptor: int, *, ignore_errors: bool
+) -> None:
+    try:
+        pending.lstat()
+        pending.unlink()
+        os.fsync(directory_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        if ignore_errors:
+            return
+        detail = error.strerror or str(error)
+        raise GitError(
+            f"Cannot clean up Fangorn generation marker publication: {detail}"
+        ) from error
+
+
+def _close_descriptor(descriptor: int, *, context: str, ignore_errors: bool) -> None:
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        if ignore_errors:
+            return
+        detail = error.strerror or str(error)
+        raise GitError(f"Cannot close {context}: {detail}") from error
 
 
 def _record(value: bytes) -> str:
