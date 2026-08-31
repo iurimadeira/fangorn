@@ -26,6 +26,7 @@ class WorktreeObservation:
     branch: str | None
     head: str | None
     observed_at: str
+    observation_token: int | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ def observe_worktree(
     create_generation: bool = False,
     create_repository_generation: bool | None = None,
     create_worktree_generation: bool | None = None,
+    observation_token: int | None = None,
 ) -> WorktreeObservation:
     requested_path = _resolve_requested_path(path)
     last_failure: GitError | None = None
@@ -150,6 +152,7 @@ def observe_worktree(
                 branch=second.branch,
                 head=second.head,
                 observed_at=observed_at,
+                observation_token=observation_token,
             )
         last_failure = GitError(
             "Git worktree changed during observation; retry the command"

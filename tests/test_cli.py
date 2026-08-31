@@ -861,7 +861,11 @@ def test_registry_rejects_a_changed_worktree_generation(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
     registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
-    observation = observe_worktree(repository, create_generation=True)
+    observation = observe_worktree(
+        repository,
+        create_generation=True,
+        observation_token=registry.reserve_observation(),
+    )
     adopted, created = registry.adopt(observation)
     replacement = "f" * 64 if observation.git_dir_generation != "f" * 64 else "e" * 64
     recreated = replace(
@@ -1067,33 +1071,52 @@ def test_replacement_repository_cannot_reuse_identity_for_a_new_linked_worktree(
     assert workspaces[0]["repository_id"] == repository_id
 
 
-def test_older_observation_cannot_overwrite_newer_workspace_facts(
+def test_causal_observation_token_wins_despite_reversed_write_and_clock_rollback(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
     registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    older_token = registry.reserve_observation()
     older = replace(
-        observe_worktree(repository, create_generation=True),
-        observed_at="2026-01-01T00:00:00.000001Z",
+        observe_worktree(
+            repository,
+            create_generation=True,
+            observation_token=older_token,
+        ),
+        observed_at="2030-01-01T00:00:00.000001Z",
     )
-    created, was_created = registry.adopt(older)
-    assert was_created is True
-    assert created.last_observed_at == older.observed_at
+    newer_token = registry.reserve_observation()
     git(repository, "branch", "-m", "newer-branch")
+    (repository / "newer.txt").write_text("newer\n", encoding="utf-8")
+    git(repository, "add", "newer.txt")
+    git(repository, "commit", "-m", "Newer observation")
     newer = replace(
-        observe_worktree(repository), observed_at="2026-01-01T00:00:00.000002Z"
+        observe_worktree(repository, observation_token=newer_token),
+        observed_at="2020-01-01T00:00:00.000001Z",
     )
 
-    refreshed = registry.get_by_worktree(newer)
+    refreshed, was_created = registry.adopt(newer)
     reversed_write = registry.get_by_worktree(older)
 
+    assert was_created is True
+    assert older_token < newer_token
     assert refreshed.branch == "newer-branch"
     assert refreshed.last_observed_at == newer.observed_at
     assert reversed_write.branch == "newer-branch"
     assert reversed_write.head == newer.head
     assert reversed_write.path == str(newer.path)
     assert reversed_write.last_observed_at == newer.observed_at
+    connection = sqlite3.connect(registry.path)
+    try:
+        assert connection.execute(
+            "SELECT last_observation_token FROM workspaces"
+        ).fetchone() == (newer_token,)
+        assert connection.execute(
+            "SELECT current_token FROM observation_clock WHERE singleton = 1"
+        ).fetchone() == (newer_token,)
+    finally:
+        connection.close()
 
 
 def test_list_emits_deterministic_human_json_and_ndjson(tmp_path: Path) -> None:
@@ -1284,6 +1307,10 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
         }
         assert repository_columns["id"][3] == 1
         assert workspace_columns["id"][3] == 1
+        assert workspace_columns["last_observation_token"][3] == 1
+        assert connection.execute(
+            "SELECT singleton, current_token FROM observation_clock"
+        ).fetchone() == (1, 2)
         repositories = connection.execute(
             "SELECT id, git_common_dir FROM repositories ORDER BY git_common_dir"
         ).fetchall()

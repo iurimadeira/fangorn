@@ -27,7 +27,8 @@ def adopt(path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
     try:
         registry = Registry.from_environment()
-        observation = observe_worktree(path)
+        observation_token = registry.reserve_observation()
+        observation = observe_worktree(path, observation_token=observation_token)
         create_repository_generation, create_worktree_generation = (
             registry.marker_creation_requirements(observation)
         )
@@ -36,6 +37,7 @@ def adopt(path: Path, as_json: bool) -> None:
                 path,
                 create_repository_generation=create_repository_generation,
                 create_worktree_generation=create_worktree_generation,
+                observation_token=observation_token,
             )
         workspace, created = registry.adopt(observation)
     except (GitError, RegistryError) as error:
@@ -65,8 +67,11 @@ def adopt(path: Path, as_json: bool) -> None:
 def info(path: Path, as_json: bool) -> None:
     """Inspect the Workspace bound to a Git worktree."""
     try:
-        observation = observe_worktree(path)
-        workspace = Registry.from_environment().get_by_worktree(observation)
+        registry = Registry.from_environment()
+        observation = observe_worktree(
+            path, observation_token=registry.reserve_observation()
+        )
+        workspace = registry.get_by_worktree(observation)
     except (GitError, RegistryError) as error:
         raise click.ClickException(_human(str(error))) from error
 

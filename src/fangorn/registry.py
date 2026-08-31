@@ -34,6 +34,7 @@ class WorkspaceRecord:
     adopted_head: str | None
     created_at: str
     last_observed_at: str
+    last_observation_token: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -68,6 +69,16 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             """
+            CREATE TABLE observation_clock (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                current_token INTEGER NOT NULL CHECK (current_token >= 0)
+            )
+            """,
+            """
+            INSERT INTO observation_clock (singleton, current_token)
+            VALUES (1, 0)
+            """,
+            """
             CREATE TABLE workspaces (
                 id TEXT PRIMARY KEY NOT NULL,
                 repository_id TEXT NOT NULL REFERENCES repositories(id),
@@ -81,7 +92,10 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 head TEXT,
                 adopted_head TEXT,
                 created_at TEXT NOT NULL,
-                last_observed_at TEXT NOT NULL
+                last_observed_at TEXT NOT NULL,
+                last_observation_token INTEGER NOT NULL CHECK (
+                    last_observation_token > 0
+                )
             )
             """,
             """
@@ -137,6 +151,7 @@ class Registry:
         return cls(root / "fangorn" / "registry.sqlite3")
 
     def adopt(self, observation: WorktreeObservation) -> tuple[WorkspaceRecord, bool]:
+        observation_token = _observation_token(observation)
         if observation.git_common_dir_generation is None:
             raise RegistryError(
                 "Fangorn repository generation marker is missing; "
@@ -190,8 +205,8 @@ class Registry:
                         INSERT INTO workspaces (
                             id, repository_id, git_dir, git_dir_generation,
                             path, branch, head, adopted_head, created_at,
-                            last_observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            last_observed_at, last_observation_token
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             workspace_id,
@@ -204,6 +219,7 @@ class Registry:
                             observation.head,
                             created_at,
                             observation.observed_at,
+                            observation_token,
                         ),
                     )
                 else:
@@ -216,16 +232,18 @@ class Registry:
                     connection.execute(
                         """
                         UPDATE workspaces
-                        SET path = ?, branch = ?, head = ?, last_observed_at = ?
-                        WHERE id = ? AND last_observed_at < ?
+                        SET path = ?, branch = ?, head = ?, last_observed_at = ?,
+                            last_observation_token = ?
+                        WHERE id = ? AND last_observation_token < ?
                         """,
                         (
                             str(observation.path),
                             observation.branch,
                             observation.head,
                             observation.observed_at,
+                            observation_token,
                             workspace_id,
-                            observation.observed_at,
+                            observation_token,
                         ),
                     )
                 connection.commit()
@@ -248,6 +266,35 @@ class Registry:
             if row is None:
                 raise RegistryError("Adopted Workspace disappeared from the registry")
             return _workspace_from_row(row), created
+
+    def reserve_observation(self) -> int:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    UPDATE observation_clock
+                    SET current_token = current_token + 1
+                    WHERE singleton = 1
+                    """
+                )
+                row = connection.execute(
+                    """
+                    SELECT current_token FROM observation_clock
+                    WHERE singleton = 1
+                    """
+                ).fetchone()
+                if row is None:
+                    raise RegistryError("Registry observation clock is unavailable")
+                token = int(row["current_token"])
+                connection.commit()
+                return token
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
 
     def marker_creation_requirements(
         self, observation: WorktreeObservation
@@ -287,6 +334,7 @@ class Registry:
             )
 
     def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
+        observation_token = _observation_token(observation)
         with self._connection() as connection:
             self._migrate(connection)
             try:
@@ -316,16 +364,18 @@ class Registry:
                 connection.execute(
                     """
                     UPDATE workspaces
-                    SET path = ?, branch = ?, head = ?, last_observed_at = ?
-                    WHERE id = ? AND last_observed_at < ?
+                    SET path = ?, branch = ?, head = ?, last_observed_at = ?,
+                        last_observation_token = ?
+                    WHERE id = ? AND last_observation_token < ?
                     """,
                     (
                         str(observation.path),
                         observation.branch,
                         observation.head,
                         observation.observed_at,
+                        observation_token,
                         str(row["id"]),
-                        observation.observed_at,
+                        observation_token,
                     ),
                 )
                 connection.commit()
@@ -443,7 +493,15 @@ def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
         ),
         created_at=str(row["created_at"]),
         last_observed_at=str(row["last_observed_at"]),
+        last_observation_token=int(row["last_observation_token"]),
     )
+
+
+def _observation_token(observation: WorktreeObservation) -> int:
+    token = observation.observation_token
+    if token is None or token <= 0:
+        raise RegistryError("Registry observation token is missing or invalid")
+    return token
 
 
 def _validate_worktree_binding(
