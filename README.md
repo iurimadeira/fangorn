@@ -48,11 +48,11 @@ Pass another worktree path to `adopt` or `info`. Adoption is idempotent: an
 equivalent retry returns the existing Workspace instead of creating another
 identity.
 
-Fangorn records the Git administrative directory's filesystem device and inode
-as a non-mutating generation witness. It refuses a later directory instance at
-the same canonical path. A filesystem that reuses both values after deletion
-can defeat that witness; Fangorn does not write marker files into Git metadata
-to manufacture a stronger identity.
+During adoption, Fangorn atomically creates one private random generation marker
+inside that worktree's canonical Git administrative directory. It stores the
+same generation in the registry and refuses missing, malformed, or changed
+markers later. Fangorn does not modify worktree files, branches, the index, or
+repository content.
 
 Human-readable output is the default. `adopt` and `info` accept `--json`;
 `list` accepts `--json` or `--ndjson`. Every machine record includes

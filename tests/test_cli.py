@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -18,6 +21,8 @@ import pytest
 import fangorn.git as git_adapter
 from fangorn.git import observe_worktree
 from fangorn.registry import Registry, RegistryError
+
+GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 
 
 def fangorn_executable() -> Path:
@@ -122,9 +127,85 @@ def test_adopt_json_binds_and_reuses_git_identity(tmp_path: Path) -> None:
     assert first_workspace["branch"] == "main"
     assert first_workspace["head"] == adopted_head
     assert first_workspace["adopted_head"] == adopted_head
+    generation = cast(str, first_workspace["git_dir_generation"])
+    marker = repository / ".git" / GENERATION_MARKER_NAME
+    assert re.fullmatch(r"[0-9a-f]{64}", generation)
+    assert marker.read_text(encoding="ascii") == f"{generation}\n"
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert second_workspace["git_dir_generation"] == generation
     assert (state_home / "fangorn" / "registry.sqlite3").is_file()
     assert git(repository, "status", "--porcelain") == ""
     assert git(repository, "rev-parse", "HEAD") == adopted_head
+
+
+def test_adopt_retries_after_generation_marker_creation_without_registry_write(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    observation = observe_worktree(repository, create_generation=True)
+    marker = observation.git_dir / GENERATION_MARKER_NAME
+
+    result = run_fangorn(tmp_path / "state", "adopt", "--json", str(repository))
+
+    assert result.returncode == 0, result.stderr
+    workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(result.stdout))["workspace"],
+    )
+    assert workspace["git_dir_generation"] == observation.git_dir_generation
+    assert marker.read_text(encoding="ascii") == (f"{observation.git_dir_generation}\n")
+
+
+def test_concurrent_adoption_converges_on_one_generation_and_workspace(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(run_fangorn, state_home, "adopt", "--json", str(repository))
+            for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+
+    assert all(result.returncode == 0 for result in results), [
+        result.stderr for result in results
+    ]
+    payloads = [
+        cast(dict[str, object], json.loads(result.stdout)) for result in results
+    ]
+    workspaces = [cast(dict[str, object], payload["workspace"]) for payload in payloads]
+    assert {payload["created"] for payload in payloads} == {False, True}
+    assert len({workspace["id"] for workspace in workspaces}) == 1
+    assert len({workspace["git_dir_generation"] for workspace in workspaces}) == 1
+    generation = cast(str, workspaces[0]["git_dir_generation"])
+    marker = repository / ".git" / GENERATION_MARKER_NAME
+    assert marker.read_text(encoding="ascii") == f"{generation}\n"
+
+
+def test_linked_worktree_uses_its_canonical_git_directory_generation_marker(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    linked = tmp_path / "linked"
+    git(repository, "worktree", "add", "-b", "topic", str(linked))
+
+    result = run_fangorn(tmp_path / "state", "adopt", "--json", str(linked))
+
+    assert result.returncode == 0, result.stderr
+    workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(result.stdout))["workspace"],
+    )
+    marker = Path(cast(str, workspace["git_dir"])) / GENERATION_MARKER_NAME
+    assert marker.parent != repository / ".git"
+    assert marker.read_text(encoding="ascii") == (
+        f"{workspace['git_dir_generation']}\n"
+    )
 
 
 def test_adopt_target_wins_over_inherited_repository_git_environment(
@@ -444,22 +525,113 @@ def test_registry_rejects_a_changed_worktree_generation(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
     registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
-    observation = observe_worktree(repository)
+    observation = observe_worktree(repository, create_generation=True)
     adopted, created = registry.adopt(observation)
+    replacement = "f" * 64 if observation.git_dir_generation != "f" * 64 else "e" * 64
     recreated = replace(
         observation,
-        git_dir_generation=f"{observation.git_dir_generation}-recreated",
+        git_dir_generation=replacement,
     )
 
     assert created is True
     for operation in (registry.get_by_worktree, registry.adopt):
-        with pytest.raises(RegistryError, match=r"generation changed.*ambiguous"):
+        with pytest.raises(RegistryError, match=r"generation marker changed.*drifted"):
             operation(recreated)
     listed = registry.list_workspaces()
     assert len(listed) == 1
     assert listed[0].git_dir_generation == adopted.git_dir_generation
     assert listed[0].last_observed_at == adopted.last_observed_at
     assert listed[0].branch == adopted.branch
+
+
+@pytest.mark.parametrize(
+    "marker_state",
+    ["missing", "malformed", "changed", "symlink", "directory"],
+)
+def test_registered_worktree_generation_marker_drift_fails_closed(
+    tmp_path: Path,
+    marker_state: str,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
+    workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(adopted.stdout))["workspace"],
+    )
+    marker = Path(cast(str, workspace["git_dir"])) / GENERATION_MARKER_NAME
+    generation = cast(str, workspace["git_dir_generation"])
+
+    marker.unlink()
+    if marker_state == "malformed":
+        marker.write_text("not-a-generation\n", encoding="ascii")
+    elif marker_state == "changed":
+        replacement = "f" * 64 if generation != "f" * 64 else "e" * 64
+        marker.write_text(f"{replacement}\n", encoding="ascii")
+        marker.chmod(0o600)
+    elif marker_state == "symlink":
+        target = tmp_path / "generation-target"
+        target.write_text(f"{generation}\n", encoding="ascii")
+        marker.symlink_to(target)
+    elif marker_state == "directory":
+        marker.mkdir()
+
+    inspected = run_fangorn(state_home, "info", "--json", str(repository))
+    readopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+
+    for result in (inspected, readopted):
+        assert result.returncode != 0
+        assert result.stdout == ""
+        assert "generation marker" in result.stderr
+        assert "identity" in result.stderr
+        assert "Traceback" not in result.stderr
+    if marker_state == "missing":
+        assert not marker.exists()
+
+
+def test_same_git_directory_path_with_a_replacement_generation_is_rejected(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
+    workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(adopted.stdout))["workspace"],
+    )
+    old_generation = cast(str, workspace["git_dir_generation"])
+    git_dir = repository / ".git"
+    old_git_dir = repository / ".git-first-generation"
+    git_dir.rename(old_git_dir)
+    shutil.copytree(
+        old_git_dir,
+        git_dir,
+        ignore=shutil.ignore_patterns(GENERATION_MARKER_NAME),
+    )
+    replacement = "f" * 64 if old_generation != "f" * 64 else "e" * 64
+    marker = git_dir / GENERATION_MARKER_NAME
+    marker.write_text(f"{replacement}\n", encoding="ascii")
+    marker.chmod(0o600)
+
+    result = run_fangorn(state_home, "adopt", "--json", str(repository))
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "generation marker changed" in result.stderr
+    assert "identity" in result.stderr
+    listed = run_fangorn(state_home, "list", "--json")
+    listed_workspace = cast(
+        dict[str, object],
+        cast(
+            list[object],
+            cast(dict[str, object], json.loads(listed.stdout))["workspaces"],
+        )[0],
+    )
+    assert listed_workspace["git_dir_generation"] == old_generation
 
 
 def test_older_observation_cannot_overwrite_newer_workspace_facts(
@@ -469,7 +641,8 @@ def test_older_observation_cannot_overwrite_newer_workspace_facts(
     create_repository(repository)
     registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
     older = replace(
-        observe_worktree(repository), observed_at="2026-01-01T00:00:00.000001Z"
+        observe_worktree(repository, create_generation=True),
+        observed_at="2026-01-01T00:00:00.000001Z",
     )
     created, was_created = registry.adopt(older)
     assert was_created is True
@@ -692,6 +865,22 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
                 )
                 """,
                 (other_repository_id, git_dir, path, head, head),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO workspaces (
+                    id, repository_id, git_dir, git_dir_generation,
+                    path, branch, head,
+                    adopted_head, created_at, last_observed_at
+                ) VALUES (
+                    'invalid-generation', ?, '/git/invalid-generation',
+                    'not-a-generation', '/worktree/invalid-generation',
+                    'main', 'head', 'head', 'now', 'now'
+                )
+                """,
+                (repository_id,),
             )
         connection.rollback()
         with pytest.raises(sqlite3.IntegrityError):

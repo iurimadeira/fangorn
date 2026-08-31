@@ -66,7 +66,10 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 id TEXT PRIMARY KEY NOT NULL,
                 repository_id TEXT NOT NULL REFERENCES repositories(id),
                 git_dir TEXT NOT NULL UNIQUE,
-                git_dir_generation TEXT NOT NULL,
+                git_dir_generation TEXT NOT NULL CHECK (
+                    length(git_dir_generation) = 64
+                    AND git_dir_generation NOT GLOB '*[^0-9a-f]*'
+                ),
                 path TEXT NOT NULL,
                 branch TEXT,
                 head TEXT NOT NULL,
@@ -120,6 +123,10 @@ class Registry:
         return cls(root / "fangorn" / "registry.sqlite3")
 
     def adopt(self, observation: WorktreeObservation) -> tuple[WorkspaceRecord, bool]:
+        if observation.git_dir_generation is None:
+            raise RegistryError(
+                "Fangorn generation marker is missing; Workspace identity drifted"
+            )
         with self._connection() as connection:
             self._migrate(connection)
             created_at = _timestamp()
@@ -214,6 +221,18 @@ class Registry:
             if row is None:
                 raise RegistryError("Adopted Workspace disappeared from the registry")
             return _workspace_from_row(row), created
+
+    def has_worktree(self, observation: WorktreeObservation) -> bool:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                row = connection.execute(
+                    "SELECT 1 FROM workspaces WHERE git_dir = ?",
+                    (str(observation.git_dir),),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise _registry_error(error) from error
+            return row is not None
 
     def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
         with self._connection() as connection:
@@ -378,10 +397,13 @@ def _validate_worktree_binding(
         raise RegistryError(
             "Git administrative directory is already bound to another repository"
         )
+    if observation.git_dir_generation is None:
+        raise RegistryError(
+            "Fangorn generation marker is missing; Workspace identity drifted"
+        )
     if str(row["git_dir_generation"]) != observation.git_dir_generation:
         raise RegistryError(
-            "Git administrative directory generation changed; Workspace binding "
-            "is ambiguous"
+            "Fangorn generation marker changed; Workspace identity drifted"
         )
 
 

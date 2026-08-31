@@ -26,8 +26,12 @@ def main() -> None:
 def adopt(path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
     try:
+        registry = Registry.from_environment()
         observation = observe_worktree(path)
-        workspace, created = Registry.from_environment().adopt(observation)
+        if observation.git_dir_generation is None:
+            create_generation = not registry.has_worktree(observation)
+            observation = observe_worktree(path, create_generation=create_generation)
+        workspace, created = registry.adopt(observation)
     except (GitError, RegistryError) as error:
         raise click.ClickException(_human(str(error))) from error
 
