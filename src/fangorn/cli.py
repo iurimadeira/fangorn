@@ -46,14 +46,25 @@ def adopt(path: Path, as_json: bool) -> None:
 
 
 @main.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit versioned JSON.")
 @click.argument(
     "path",
     default=".",
     type=click.Path(path_type=Path, file_okay=False, resolve_path=True),
 )
-def info(path: Path) -> None:
+def info(path: Path, as_json: bool) -> None:
     """Inspect the Workspace bound to a Git worktree."""
-    raise click.ClickException(f"info is not implemented for {path}")
+    try:
+        observation = observe_worktree(path)
+        workspace = Registry.from_environment().get_by_worktree(observation)
+    except (GitError, RegistryError) as error:
+        raise click.ClickException(str(error)) from error
+
+    if as_json:
+        _echo_json({"schema_version": 1, "workspace": workspace.as_dict()})
+        return
+    click.echo(f"Workspace {workspace.id}")
+    _echo_workspace(workspace)
 
 
 @main.command(name="list")

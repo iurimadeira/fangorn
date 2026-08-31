@@ -106,3 +106,39 @@ def test_adopt_json_binds_and_reuses_git_identity(tmp_path: Path) -> None:
     assert (state_home / "fangorn" / "registry.sqlite3").is_file()
     assert git(repository, "status", "--porcelain") == ""
     assert git(repository, "rev-parse", "HEAD") == adopted_head
+
+
+def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    adopted_payload = cast(dict[str, object], json.loads(adopted.stdout))
+    adopted_workspace = cast(dict[str, object], adopted_payload["workspace"])
+    workspace_id = adopted_workspace["id"]
+    nested_path = repository / "nested" / "directory"
+    nested_path.mkdir(parents=True)
+    git(repository, "branch", "-m", "topic")
+
+    machine = run_fangorn(state_home, "info", "--json", str(nested_path))
+    human = run_fangorn(state_home, "info", str(repository))
+
+    assert machine.returncode == 0, machine.stderr
+    assert machine.stderr == ""
+    machine_payload = cast(dict[str, object], json.loads(machine.stdout))
+    assert machine_payload["schema_version"] == 1
+    workspace = cast(dict[str, object], machine_payload["workspace"])
+    assert workspace["id"] == workspace_id
+    assert workspace["path"] == str(repository.resolve())
+    assert workspace["branch"] == "topic"
+    assert human.returncode == 0, human.stderr
+    assert human.stdout.startswith(f"Workspace {workspace_id}\n")
+    assert f"Path: {repository.resolve()}\n" in human.stdout
+    assert "Branch: topic\n" in human.stdout
+
+    other_repository = tmp_path / "other"
+    create_repository(other_repository)
+    unregistered = run_fangorn(state_home, "info", "--json", str(other_repository))
+    assert unregistered.returncode != 0
+    assert unregistered.stdout == ""
+    assert "Worktree is not adopted" in unregistered.stderr

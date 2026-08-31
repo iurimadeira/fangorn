@@ -179,6 +179,60 @@ class Registry:
                 raise RegistryError("Adopted Workspace disappeared from the registry")
             return _workspace_from_row(row), created
 
+    def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT workspaces.*, repositories.git_common_dir
+                    FROM workspaces
+                    JOIN repositories ON repositories.id = workspaces.repository_id
+                    WHERE workspaces.git_dir = ?
+                    """,
+                    (str(observation.git_dir),),
+                ).fetchone()
+                if row is None:
+                    raise RegistryError(f"Worktree is not adopted: {observation.path}")
+                if str(row["git_common_dir"]) != str(observation.repository_common_dir):
+                    raise RegistryError(
+                        "Git identity is ambiguous; refusing to change the binding"
+                    )
+                connection.execute(
+                    """
+                    UPDATE workspaces
+                    SET path = ?, branch = ?, head = ?, last_observed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(observation.path),
+                        observation.branch,
+                        observation.head,
+                        _timestamp(),
+                        str(row["id"]),
+                    ),
+                )
+                connection.commit()
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+            refreshed = connection.execute(
+                """
+                SELECT workspaces.*, repositories.git_common_dir
+                FROM workspaces
+                JOIN repositories ON repositories.id = workspaces.repository_id
+                WHERE workspaces.id = ?
+                """,
+                (str(row["id"]),),
+            ).fetchone()
+            if refreshed is None:
+                raise RegistryError("Workspace disappeared from the registry")
+            return _workspace_from_row(refreshed)
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
