@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -11,19 +12,59 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_publication_gate(*artifacts: Path) -> subprocess.CompletedProcess[str]:
+PRIVATE_KEY_HEADERS = tuple(
+    "-----BEGIN " + prefix + "PRIVATE KEY-----"
+    for prefix in ("", "RSA ", "EC ", "DSA ", "OPENSSH ")
+)
+
+
+def run_publication_gate(
+    *artifacts: Path,
+    source: Path = PROJECT_ROOT,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
             PROJECT_ROOT / "scripts" / "check_publication.py",
             "--source",
-            PROJECT_ROOT,
+            source,
             *artifacts,
         ],
         check=False,
         capture_output=True,
         text=True,
     )
+
+
+def copy_source_to_temporary_repository(tmp_path: Path) -> Path:
+    source = tmp_path / "source"
+    shutil.copytree(
+        PROJECT_ROOT,
+        source,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".venv",
+            "__pycache__",
+            "build",
+            "dist",
+        ),
+    )
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", source],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", source, "add", "--all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return source
 
 
 def write_test_wheel(
@@ -65,6 +106,74 @@ def test_publication_gate_accepts_the_public_source_tree() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "uv tool install fangorn-cli" in readme
     assert "pipx install fangorn-cli" in readme
+
+
+@pytest.mark.parametrize(
+    "relative_name",
+    [
+        "dist/sensitive.pem",
+        "nested/build/sensitive.pem",
+        ".venv/sensitive.pem",
+        ".pytest_cache/line\nsensitive.pem",
+    ],
+)
+def test_publication_gate_scans_force_tracked_files_in_excluded_directories(
+    tmp_path: Path,
+    relative_name: str,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    sensitive = source / relative_name
+    sensitive.parent.mkdir(parents=True, exist_ok=True)
+    sensitive.write_text("sensitive\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", source, "add", "-f", "--", relative_name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Sensitive file type included" in result.stderr
+
+
+@pytest.mark.parametrize("header", PRIVATE_KEY_HEADERS)
+def test_publication_gate_rejects_private_key_headers_in_tracked_source(
+    tmp_path: Path,
+    header: str,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    payload = source / "private-key-header.txt"
+    payload.write_text(f"{header}\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", source, "add", "--", payload.name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Private key material found" in result.stderr
+
+
+@pytest.mark.parametrize("header", PRIVATE_KEY_HEADERS)
+def test_publication_gate_rejects_private_key_headers_in_artifacts(
+    tmp_path: Path,
+    header: str,
+) -> None:
+    wheel = tmp_path / "fangorn_cli-0.1.0-py3-none-any.whl"
+    write_test_wheel(wheel, payload=f"{header}\n".encode())
+
+    result = run_publication_gate(wheel)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Private key material found" in result.stderr
 
 
 @pytest.mark.parametrize(

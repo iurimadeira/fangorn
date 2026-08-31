@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import stat
+import subprocess
 import sys
 import tarfile
 import tomllib
@@ -32,7 +34,7 @@ CONTENT_PATTERNS = (
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
 )
-PRIVATE_KEY_MARKER = "-----BEGIN " + "PRIVATE KEY-----"
+PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 EXPECTED_PROJECT_URLS = {
     "Homepage": "https://github.com/iurimadeira/fangorn",
     "Issues": "https://github.com/iurimadeira/fangorn/issues",
@@ -56,8 +58,16 @@ def _text(path: Path) -> str:
 
 
 def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
+    tracked_names: set[str] = set()
+    for name, content in _tracked_source_files(source):
+        tracked_names.add(name)
+        yield name, content
+
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
+        name = relative.as_posix()
+        if name in tracked_names:
+            continue
         if any(part in EXCLUDED_DIRECTORIES for part in relative.parts):
             continue
         if path.is_symlink():
@@ -70,7 +80,67 @@ def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
                 raise CheckFailure(
                     f"Cannot read source file {relative}: {detail}"
                 ) from error
-            yield relative.as_posix(), content
+            yield name, content
+
+
+def _tracked_source_files(source: Path) -> Iterable[tuple[str, bytes]]:
+    environment = os.environ.copy()
+    for name in (
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_WORK_TREE",
+    ):
+        environment.pop(name, None)
+    try:
+        result = subprocess.run(
+            ["git", "-C", source, "ls-files", "--cached", "-z", "--"],
+            check=False,
+            capture_output=True,
+            env=environment,
+        )
+    except FileNotFoundError as error:
+        raise CheckFailure("Git executable was not found") from error
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise CheckFailure(
+            f"Cannot enumerate tracked source files: {detail}"
+        ) from error
+    if result.returncode != 0:
+        detail = result.stderr.removesuffix(b"\n").decode(
+            "utf-8", errors="backslashreplace"
+        )
+        raise CheckFailure(detail or "Cannot enumerate tracked source files")
+
+    records = result.stdout.split(b"\0")
+    _require(records[-1] == b"", "Git tracked path output is not NUL terminated")
+    for raw_name in records[:-1]:
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise CheckFailure("Git tracked path is not valid UTF-8") from error
+        relative = PurePosixPath(name)
+        _require(
+            not relative.is_absolute() and ".." not in relative.parts,
+            f"Git tracked path escapes the source tree: {name}",
+        )
+        path = source.joinpath(*relative.parts)
+        try:
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise CheckFailure(f"Source tree contains a symlink: {name}")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CheckFailure(f"Tracked source is not a regular file: {name}")
+            content = path.read_bytes()
+        except CheckFailure:
+            raise
+        except OSError as error:
+            detail = error.strerror or str(error)
+            raise CheckFailure(f"Cannot read source file {name}: {detail}") from error
+        yield name, content
 
 
 def _validate_public_content(name: str, content: bytes) -> None:
@@ -86,7 +156,10 @@ def _validate_public_content(name: str, content: bytes) -> None:
         text = content.decode("utf-8")
     except UnicodeDecodeError as error:
         raise CheckFailure(f"Content is not valid UTF-8: {name}") from error
-    _require(PRIVATE_KEY_MARKER not in text, f"Private key material found: {name}")
+    _require(
+        PRIVATE_KEY_PATTERN.search(text) is None,
+        f"Private key material found: {name}",
+    )
     for pattern in CONTENT_PATTERNS:
         _require(pattern.search(text) is None, f"Private data pattern found: {name}")
 
