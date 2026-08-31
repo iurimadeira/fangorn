@@ -30,8 +30,8 @@ class WorkspaceRecord:
     git_dir_generation: str
     path: str
     branch: str | None
-    head: str
-    adopted_head: str
+    head: str | None
+    adopted_head: str | None
     created_at: str
     last_observed_at: str
 
@@ -78,8 +78,8 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 ),
                 path TEXT NOT NULL,
                 branch TEXT,
-                head TEXT NOT NULL,
-                adopted_head TEXT NOT NULL,
+                head TEXT,
+                adopted_head TEXT,
                 created_at TEXT NOT NULL,
                 last_observed_at TEXT NOT NULL
             )
@@ -125,7 +125,12 @@ class Registry:
         if state_home and Path(state_home).is_absolute():
             root = Path(state_home)
         else:
-            home = Path.home()
+            home_value = os.environ.get("HOME")
+            if not home_value:
+                raise RegistryError(
+                    "Registry state directory unavailable: HOME is unset"
+                )
+            home = Path(home_value)
             if not home.is_absolute():
                 raise RegistryError("HOME must be an absolute path")
             root = home / ".local" / "state"
@@ -432,8 +437,10 @@ def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
         git_dir_generation=str(row["git_dir_generation"]),
         path=str(row["path"]),
         branch=str(row["branch"]) if row["branch"] is not None else None,
-        head=str(row["head"]),
-        adopted_head=str(row["adopted_head"]),
+        head=str(row["head"]) if row["head"] is not None else None,
+        adopted_head=(
+            str(row["adopted_head"]) if row["adopted_head"] is not None else None
+        ),
         created_at=str(row["created_at"]),
         last_observed_at=str(row["last_observed_at"]),
     )

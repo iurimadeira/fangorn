@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -23,7 +24,7 @@ class WorktreeObservation:
     git_dir_generation: str | None
     path: Path
     branch: str | None
-    head: str
+    head: str | None
     observed_at: str
 
 
@@ -35,7 +36,7 @@ class _Snapshot:
     git_dir_generation: str | None
     path: Path
     branch: str | None
-    head: str
+    head: str | None
 
 
 REPOSITORY_LOCAL_ENVIRONMENT = (
@@ -61,6 +62,7 @@ REPOSITORY_LOCAL_ENVIRONMENT = (
     "GIT_WORK_TREE",
 )
 OBSERVATION_ATTEMPTS = 3
+MINIMUM_GIT_VERSION = (2, 31)
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
@@ -113,6 +115,7 @@ def observe_worktree(
     for _ in range(OBSERVATION_ATTEMPTS):
         observed_at = _timestamp()
         try:
+            _require_supported_git(requested_path)
             if (
                 create_repository_generation == create_generation
                 and create_worktree_generation == create_generation
@@ -233,9 +236,14 @@ def _capture_snapshot(
         "HEAD",
         allowed_exit_codes=frozenset({1}),
     )
-    head = _run_git(requested_path, "rev-parse", "HEAD")
-    if head is None:
-        raise GitError("Git did not report HEAD")
+    head = _run_git(
+        requested_path,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "HEAD",
+        allowed_exit_codes=frozenset({1}),
+    )
     repository_generation_after = _generation(
         common_dir,
         marker_name=REPOSITORY_GENERATION_MARKER_NAME,
@@ -283,6 +291,19 @@ def _required_path(value: str | None, label: str) -> Path:
         return Path(value).resolve(strict=True)
     except OSError as error:
         raise GitError(f"Git reported an invalid {label}: {value}") from error
+
+
+def _require_supported_git(path: Path) -> None:
+    reported = _run_git(path, "--version")
+    if reported is None:
+        raise GitError("Cannot determine Git version; Git 2.31 or newer is required")
+    match = re.match(r"git version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", reported)
+    if match is None:
+        raise GitError("Cannot determine Git version; Git 2.31 or newer is required")
+    version = (int(match[1]), int(match[2]))
+    if version < MINIMUM_GIT_VERSION:
+        found = ".".join(part for part in match.groups() if part is not None)
+        raise GitError(f"Git 2.31 or newer is required; found {found}")
 
 
 def _directory_identity(path: Path) -> str:

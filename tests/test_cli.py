@@ -36,7 +36,7 @@ def fangorn_executable() -> Path:
 def run_fangorn(
     state_home: Path,
     *arguments: str,
-    environment_overrides: Mapping[str, str] | None = None,
+    environment_overrides: Mapping[str, str | None] | None = None,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
@@ -44,7 +44,11 @@ def run_fangorn(
     environment["HOME"] = str(state_home.parent / "home")
     environment.pop("XDG_CONFIG_HOME", None)
     if environment_overrides is not None:
-        environment.update(environment_overrides)
+        for name, value in environment_overrides.items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
     return subprocess.run(
         [fangorn_executable(), *arguments],
         check=False,
@@ -76,6 +80,117 @@ def test_help_exposes_bootstrap_commands() -> None:
     assert "adopt" in result.stdout
     assert "info" in result.stdout
     assert "list" in result.stdout
+
+
+def test_unborn_worktree_is_adoptable_and_keeps_nullable_head(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    initialize_repository(repository)
+    state_home = tmp_path / "state"
+
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    inspected = run_fangorn(state_home, "info", "--json", str(repository))
+    listed = run_fangorn(state_home, "list", "--json")
+    human = run_fangorn(state_home, "info", str(repository))
+
+    for result in (adopted, inspected, listed, human):
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+    adopted_workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(adopted.stdout))["workspace"],
+    )
+    inspected_workspace = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(inspected.stdout))["workspace"],
+    )
+    listed_workspace = cast(
+        dict[str, object],
+        cast(
+            list[object],
+            cast(dict[str, object], json.loads(listed.stdout))["workspaces"],
+        )[0],
+    )
+    for workspace in (adopted_workspace, inspected_workspace, listed_workspace):
+        assert workspace["branch"] == "main"
+        assert workspace["head"] is None
+        assert workspace["adopted_head"] is None
+    assert "Branch: main\n" in human.stdout
+    assert "HEAD: (unborn)\n" in human.stdout
+
+    connection = sqlite3.connect(state_home / "fangorn" / "registry.sqlite3")
+    try:
+        assert connection.execute(
+            "SELECT head, adopted_head FROM workspaces"
+        ).fetchone() == (None, None)
+        columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(workspaces)")
+        }
+        assert columns["head"][3] == 0
+        assert columns["adopted_head"][3] == 0
+    finally:
+        connection.close()
+
+
+def test_cli_reports_unavailable_home_without_a_traceback(tmp_path: Path) -> None:
+    result = run_fangorn(
+        tmp_path / "unused-state",
+        "list",
+        "--json",
+        environment_overrides={"XDG_STATE_HOME": None, "HOME": None},
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "HOME is unset" in result.stderr
+    assert result.stderr.count("\n") == 1
+    assert "Traceback" not in result.stderr
+
+
+def test_git_older_than_231_fails_preflight_before_marker_creation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    wrapper_directory = tmp_path / "bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "git"
+    real_git = subprocess.run(
+        ["sh", "-c", "command -v git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wrapper.write_text(
+        """#!/bin/sh
+case "$*" in
+    *" --version")
+        printf 'git version 2.30.9\n'
+        exit 0
+        ;;
+esac
+exec "$FANGORN_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "adopt",
+        "--json",
+        str(repository),
+        environment_overrides={
+            "PATH": f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}",
+            "FANGORN_TEST_REAL_GIT": real_git,
+        },
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Git 2.31 or newer is required; found 2.30.9" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (repository / ".git" / GENERATION_MARKER_NAME).exists()
+    assert not (repository / ".git" / REPOSITORY_GENERATION_MARKER_NAME).exists()
 
 
 def test_adopt_json_binds_and_reuses_git_identity(tmp_path: Path) -> None:
@@ -226,7 +341,7 @@ def test_marker_publication_does_not_require_hard_links(
     def reject_hard_link(*_arguments: object, **_options: object) -> None:
         raise AssertionError("marker publication attempted a hard link")
 
-    monkeypatch.setattr(git_adapter.os, "link", reject_hard_link)
+    monkeypatch.setattr(os, "link", reject_hard_link)
 
     observation = observe_worktree(repository, create_generation=True)
 
@@ -246,7 +361,7 @@ def test_marker_publication_and_concurrent_winner_fsync_the_directory(
         fsynced_modes.append(os.fstat(descriptor).st_mode)
         real_fsync(descriptor)
 
-    monkeypatch.setattr(git_adapter.os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "fsync", record_fsync)
 
     observation = observe_worktree(repository, create_generation=True)
     assert sum(stat.S_ISDIR(mode) for mode in fsynced_modes) >= 2
@@ -269,12 +384,12 @@ def test_marker_cleanup_does_not_mask_a_publication_failure(
     def fail_replace(*_arguments: object, **_options: object) -> None:
         raise OSError("publication failed")
 
-    def fail_pending_cleanup(path: Path, *arguments: object, **options: object) -> None:
+    def fail_pending_cleanup(path: Path, *, missing_ok: bool = False) -> None:
         if path.name == f".{GENERATION_MARKER_NAME}.pending":
             raise OSError("cleanup failed")
-        real_unlink(path, *arguments, **options)
+        real_unlink(path, missing_ok=missing_ok)
 
-    monkeypatch.setattr(git_adapter.os, "replace", fail_replace)
+    monkeypatch.setattr(os, "replace", fail_replace)
     monkeypatch.setattr(Path, "unlink", fail_pending_cleanup)
 
     with pytest.raises(GitError, match="publication failed"):
@@ -291,10 +406,10 @@ def test_marker_cleanup_failure_without_a_primary_error_is_a_git_error(
     pending.write_text("incomplete", encoding="ascii")
     real_unlink = Path.unlink
 
-    def fail_pending_cleanup(path: Path, *arguments: object, **options: object) -> None:
+    def fail_pending_cleanup(path: Path, *, missing_ok: bool = False) -> None:
         if path == pending:
             raise OSError("cleanup failed")
-        real_unlink(path, *arguments, **options)
+        real_unlink(path, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", fail_pending_cleanup)
 
@@ -373,7 +488,7 @@ def test_each_observation_attempt_is_timestamped_before_its_first_git_read(
     wrapper.write_text(
         """#!/bin/sh
 printf 'git\n' >> "$FANGORN_TEST_EVENTS"
-if [ "$*" = "-C $FANGORN_TEST_REPOSITORY rev-parse HEAD" ] \
+if [ "$*" = "-C $FANGORN_TEST_REPOSITORY rev-parse --verify --quiet HEAD" ] \
     && [ ! -e "$FANGORN_TEST_MARKER" ]; then
     "$FANGORN_TEST_REAL_GIT" "$@"
     : > "$FANGORN_TEST_MARKER"
@@ -586,7 +701,7 @@ def test_adopt_revalidates_a_deterministic_concurrent_branch_change(
     ).stdout.strip()
     wrapper.write_text(
         """#!/bin/sh
-if [ "$*" = "-C $FANGORN_TEST_REPOSITORY rev-parse HEAD" ] \
+if [ "$*" = "-C $FANGORN_TEST_REPOSITORY rev-parse --verify --quiet HEAD" ] \
     && [ ! -e "$FANGORN_TEST_MARKER" ]; then
     "$FANGORN_TEST_REAL_GIT" "$@"
     : > "$FANGORN_TEST_MARKER"

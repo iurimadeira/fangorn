@@ -123,7 +123,8 @@ def _echo_workspace(workspace: WorkspaceRecord) -> None:
     branch = workspace.branch if workspace.branch is not None else "(detached)"
     click.echo(f"Path: {_human(workspace.path)}")
     click.echo(f"Branch: {_human(branch)}")
-    click.echo(f"HEAD: {workspace.head}")
+    head = workspace.head if workspace.head is not None else "(unborn)"
+    click.echo(f"HEAD: {head}")
 
 
 def _human(value: str) -> str:

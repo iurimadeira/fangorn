@@ -10,7 +10,7 @@ changing any checkout.
 ## Requirements
 
 - Python 3.12 or newer
-- Git
+- Git 2.31 or newer
 - Linux or macOS
 
 Click is Fangorn's only third-party runtime dependency.
