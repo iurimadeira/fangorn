@@ -15,8 +15,9 @@ from uuid import UUID
 
 import pytest
 
+import fangorn.git as git_adapter
 from fangorn.git import observe_worktree
-from fangorn.registry import Registry
+from fangorn.registry import Registry, RegistryError
 
 
 def fangorn_executable() -> Path:
@@ -149,6 +150,106 @@ def test_adopt_target_wins_over_inherited_repository_git_environment(
     assert workspace["path"] == str(target.resolve())
     assert workspace["git_dir"] == str((target / ".git").resolve())
     assert workspace["head"] == target_head
+
+
+def test_adopt_nested_path_ignores_inherited_git_discovery_environment(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    nested = repository / "nested" / "directory"
+    nested.mkdir(parents=True)
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "adopt",
+        "--json",
+        str(nested),
+        environment_overrides={
+            "GIT_CEILING_DIRECTORIES": str(repository),
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = cast(dict[str, object], json.loads(result.stdout))
+    workspace = cast(dict[str, object], payload["workspace"])
+    assert workspace["path"] == str(repository.resolve())
+
+
+def test_each_observation_attempt_is_timestamped_before_its_first_git_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    wrapper_directory = tmp_path / "bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "git"
+    events = tmp_path / "events"
+    marker = tmp_path / "branch-changed"
+    real_git = subprocess.run(
+        ["sh", "-c", "command -v git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wrapper.write_text(
+        """#!/bin/sh
+printf 'git\n' >> "$FANGORN_TEST_EVENTS"
+if [ "$*" = "-C $FANGORN_TEST_REPOSITORY rev-parse HEAD" ] \
+    && [ ! -e "$FANGORN_TEST_MARKER" ]; then
+    "$FANGORN_TEST_REAL_GIT" "$@"
+    : > "$FANGORN_TEST_MARKER"
+    "$FANGORN_TEST_REAL_GIT" -C "$FANGORN_TEST_REPOSITORY" branch -m observed-later
+    exit 0
+fi
+exec "$FANGORN_TEST_REAL_GIT" "$@"
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FANGORN_TEST_EVENTS", str(events))
+    monkeypatch.setenv("FANGORN_TEST_MARKER", str(marker))
+    monkeypatch.setenv("FANGORN_TEST_REAL_GIT", real_git)
+    monkeypatch.setenv("FANGORN_TEST_REPOSITORY", str(repository))
+
+    timestamp_index = 0
+
+    def timestamp() -> str:
+        nonlocal timestamp_index
+        timestamp_index += 1
+        with events.open("a", encoding="utf-8") as stream:
+            stream.write("timestamp\n")
+        return f"2026-01-01T00:00:00.00000{timestamp_index}Z"
+
+    monkeypatch.setattr(git_adapter, "_timestamp", timestamp)
+
+    observation = observe_worktree(repository)
+
+    recorded_events = events.read_text(encoding="utf-8").splitlines()
+    assert observation.branch == "observed-later"
+    assert recorded_events[0] == "timestamp"
+    assert recorded_events.count("timestamp") == 2
+    for index, event in enumerate(recorded_events):
+        if event == "timestamp":
+            assert recorded_events[index + 1] == "git"
+
+
+def test_adopt_rejects_non_utf8_git_path_text_without_a_traceback(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "repository"
+    create_repository(original)
+    repository = tmp_path / os.fsdecode(b"repository-\xff")
+    os.rename(os.fsencode(original), os.fsencode(repository))
+
+    result = run_fangorn(tmp_path / "state", "adopt", "--json", str(repository))
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Git output is not valid UTF-8" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_adopt_preserves_whitespace_in_git_reported_paths(tmp_path: Path) -> None:
@@ -337,48 +438,26 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     assert "Worktree is not adopted" in unregistered.stderr
 
 
-def test_recreated_linked_worktree_admin_directory_is_ambiguous(tmp_path: Path) -> None:
+def test_registry_rejects_a_changed_worktree_generation(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
-    linked = tmp_path / "linked"
-    git(repository, "worktree", "add", "-b", "first-generation", str(linked))
-    state_home = tmp_path / "state"
-    adopted = run_fangorn(state_home, "adopt", "--json", str(linked))
-    assert adopted.returncode == 0, adopted.stderr
-    adopted_payload = cast(dict[str, object], json.loads(adopted.stdout))
-    adopted_workspace = cast(dict[str, object], adopted_payload["workspace"])
-    old_generation = adopted_workspace["git_dir_generation"]
-    old_observed_at = adopted_workspace["last_observed_at"]
-    old_git_dir = cast(str, adopted_workspace["git_dir"])
-
-    git(repository, "worktree", "remove", str(linked))
-    git(repository, "worktree", "prune", "--expire", "now")
-    git(repository, "branch", "-D", "first-generation")
-    for index in range(8):
-        (tmp_path / f"inode-consumer-{index}").mkdir()
-    git(repository, "worktree", "add", "-b", "second-generation", str(linked))
-    new_git_dir = git(linked, "rev-parse", "--path-format=absolute", "--git-dir")
-    metadata = Path(new_git_dir).stat()
-    new_generation = f"{metadata.st_dev}:{metadata.st_ino}"
-    assert new_git_dir == old_git_dir
-    assert new_generation != old_generation
-
-    inspected = run_fangorn(state_home, "info", "--json", str(linked))
-    readopted = run_fangorn(state_home, "adopt", "--json", str(linked))
-
-    for result in (inspected, readopted):
-        assert result.returncode != 0
-        assert result.stdout == ""
-        assert "generation changed" in result.stderr
-        assert "ambiguous" in result.stderr
-    listed = run_fangorn(state_home, "list", "--json")
-    listed_payload = cast(dict[str, object], json.loads(listed.stdout))
-    listed_workspace = cast(
-        dict[str, object], cast(list[object], listed_payload["workspaces"])[0]
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    observation = observe_worktree(repository)
+    adopted, created = registry.adopt(observation)
+    recreated = replace(
+        observation,
+        git_dir_generation=f"{observation.git_dir_generation}-recreated",
     )
-    assert listed_workspace["git_dir_generation"] == old_generation
-    assert listed_workspace["last_observed_at"] == old_observed_at
-    assert listed_workspace["branch"] == "first-generation"
+
+    assert created is True
+    for operation in (registry.get_by_worktree, registry.adopt):
+        with pytest.raises(RegistryError, match=r"generation changed.*ambiguous"):
+            operation(recreated)
+    listed = registry.list_workspaces()
+    assert len(listed) == 1
+    assert listed[0].git_dir_generation == adopted.git_dir_generation
+    assert listed[0].last_observed_at == adopted.last_observed_at
+    assert listed[0].branch == adopted.branch
 
 
 def test_older_observation_cannot_overwrite_newer_workspace_facts(

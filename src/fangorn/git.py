@@ -36,10 +36,12 @@ class _Snapshot:
 REPOSITORY_LOCAL_ENVIRONMENT = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
     "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     "GIT_GRAFT_FILE",
     "GIT_IMPLICIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -90,6 +92,7 @@ def observe_worktree(path: Path) -> WorktreeObservation:
     saw_mismatch = False
 
     for _ in range(OBSERVATION_ATTEMPTS):
+        observed_at = _timestamp()
         try:
             first = _capture_snapshot(requested_path)
             second = _capture_snapshot(requested_path)
@@ -104,7 +107,7 @@ def observe_worktree(path: Path) -> WorktreeObservation:
                 path=second.path,
                 branch=second.branch,
                 head=second.head,
-                observed_at=_timestamp(),
+                observed_at=observed_at,
             )
         saw_mismatch = True
 
@@ -210,7 +213,12 @@ def _directory_generation(path: Path) -> str:
 
 
 def _record(value: bytes) -> str:
-    return os.fsdecode(value.removesuffix(b"\n"))
+    try:
+        return value.removesuffix(b"\n").decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise GitError(
+            "Git output is not valid UTF-8; Fangorn v1 requires UTF-8 paths and refs"
+        ) from error
 
 
 def _timestamp() -> str:
