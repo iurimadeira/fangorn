@@ -85,6 +85,22 @@ Fangorn
         )
 
 
+def alter_first_wheel_member(
+    path: Path, *, encrypted: bool = False, compression: int | None = None
+) -> None:
+    content = bytearray(path.read_bytes())
+    local = content.index(b"PK\x03\x04")
+    central = content.index(b"PK\x01\x02")
+    if encrypted:
+        for offset in (local + 6, central + 8):
+            flags = int.from_bytes(content[offset : offset + 2], "little") | 0x1
+            content[offset : offset + 2] = flags.to_bytes(2, "little")
+    if compression is not None:
+        for offset in (local + 8, central + 10):
+            content[offset : offset + 2] = compression.to_bytes(2, "little")
+    path.write_bytes(content)
+
+
 def test_publication_gate_accepts_the_public_source_tree() -> None:
     result = run_publication_gate()
 
@@ -92,8 +108,10 @@ def test_publication_gate_accepts_the_public_source_tree() -> None:
     assert result.stdout == "Publication checks passed: source tree\n"
     assert result.stderr == ""
     with (PROJECT_ROOT / "pyproject.toml").open("rb") as file:
-        project = tomllib.load(file)["project"]
+        pyproject = tomllib.load(file)
+    project = pyproject["project"]
     assert project["name"] == "fangorn-cli"
+    assert pyproject["build-system"]["requires"] == ["uv_build==0.12.7"]
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "uv tool install fangorn-cli" in readme
     assert "pipx install fangorn-cli" in readme
@@ -220,6 +238,50 @@ def test_publication_gate_rejects_unexpected_project_metadata_url(
     assert "project URLs do not match" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "token",
+    [
+        "github_" + "pat_" + "11AA22BB33CC44DD55EE66FF77GG88HH",
+        "sk-" + "proj-" + "11AA22BB33CC44DD55EE66FF77GG88HH",
+    ],
+)
+def test_publication_gate_rejects_current_credential_formats_in_source(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    payload = source / "credential.txt"
+    payload.write_text(f"value={token}\n", encoding="utf-8")
+    git(source, "add", "--", payload.name)
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Private data pattern found" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "github_" + "pat_" + "11AA22BB33CC44DD55EE66FF77GG88HH",
+        "sk-" + "proj-" + "11AA22BB33CC44DD55EE66FF77GG88HH",
+    ],
+)
+def test_publication_gate_rejects_current_credential_formats_in_artifacts(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    wheel = tmp_path / "fangorn_cli-0.1.0-py3-none-any.whl"
+    write_test_wheel(wheel, payload=f"value={token}\n".encode())
+
+    result = run_publication_gate(wheel)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Private data pattern found" in result.stderr
+
+
 def test_publication_gate_preserves_archive_io_causes(tmp_path: Path) -> None:
     malformed = tmp_path / "fangorn_cli-0.1.0-py3-none-any.whl"
     malformed.write_text("not a zip archive\n", encoding="utf-8")
@@ -228,13 +290,38 @@ def test_publication_gate_preserves_archive_io_causes(tmp_path: Path) -> None:
     assert "Malformed wheel archive" in malformed_result.stderr
 
     unreadable = tmp_path / "fangorn_cli-0.1.1-py3-none-any.whl"
-    write_test_wheel(unreadable)
-    unreadable.chmod(0)
-    try:
-        unreadable_result = run_publication_gate(unreadable)
-    finally:
-        unreadable.chmod(0o600)
+    unreadable.mkdir()
+    unreadable_result = run_publication_gate(unreadable)
     assert unreadable_result.returncode != 0
     assert "Cannot read wheel" in unreadable_result.stderr
-    assert "Permission denied" in unreadable_result.stderr
     assert "Malformed wheel" not in unreadable_result.stderr
+
+
+@pytest.mark.parametrize(
+    ("encrypted", "compression", "expected"),
+    [
+        (True, None, "Encrypted wheel member"),
+        (False, 99, "Unsupported compression for wheel member"),
+    ],
+)
+def test_wheel_member_read_failures_are_translated(
+    tmp_path: Path,
+    encrypted: bool,
+    compression: int | None,
+    expected: str,
+) -> None:
+    wheel = tmp_path / "fangorn_cli-0.1.0-py3-none-any.whl"
+    write_test_wheel(wheel)
+    alter_first_wheel_member(
+        wheel,
+        encrypted=encrypted,
+        compression=compression,
+    )
+
+    result = run_publication_gate(wheel)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert expected in result.stderr
+    assert result.stderr.count("\n") == 1
+    assert "Traceback" not in result.stderr

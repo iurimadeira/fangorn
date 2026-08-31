@@ -32,6 +32,8 @@ SENSITIVE_SUFFIXES = {".key", ".p12", ".pem"}
 CONTENT_PATTERNS = (
     re.compile(r"/(?:home|Users)/[^/\s]+/"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github[_]pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"sk[-]proj-[A-Za-z0-9_-]{20,}"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
 )
 PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
@@ -208,6 +210,10 @@ def validate_source(source: Path) -> None:
         "Build backend must be uv_build",
     )
     _require(
+        build_system.get("requires") == ["uv_build==0.12.7"],
+        "Build backend requirement must be uv_build==0.12.7",
+    )
+    _require(
         build_backend.get("module-name") == "fangorn",
         "Build module must remain fangorn",
     )
@@ -270,7 +276,20 @@ def _zip_contents(path: Path) -> list[tuple[str, bytes]]:
                     mode != stat.S_IFLNK, f"Archive contains symlink: {member.filename}"
                 )
                 if not member.is_dir():
-                    contents.append((member.filename, archive.read(member)))
+                    try:
+                        content = archive.read(member)
+                    except NotImplementedError as error:
+                        raise CheckFailure(
+                            "Unsupported compression for wheel member: "
+                            f"{member.filename}"
+                        ) from error
+                    except RuntimeError as error:
+                        if not member.flag_bits & 0x1:
+                            raise
+                        raise CheckFailure(
+                            f"Encrypted wheel member cannot be read: {member.filename}"
+                        ) from error
+                    contents.append((member.filename, content))
     except zipfile.BadZipFile as error:
         raise CheckFailure(f"Malformed wheel archive: {path}") from error
     except OSError as error:
