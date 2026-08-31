@@ -3,7 +3,7 @@ requires = ["uv_build>=0.12.7,<0.13.0"]
 build-backend = "uv_build"
 
 [project]
-name = "fangorn"
+name = "fangorn-cli"
 version = "0.1.0"
 description = "Worktree-native workspace families for humans and agents"
 readme = "README.md"
@@ -50,6 +50,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.uv.build-backend]
+module-name = "fangorn"
 source-include = [".github/**", "scripts/**", "tests/**", "uv.lock"]
 
 [tool.mypy]

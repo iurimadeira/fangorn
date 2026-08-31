@@ -40,7 +40,7 @@ jobs:
         run: uv run mypy
       - name: Build wheel and source distribution
         run: uv build
-      - name: Check license, provenance, and privacy
+      - name: Check license and privacy
         run: uv run python scripts/check_publication.py --source . dist/*
       - name: Smoke-test installed wheel
         run: uv run --isolated --no-project --with dist/*.whl fangorn --help

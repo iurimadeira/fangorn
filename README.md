@@ -20,13 +20,13 @@ Click is Fangorn's only third-party runtime dependency.
 With uv:
 
 ```sh
-uv tool install fangorn
+uv tool install fangorn-cli
 ```
 
 With pipx:
 
 ```sh
-pipx install fangorn
+pipx install fangorn-cli
 ```
 
 ## Use

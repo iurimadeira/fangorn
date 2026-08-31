@@ -1,8 +1,5 @@
 # Third-party notices
 
-Fangorn's source is original work for this project and does not incorporate a
-legacy workspace implementation.
-
 ## Click
 
 Fangorn uses [Click](https://github.com/pallets/click) as its only third-party

@@ -33,6 +33,10 @@ CONTENT_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
 )
 PRIVATE_KEY_MARKER = "-----BEGIN " + "PRIVATE KEY-----"
+EXPECTED_PROJECT_URLS = {
+    "Homepage": "https://github.com/iurimadeira/fangorn",
+    "Issues": "https://github.com/iurimadeira/fangorn/issues",
+}
 
 
 class CheckFailure(RuntimeError):
@@ -59,7 +63,14 @@ def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
         if path.is_symlink():
             raise CheckFailure(f"Source tree contains a symlink: {relative}")
         if path.is_file():
-            yield relative.as_posix(), path.read_bytes()
+            try:
+                content = path.read_bytes()
+            except OSError as error:
+                detail = error.strerror or str(error)
+                raise CheckFailure(
+                    f"Cannot read source file {relative}: {detail}"
+                ) from error
+            yield relative.as_posix(), content
 
 
 def _validate_public_content(name: str, content: bytes) -> None:
@@ -70,12 +81,11 @@ def _validate_public_content(name: str, content: bytes) -> None:
         path.suffix.lower() not in SENSITIVE_SUFFIXES,
         f"Sensitive file type included: {name}",
     )
-    if b"\0" in content:
-        return
+    _require(b"\0" not in content, f"Unexpected binary content: {name}")
     try:
         text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        return
+    except UnicodeDecodeError as error:
+        raise CheckFailure(f"Content is not valid UTF-8: {name}") from error
     _require(PRIVATE_KEY_MARKER not in text, f"Private key material found: {name}")
     for pattern in CONTENT_PATTERNS:
         _require(pattern.search(text) is None, f"Private data pattern found: {name}")
@@ -91,8 +101,10 @@ def validate_source(source: Path) -> None:
 
     project = pyproject.get("project", {})
     build_system = pyproject.get("build-system", {})
+    build_backend = pyproject.get("tool", {}).get("uv", {}).get("build-backend", {})
     dependencies = project.get("dependencies", [])
     dev_dependencies = pyproject.get("dependency-groups", {}).get("dev", [])
+    _require(project.get("name") == "fangorn-cli", "Project name must be fangorn-cli")
     _require(project.get("license") == "MIT", "Project license must be MIT")
     _require(
         set(project.get("license-files", [])) == {"LICENSE", "THIRD_PARTY_NOTICES.md"},
@@ -105,6 +117,14 @@ def validate_source(source: Path) -> None:
     _require(
         build_system.get("build-backend") == "uv_build",
         "Build backend must be uv_build",
+    )
+    _require(
+        build_backend.get("module-name") == "fangorn",
+        "Build module must remain fangorn",
+    )
+    _require(
+        project.get("urls") == EXPECTED_PROJECT_URLS,
+        "Project URLs do not match the public repository",
     )
     _require(
         isinstance(dependencies, list)
@@ -126,10 +146,10 @@ def validate_source(source: Path) -> None:
     readme = _text(source / "README.md")
     workflow = _text(source / ".github" / "workflows" / "ci.yml")
     _require("MIT License" in license_text, "LICENSE is not the MIT License")
-    _require("Click" in notices, "Click provenance notice is missing")
+    _require("Click" in notices, "Click dependency notice is missing")
     _require("BSD-3-Clause" in notices, "Click license notice is missing")
-    _require("uv tool install fangorn" in readme, "uv install instructions missing")
-    _require("pipx install fangorn" in readme, "pipx install instructions missing")
+    _require("uv tool install fangorn-cli" in readme, "uv install instructions missing")
+    _require("pipx install fangorn-cli" in readme, "pipx install instructions missing")
     _require("ubuntu-latest" in workflow, "Linux CI is missing")
     _require("macos-latest" in workflow, "macOS CI is missing")
     _require("uv build" in workflow, "Distribution build check is missing")
@@ -162,8 +182,11 @@ def _zip_contents(path: Path) -> list[tuple[str, bytes]]:
                 )
                 if not member.is_dir():
                     contents.append((member.filename, archive.read(member)))
-    except (OSError, zipfile.BadZipFile) as error:
-        raise CheckFailure(f"Invalid wheel: {path}") from error
+    except zipfile.BadZipFile as error:
+        raise CheckFailure(f"Malformed wheel archive: {path}") from error
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise CheckFailure(f"Cannot read wheel {path}: {detail}") from error
     return contents
 
 
@@ -184,15 +207,28 @@ def _tar_contents(path: Path) -> list[tuple[str, bytes]]:
                         f"Cannot read archive entry: {member.name}",
                     )
                     contents.append((member.name, extracted.read()))
-    except (OSError, tarfile.TarError) as error:
-        raise CheckFailure(f"Invalid source distribution: {path}") from error
+    except tarfile.TarError as error:
+        raise CheckFailure(f"Malformed source distribution archive: {path}") from error
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise CheckFailure(
+            f"Cannot read source distribution {path}: {detail}"
+        ) from error
     return contents
 
 
 def validate_artifact(path: Path) -> None:
     if path.suffix == ".whl":
+        _require(
+            path.name.startswith("fangorn_cli-"),
+            f"Unexpected wheel name: {path.name}",
+        )
         contents = _zip_contents(path)
     elif path.name.endswith(".tar.gz"):
+        _require(
+            path.name.startswith("fangorn_cli-"),
+            f"Unexpected source distribution name: {path.name}",
+        )
         contents = _tar_contents(path)
     else:
         raise CheckFailure(f"Unsupported distribution artifact: {path}")
@@ -216,21 +252,47 @@ def validate_artifact(path: Path) -> None:
             if name.endswith(".dist-info/METADATA")
         ]
         _require(len(metadata_entries) == 1, f"Wheel metadata missing from {path}")
-        metadata = metadata_entries[0].decode("utf-8")
-        _require("License-Expression: MIT" in metadata, "Wheel MIT metadata missing")
-        _require("Requires-Python: >=3.12" in metadata, "Wheel Python metadata missing")
-        runtime_dependencies = re.findall(
-            r"^Requires-Dist:\s*([A-Za-z0-9_.-]+)", metadata, re.MULTILINE
-        )
+    else:
+        metadata_entries = [
+            content for name, content in contents if name.endswith("/PKG-INFO")
+        ]
         _require(
-            [dependency.lower() for dependency in runtime_dependencies] == ["click"],
-            "Wheel must contain only the Click runtime dependency",
+            len(metadata_entries) == 1,
+            f"Source distribution metadata missing from {path}",
         )
+    _validate_project_metadata(metadata_entries[0], path)
+
+
+def _validate_project_metadata(content: bytes, path: Path) -> None:
+    metadata = content.decode("utf-8")
+    _require(
+        re.search(r"^Name: fangorn-cli$", metadata, re.MULTILINE) is not None,
+        f"Distribution project name does not match: {path}",
+    )
+    _require("License-Expression: MIT" in metadata, "MIT metadata missing")
+    _require("Requires-Python: >=3.12" in metadata, "Python metadata missing")
+    runtime_dependencies = re.findall(
+        r"^Requires-Dist:\s*([A-Za-z0-9_.-]+)", metadata, re.MULTILINE
+    )
+    _require(
+        [dependency.lower() for dependency in runtime_dependencies] == ["click"],
+        "Distribution must contain only the Click runtime dependency",
+    )
+    project_urls = {
+        label: url
+        for label, url in re.findall(
+            r"^Project-URL:\s*([^,]+),\s*(\S+)$", metadata, re.MULTILINE
+        )
+    }
+    _require(
+        project_urls == EXPECTED_PROJECT_URLS,
+        f"Distribution project URLs do not match: {path}",
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check Fangorn license, provenance, and public artifact privacy."
+        description="Check Fangorn license and public artifact privacy."
     )
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("artifacts", type=Path, nargs="*")
