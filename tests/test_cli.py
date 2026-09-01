@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -605,7 +605,7 @@ def test_adoption_lock_retry_stops_at_its_command_deadline(
     holder.execute("BEGIN IMMEDIATE")
     real_connect = sqlite3.connect
     clock = {"now": 0.0}
-    connection_attempts: list[float] = []
+    connection_timeouts: list[float] = []
 
     def connect_without_wait(
         database: Path,
@@ -613,7 +613,7 @@ def test_adoption_lock_retry_stops_at_its_command_deadline(
         timeout: float,
         isolation_level: None,
     ) -> sqlite3.Connection:
-        connection_attempts.append(timeout)
+        connection_timeouts.append(timeout)
         return real_connect(database, timeout=0.0, isolation_level=isolation_level)
 
     def monotonic() -> float:
@@ -630,15 +630,96 @@ def test_adoption_lock_retry_stops_at_its_command_deadline(
     try:
         with pytest.raises(
             RegistryError,
-            match="Registry remained busy for 2 seconds",
-        ):
+            match=re.escape("Registry remained busy for 0.02 seconds"),
+        ) as failure:
             registry.adopt(initial)
     finally:
         holder.rollback()
         holder.close()
 
-    assert connection_attempts == pytest.approx([0.02, 0.01])
+    assert connection_timeouts == [0.0, 0.0]
     assert clock["now"] == pytest.approx(0.02)
+    cause = failure.value.__cause__
+    assert isinstance(cause, sqlite3.OperationalError)
+    assert cause.sqlite_errorcode == sqlite3.SQLITE_BUSY
+
+
+def test_adoption_materializes_result_before_commit_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    initial = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    real_connect = sqlite3.connect
+    adoption_commits: list[None] = []
+    post_commit_failures: list[None] = []
+    reobservations: list[WorktreeObservation] = []
+
+    class InjectedBusyError(sqlite3.OperationalError):
+        sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    class PostCommitContentionConnection(sqlite3.Connection):
+        commit_count = 0
+
+        def commit(self) -> None:
+            super().commit()
+            self.commit_count += 1
+            if self.commit_count == 2:
+                adoption_commits.append(None)
+
+        def execute(
+            self,
+            sql: str,
+            parameters: Any = (),
+            /,
+        ) -> sqlite3.Cursor:
+            if (
+                self.commit_count >= 2
+                and sql.lstrip().startswith("SELECT workspaces.*")
+                and not post_commit_failures
+            ):
+                post_commit_failures.append(None)
+                raise InjectedBusyError("database is locked")
+            return super().execute(sql, parameters)
+
+    def instrumented_connect(
+        database: Path,
+        *,
+        timeout: float,
+        isolation_level: None,
+    ) -> sqlite3.Connection:
+        return real_connect(
+            database,
+            timeout=timeout,
+            isolation_level=isolation_level,
+            factory=PostCommitContentionConnection,
+        )
+
+    def reobserve(
+        reserve_observation: Callable[[], int],
+    ) -> WorktreeObservation:
+        observation = observe_worktree(
+            repository,
+            reserve_observation=reserve_observation,
+        )
+        reobservations.append(observation)
+        return observation
+
+    monkeypatch.setattr("fangorn.registry.sqlite3.connect", instrumented_connect)
+
+    workspace, created = registry.adopt(initial, reobserve=reobserve)
+
+    assert created is True
+    assert workspace.git_dir == str(initial.git_dir)
+    assert len(reobservations) == 1
+    assert adoption_commits == [None]
+    assert post_commit_failures == []
 
 
 def test_linked_worktree_uses_its_canonical_git_directory_generation_marker(

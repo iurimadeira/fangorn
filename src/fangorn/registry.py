@@ -166,40 +166,39 @@ class Registry:
         reobserve: Callable[[Callable[[], int]], WorktreeObservation] | None = None,
     ) -> tuple[WorkspaceRecord, bool]:
         deadline = time.monotonic() + ADOPTION_TIMEOUT_SECONDS
-        last_busy_error: RegistryError | None = None
+        last_busy_cause: sqlite3.Error | None = None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if last_busy_error is not None:
-                    raise last_busy_error
-                raise RegistryError(
-                    f"Registry remained busy for {BUSY_TIMEOUT_SECONDS:g} seconds"
-                )
+                break
             try:
                 return self._adopt_once(
                     observation,
                     reobserve=reobserve,
-                    timeout=min(BUSY_TIMEOUT_SECONDS, remaining),
                 )
             except RegistryError as error:
-                if not _caused_by_sqlite_contention(error):
+                busy_cause = _sqlite_contention_cause(error)
+                if busy_cause is None:
                     raise
-                last_busy_error = error
+                last_busy_cause = busy_cause
 
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise last_busy_error
-            time.sleep(min(ADOPTION_RETRY_DELAY_SECONDS, remaining))
+            if remaining > 0:
+                time.sleep(min(ADOPTION_RETRY_DELAY_SECONDS, remaining))
+
+        raise RegistryError(
+            "Registry remained busy for "
+            f"{ADOPTION_TIMEOUT_SECONDS:g} seconds during adoption"
+        ) from last_busy_cause
 
     def _adopt_once(
         self,
         observation: WorktreeObservation,
         *,
         reobserve: Callable[[Callable[[], int]], WorktreeObservation] | None,
-        timeout: float,
     ) -> tuple[WorkspaceRecord, bool]:
         requested_path = observation.path
-        with self._connection(timeout=timeout) as connection:
+        with self._connection(timeout=0.0) as connection:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -316,26 +315,29 @@ class Registry:
                             observation_token,
                         ),
                     )
+                row = connection.execute(
+                    """
+                    SELECT workspaces.*, repositories.git_common_dir,
+                        repositories.git_common_dir_generation
+                    FROM workspaces
+                    JOIN repositories
+                        ON repositories.id = workspaces.repository_id
+                    WHERE workspaces.id = ?
+                    """,
+                    (workspace_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryError(
+                        "Adopted Workspace disappeared from the registry"
+                    )
+                record = _workspace_from_row(row)
                 connection.commit()
+                return record, created
             except (sqlite3.Error, GitError, RegistryError) as error:
                 connection.rollback()
                 if isinstance(error, (GitError, RegistryError)):
                     raise
                 raise _registry_error(error) from error
-
-            row = connection.execute(
-                """
-                SELECT workspaces.*, repositories.git_common_dir,
-                    repositories.git_common_dir_generation
-                FROM workspaces
-                JOIN repositories ON repositories.id = workspaces.repository_id
-                WHERE workspaces.id = ?
-                """,
-                (workspace_id,),
-            ).fetchone()
-            if row is None:
-                raise RegistryError("Adopted Workspace disappeared from the registry")
-            return _workspace_from_row(row), created
 
     def reserve_observation(self) -> int:
         with self._connection() as connection:
@@ -693,13 +695,13 @@ def _registry_error(error: sqlite3.Error) -> RegistryError:
     return RegistryError(f"Registry operation failed: {error}")
 
 
-def _caused_by_sqlite_contention(error: RegistryError) -> bool:
+def _sqlite_contention_cause(error: RegistryError) -> sqlite3.Error | None:
     cause = error.__cause__
     while cause is not None:
         if isinstance(cause, sqlite3.Error) and _is_sqlite_contention(cause):
-            return True
+            return cause
         cause = cause.__cause__
-    return False
+    return None
 
 
 def _is_sqlite_contention(error: sqlite3.Error) -> bool:
