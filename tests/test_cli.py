@@ -506,18 +506,22 @@ def test_marker_cleanup_does_not_mask_a_publication_failure(
     repository = tmp_path / "repository"
     create_repository(repository)
     git_dir = repository / ".git"
-    real_unlink = Path.unlink
+    pending_name = f".{GENERATION_MARKER_NAME}.pending"
+    real_unlink = os.unlink
+    replace_attempted = False
 
     def fail_replace(*_arguments: object, **_options: object) -> None:
+        nonlocal replace_attempted
+        replace_attempted = True
         raise OSError("publication failed")
 
-    def fail_pending_cleanup(path: Path, *, missing_ok: bool = False) -> None:
-        if path.name == f".{GENERATION_MARKER_NAME}.pending":
+    def fail_pending_cleanup(path: str, *, dir_fd: int | None = None) -> None:
+        if path == pending_name and replace_attempted:
             raise OSError("cleanup failed")
-        real_unlink(path, missing_ok=missing_ok)
+        real_unlink(path, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "replace", fail_replace)
-    monkeypatch.setattr(Path, "unlink", fail_pending_cleanup)
+    monkeypatch.setattr(os, "unlink", fail_pending_cleanup)
 
     with pytest.raises(GitError, match="publication failed"):
         git_adapter._create_generation_marker(git_dir)
@@ -531,14 +535,14 @@ def test_marker_cleanup_failure_without_a_primary_error_is_a_git_error(
     git_dir = repository / ".git"
     pending = git_dir / f".{GENERATION_MARKER_NAME}.pending"
     pending.write_text("incomplete", encoding="ascii")
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
 
-    def fail_pending_cleanup(path: Path, *, missing_ok: bool = False) -> None:
-        if path == pending:
+    def fail_pending_cleanup(path: str, *, dir_fd: int | None = None) -> None:
+        if path == pending.name:
             raise OSError("cleanup failed")
-        real_unlink(path, missing_ok=missing_ok)
+        real_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "unlink", fail_pending_cleanup)
+    monkeypatch.setattr(os, "unlink", fail_pending_cleanup)
 
     with pytest.raises(GitError, match="cleanup failed"):
         git_adapter._create_generation_marker(git_dir)
@@ -612,6 +616,43 @@ def test_timed_out_contender_leaves_owner_pending_marker(
     assert pending.read_text(encoding="ascii") == f"{owner_generation}\n"
     os.replace(pending, marker)
     assert git_adapter._read_generation_marker(git_dir) == owner_generation
+
+
+def test_marker_publication_rejects_a_locked_directory_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    administrative_directory = tmp_path / "administrative"
+    replacement_directory = tmp_path / "replacement"
+    detached_directory = tmp_path / "detached"
+    administrative_directory.mkdir()
+    replacement_directory.mkdir()
+    pending_name = f".{GENERATION_MARKER_NAME}.pending"
+    contender_pending = replacement_directory / pending_name
+    contender_pending.write_text("contender publication\n", encoding="ascii")
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    contender_descriptor = os.open(replacement_directory, directory_flags)
+    fcntl.flock(contender_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    acquire_lock = git_adapter._acquire_marker_lock
+
+    def acquire_then_swap(descriptor: int) -> None:
+        acquire_lock(descriptor)
+        administrative_directory.rename(detached_directory)
+        replacement_directory.rename(administrative_directory)
+
+    monkeypatch.setattr(git_adapter, "_acquire_marker_lock", acquire_then_swap)
+    try:
+        with pytest.raises(GitError, match="changed while locked"):
+            git_adapter._create_generation_marker(administrative_directory)
+    finally:
+        os.close(contender_descriptor)
+
+    assert not (detached_directory / pending_name).exists()
+    assert (administrative_directory / pending_name).read_text(encoding="ascii") == (
+        "contender publication\n"
+    )
+    assert not (administrative_directory / GENERATION_MARKER_NAME).exists()
 
 
 def test_adopt_target_wins_over_inherited_repository_git_environment(

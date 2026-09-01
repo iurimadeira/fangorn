@@ -344,10 +344,18 @@ def _read_generation_marker(
     *,
     marker_name: str = GENERATION_MARKER_NAME,
     identity: str = "worktree",
+    directory_descriptor: int | None = None,
 ) -> str | None:
     marker = directory / marker_name
     try:
-        metadata = marker.lstat()
+        if directory_descriptor is None:
+            metadata = marker.lstat()
+        else:
+            metadata = os.stat(
+                marker_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -367,7 +375,11 @@ def _read_generation_marker(
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        descriptor = os.open(marker, flags)
+        descriptor = os.open(
+            marker if directory_descriptor is None else marker_name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise GitError(
@@ -416,7 +428,7 @@ def _create_generation_marker(
     identity: str = "worktree",
 ) -> str:
     marker = directory / marker_name
-    pending = directory / f".{marker_name}.pending"
+    pending_name = f".{marker_name}.pending"
     directory_descriptor: int | None = None
     pending_descriptor: int | None = None
     lock_acquired = False
@@ -424,6 +436,8 @@ def _create_generation_marker(
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         directory_descriptor = os.open(directory, flags)
         if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
             raise GitError(
@@ -431,38 +445,60 @@ def _create_generation_marker(
             )
         _acquire_marker_lock(directory_descriptor)
         lock_acquired = True
+        _verify_locked_directory(directory, directory_descriptor, identity=identity)
 
         winner = _read_generation_marker(
-            directory, marker_name=marker_name, identity=identity
+            directory,
+            marker_name=marker_name,
+            identity=identity,
+            directory_descriptor=directory_descriptor,
         )
         if winner is not None:
-            _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=False)
+            _verify_locked_directory(directory, directory_descriptor, identity=identity)
+            _cleanup_pending_marker(
+                pending_name, directory_descriptor, ignore_errors=False
+            )
             os.fsync(directory_descriptor)
             return winner
 
-        _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=False)
+        _cleanup_pending_marker(pending_name, directory_descriptor, ignore_errors=False)
         generation = secrets.token_hex(32)
         payload = f"{generation}\n".encode("ascii")
         pending_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             pending_flags |= os.O_NOFOLLOW
-        pending_descriptor = os.open(pending, pending_flags, 0o600)
+        pending_descriptor = os.open(
+            pending_name,
+            pending_flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
         written = 0
         while written < len(payload):
             written += os.write(pending_descriptor, payload[written:])
         os.fsync(pending_descriptor)
         os.close(pending_descriptor)
         pending_descriptor = None
-        os.replace(pending, marker)
+        _verify_locked_directory(directory, directory_descriptor, identity=identity)
+        os.replace(
+            pending_name,
+            marker_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
         os.fsync(directory_descriptor)
         return generation
     except GitError:
         if directory_descriptor is not None and lock_acquired:
-            _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=True)
+            _cleanup_pending_marker(
+                pending_name, directory_descriptor, ignore_errors=True
+            )
         raise
     except OSError as error:
         if directory_descriptor is not None and lock_acquired:
-            _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=True)
+            _cleanup_pending_marker(
+                pending_name, directory_descriptor, ignore_errors=True
+            )
         detail = error.strerror or str(error)
         raise GitError(
             f"Cannot create Fangorn {identity} generation marker {marker}: {detail}"
@@ -484,11 +520,10 @@ def _create_generation_marker(
 
 
 def _cleanup_pending_marker(
-    pending: Path, directory_descriptor: int, *, ignore_errors: bool
+    pending_name: str, directory_descriptor: int, *, ignore_errors: bool
 ) -> None:
     try:
-        pending.lstat()
-        pending.unlink()
+        os.unlink(pending_name, dir_fd=directory_descriptor)
         os.fsync(directory_descriptor)
     except FileNotFoundError:
         return
@@ -499,6 +534,28 @@ def _cleanup_pending_marker(
         raise GitError(
             f"Cannot clean up Fangorn generation marker publication: {detail}"
         ) from error
+
+
+def _verify_locked_directory(
+    directory: Path, directory_descriptor: int, *, identity: str
+) -> None:
+    try:
+        opened = os.fstat(directory_descriptor)
+        current = directory.stat()
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise GitError(
+            f"Cannot verify locked Git {identity} administrative directory "
+            f"{directory}: {detail}"
+        ) from error
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise GitError(
+            f"Git {identity} administrative directory changed while locked: {directory}"
+        )
 
 
 def _acquire_marker_lock(descriptor: int) -> None:
