@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fcntl
+import importlib
+import importlib.metadata
 import json
 import os
 import re
@@ -20,6 +22,7 @@ from uuid import UUID
 import pytest
 from git_helpers import git, initialize_repository
 
+import fangorn
 import fangorn.git as git_adapter
 from fangorn.git import GitError, observe_worktree
 from fangorn.registry import Registry, RegistryError
@@ -81,6 +84,36 @@ def test_help_exposes_bootstrap_commands() -> None:
     assert "adopt" in result.stdout
     assert "info" in result.stdout
     assert "list" in result.stdout
+
+
+def test_package_version_comes_from_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed_version = importlib.metadata.version("fangorn-cli")
+    requested: list[str] = []
+
+    def fake_version(distribution_name: str) -> str:
+        requested.append(distribution_name)
+        return "9.8.7"
+
+    monkeypatch.setattr(importlib.metadata, "version", fake_version)
+    try:
+        importlib.reload(fangorn)
+        assert fangorn.__version__ == "9.8.7"
+        assert requested == ["fangorn-cli"]
+    finally:
+        monkeypatch.undo()
+        importlib.reload(fangorn)
+
+    result = subprocess.run(
+        [fangorn_executable(), "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"fangorn, version {installed_version}\n"
+    assert result.stderr == ""
 
 
 def test_unborn_worktree_is_adoptable_and_keeps_nullable_head(tmp_path: Path) -> None:
