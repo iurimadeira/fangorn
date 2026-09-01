@@ -41,6 +41,7 @@ EXPECTED_PROJECT_URLS = {
     "Homepage": "https://github.com/iurimadeira/fangorn",
     "Issues": "https://github.com/iurimadeira/fangorn/issues",
 }
+EXACT_RUNTIME_DEPENDENCY = "click>=8.1.8,<9"
 
 
 class CheckFailure(RuntimeError):
@@ -182,7 +183,7 @@ def _validate_public_content(name: str, content: bytes) -> None:
         _require(pattern.search(text) is None, f"Private data pattern found: {name}")
 
 
-def validate_source(source: Path) -> None:
+def validate_source(source: Path) -> tuple[str, bytes, bytes]:
     pyproject_path = source / "pyproject.toml"
     try:
         with pyproject_path.open("rb") as file:
@@ -195,7 +196,9 @@ def validate_source(source: Path) -> None:
     build_backend = pyproject.get("tool", {}).get("uv", {}).get("build-backend", {})
     dependencies = project.get("dependencies", [])
     dev_dependencies = pyproject.get("dependency-groups", {}).get("dev", [])
+    version = project.get("version")
     _require(project.get("name") == "fangorn-cli", "Project name must be fangorn-cli")
+    _require(isinstance(version, str) and bool(version), "Project version is missing")
     _require(project.get("license") == "MIT", "Project license must be MIT")
     _require(
         set(project.get("license-files", [])) == {"LICENSE", "THIRD_PARTY_NOTICES.md"},
@@ -222,10 +225,8 @@ def validate_source(source: Path) -> None:
         "Project URLs do not match the public repository",
     )
     _require(
-        isinstance(dependencies, list)
-        and len(dependencies) == 1
-        and dependencies[0].lower().startswith("click"),
-        "Click must be the only runtime dependency",
+        dependencies == [EXACT_RUNTIME_DEPENDENCY],
+        f"Runtime dependency must be exactly {EXACT_RUNTIME_DEPENDENCY}",
     )
     for tool in ("pytest", "ruff", "mypy"):
         _require(
@@ -257,6 +258,12 @@ def validate_source(source: Path) -> None:
 
     for name, content in _source_files(source):
         _validate_public_content(name, content)
+
+    return (
+        version,
+        (source / "LICENSE").read_bytes(),
+        (source / "THIRD_PARTY_NOTICES.md").read_bytes(),
+    )
 
 
 def _safe_archive_name(name: str) -> None:
@@ -310,10 +317,8 @@ def _tar_contents(path: Path) -> list[tuple[str, bytes]]:
                 )
                 if member.isfile():
                     extracted = archive.extractfile(member)
-                    _require(
-                        extracted is not None,
-                        f"Cannot read archive entry: {member.name}",
-                    )
+                    if extracted is None:
+                        raise CheckFailure(f"Cannot read archive entry: {member.name}")
                     contents.append((member.name, extracted.read()))
     except tarfile.TarError as error:
         raise CheckFailure(f"Malformed source distribution archive: {path}") from error
@@ -325,66 +330,98 @@ def _tar_contents(path: Path) -> list[tuple[str, bytes]]:
     return contents
 
 
-def validate_artifact(path: Path) -> None:
-    if path.suffix == ".whl":
-        _require(
-            path.name.startswith("fangorn_cli-"),
-            f"Unexpected wheel name: {path.name}",
+def validate_artifact_set(
+    paths: list[Path],
+    *,
+    version: str,
+    license_content: bytes,
+    notices_content: bytes,
+) -> None:
+    wheels = [path for path in paths if path.suffix == ".whl"]
+    sdists = [path for path in paths if path.name.endswith(".tar.gz")]
+    _require(
+        len(paths) == 2 and len(wheels) == 1 and len(sdists) == 1,
+        "Release set must contain exactly one wheel and one source distribution",
+    )
+    _require(
+        wheels[0].name == f"fangorn_cli-{version}-py3-none-any.whl",
+        f"Wheel artifact filename does not match project version: {wheels[0].name}",
+    )
+    _require(
+        sdists[0].name == f"fangorn_cli-{version}.tar.gz",
+        "Source distribution artifact filename does not match project version: "
+        f"{sdists[0].name}",
+    )
+    for path in paths:
+        validate_artifact(
+            path,
+            version=version,
+            license_content=license_content,
+            notices_content=notices_content,
         )
+
+
+def validate_artifact(
+    path: Path,
+    *,
+    version: str,
+    license_content: bytes,
+    notices_content: bytes,
+) -> None:
+    if path.suffix == ".whl":
+        root = f"fangorn_cli-{version}.dist-info"
+        metadata_name = f"{root}/METADATA"
+        license_name = f"{root}/licenses/LICENSE"
+        notices_name = f"{root}/licenses/THIRD_PARTY_NOTICES.md"
         contents = _zip_contents(path)
     elif path.name.endswith(".tar.gz"):
-        _require(
-            path.name.startswith("fangorn_cli-"),
-            f"Unexpected source distribution name: {path.name}",
-        )
+        root = f"fangorn_cli-{version}"
+        metadata_name = f"{root}/PKG-INFO"
+        license_name = f"{root}/LICENSE"
+        notices_name = f"{root}/THIRD_PARTY_NOTICES.md"
         contents = _tar_contents(path)
     else:
         raise CheckFailure(f"Unsupported distribution artifact: {path}")
 
-    names = [name for name, _ in contents]
-    _require(
-        any(PurePosixPath(name).name == "LICENSE" for name in names),
-        f"LICENSE missing from {path}",
-    )
-    _require(
-        any(PurePosixPath(name).name == "THIRD_PARTY_NOTICES.md" for name in names),
-        f"Third-party notices missing from {path}",
-    )
     for name, content in contents:
         _validate_public_content(name, content)
+    entries = dict(contents)
+    _require(metadata_name in entries, f"Distribution metadata missing from {path}")
+    _require(license_name in entries, f"Expected LICENSE path missing from {path}")
+    _require(
+        notices_name in entries,
+        f"Expected third-party notices path missing from {path}",
+    )
+    _require(
+        entries[license_name] == license_content,
+        f"Packaged LICENSE does not match source: {path}",
+    )
+    _require(
+        entries[notices_name] == notices_content,
+        f"Packaged third-party notices do not match source: {path}",
+    )
+    _validate_project_metadata(entries[metadata_name], path, version=version)
 
-    if path.suffix == ".whl":
-        metadata_entries = [
-            content
-            for name, content in contents
-            if name.endswith(".dist-info/METADATA")
-        ]
-        _require(len(metadata_entries) == 1, f"Wheel metadata missing from {path}")
-    else:
-        metadata_entries = [
-            content for name, content in contents if name.endswith("/PKG-INFO")
-        ]
-        _require(
-            len(metadata_entries) == 1,
-            f"Source distribution metadata missing from {path}",
-        )
-    _validate_project_metadata(metadata_entries[0], path)
 
-
-def _validate_project_metadata(content: bytes, path: Path) -> None:
+def _validate_project_metadata(content: bytes, path: Path, *, version: str) -> None:
     metadata = content.decode("utf-8")
     _require(
         re.search(r"^Name: fangorn-cli$", metadata, re.MULTILINE) is not None,
         f"Distribution project name does not match: {path}",
     )
+    _require(
+        re.search(rf"^Version: {re.escape(version)}$", metadata, re.MULTILINE)
+        is not None,
+        f"Distribution metadata version does not match project: {path}",
+    )
     _require("License-Expression: MIT" in metadata, "MIT metadata missing")
     _require("Requires-Python: >=3.12" in metadata, "Python metadata missing")
     runtime_dependencies = re.findall(
-        r"^Requires-Dist:\s*([A-Za-z0-9_.-]+)", metadata, re.MULTILINE
+        r"^Requires-Dist:\s*(.+)$", metadata, re.MULTILINE
     )
     _require(
-        [dependency.lower() for dependency in runtime_dependencies] == ["click"],
-        "Distribution must contain only the Click runtime dependency",
+        runtime_dependencies == [EXACT_RUNTIME_DEPENDENCY],
+        f"Distribution must contain exact Requires-Dist: {EXACT_RUNTIME_DEPENDENCY}",
     )
     project_urls = {
         label: url
@@ -410,9 +447,16 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_arguments()
     try:
-        validate_source(arguments.source.resolve(strict=True))
-        for artifact in arguments.artifacts:
-            validate_artifact(artifact.resolve(strict=True))
+        version, license_content, notices_content = validate_source(
+            arguments.source.resolve(strict=True)
+        )
+        if arguments.artifacts:
+            validate_artifact_set(
+                [artifact.resolve(strict=True) for artifact in arguments.artifacts],
+                version=version,
+                license_content=license_content,
+                notices_content=notices_content,
+            )
     except (CheckFailure, OSError) as error:
         print(
             f"Publication check failed: {_terminal_safe(str(error))}",
