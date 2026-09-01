@@ -266,23 +266,38 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
     )
 
 
-def _safe_archive_name(name: str) -> None:
+def _canonical_archive_name(name: str, *, directory: bool) -> str:
     path = PurePosixPath(name)
     _require(not path.is_absolute(), f"Archive has an absolute path: {name}")
     _require(".." not in path.parts, f"Archive path escapes its root: {name}")
+    canonical = path.as_posix()
+    comparable = name[:-1] if directory and name.endswith("/") else name
+    _require(
+        canonical != "." and comparable == canonical,
+        f"Archive path is not canonical: {name}",
+    )
+    return canonical
 
 
 def _zip_contents(path: Path) -> list[tuple[str, bytes]]:
     contents: list[tuple[str, bytes]] = []
+    file_names: set[str] = set()
     try:
         with zipfile.ZipFile(path) as archive:
             for member in archive.infolist():
-                _safe_archive_name(member.filename)
+                name = _canonical_archive_name(
+                    member.filename, directory=member.is_dir()
+                )
                 mode = (member.external_attr >> 16) & 0o170000
                 _require(
                     mode != stat.S_IFLNK, f"Archive contains symlink: {member.filename}"
                 )
                 if not member.is_dir():
+                    _require(
+                        name not in file_names,
+                        f"Archive contains duplicate file path: {name}",
+                    )
+                    file_names.add(name)
                     try:
                         content = archive.read(member)
                     except NotImplementedError as error:
@@ -296,7 +311,7 @@ def _zip_contents(path: Path) -> list[tuple[str, bytes]]:
                         raise CheckFailure(
                             f"Encrypted wheel member cannot be read: {member.filename}"
                         ) from error
-                    contents.append((member.filename, content))
+                    contents.append((name, content))
     except zipfile.BadZipFile as error:
         raise CheckFailure(f"Malformed wheel archive: {path}") from error
     except OSError as error:
@@ -307,19 +322,25 @@ def _zip_contents(path: Path) -> list[tuple[str, bytes]]:
 
 def _tar_contents(path: Path) -> list[tuple[str, bytes]]:
     contents: list[tuple[str, bytes]] = []
+    file_names: set[str] = set()
     try:
         with tarfile.open(path, "r:gz") as archive:
             for member in archive.getmembers():
-                _safe_archive_name(member.name)
+                name = _canonical_archive_name(member.name, directory=member.isdir())
                 _require(
                     member.isfile() or member.isdir(),
                     f"Archive contains special entry: {member.name}",
                 )
                 if member.isfile():
+                    _require(
+                        name not in file_names,
+                        f"Archive contains duplicate file path: {name}",
+                    )
+                    file_names.add(name)
                     extracted = archive.extractfile(member)
                     if extracted is None:
                         raise CheckFailure(f"Cannot read archive entry: {member.name}")
-                    contents.append((member.name, extracted.read()))
+                    contents.append((name, extracted.read()))
     except tarfile.TarError as error:
         raise CheckFailure(f"Malformed source distribution archive: {path}") from error
     except OSError as error:

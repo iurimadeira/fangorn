@@ -72,6 +72,7 @@ def write_test_wheel(
     metadata_version: str = PROJECT_VERSION,
     dependency: str = EXACT_CLICK_REQUIREMENT,
     license_entries: dict[str, bytes] | None = None,
+    extra_entries: tuple[tuple[str, bytes], ...] = (),
 ) -> None:
     root = f"fangorn_cli-{PROJECT_VERSION}.dist-info"
     metadata = project_metadata(
@@ -87,7 +88,7 @@ def write_test_wheel(
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("fangorn/__init__.py", payload)
         archive.writestr(f"{root}/METADATA", metadata)
-        for name, content in license_entries.items():
+        for name, content in (*license_entries.items(), *extra_entries):
             archive.writestr(name, content)
 
 
@@ -116,6 +117,7 @@ def write_test_sdist(
     metadata_version: str = PROJECT_VERSION,
     dependency: str = EXACT_CLICK_REQUIREMENT,
     license_entries: dict[str, bytes] | None = None,
+    extra_entries: tuple[tuple[str, bytes], ...] = (),
 ) -> None:
     root = f"fangorn_cli-{PROJECT_VERSION}"
     if license_entries is None:
@@ -132,7 +134,7 @@ def write_test_sdist(
         **license_entries,
     }
     with tarfile.open(path, "w:gz") as archive:
-        for name, content in entries.items():
+        for name, content in (*entries.items(), *extra_entries):
             member = tarfile.TarInfo(name)
             member.size = len(content)
             member.mode = 0o644
@@ -341,6 +343,53 @@ def test_publication_gate_rejects_license_basename_collisions(
     assert result.returncode != 0
     assert result.stdout == ""
     assert "LICENSE does not match source" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("noncanonical", ["payload/./file.py", "payload//file.py"])
+def test_publication_gate_rejects_noncanonical_archive_member_paths(
+    tmp_path: Path,
+    artifact_kind: str,
+    noncanonical: str,
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, extra_entries=((noncanonical, b"value = 1\n"),))
+    else:
+        write_test_sdist(sdist, extra_entries=((noncanonical, b"value = 1\n"),))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Archive path is not canonical" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+def test_publication_gate_rejects_duplicate_canonical_license_paths(
+    tmp_path: Path,
+    artifact_kind: str,
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    if artifact_kind == "wheel":
+        license_name = f"fangorn_cli-{PROJECT_VERSION}.dist-info/licenses/LICENSE"
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            write_test_wheel(
+                wheel,
+                extra_entries=((license_name, LICENSE_BYTES),),
+            )
+    else:
+        license_name = f"fangorn_cli-{PROJECT_VERSION}/LICENSE"
+        write_test_sdist(
+            sdist,
+            extra_entries=((license_name, LICENSE_BYTES),),
+        )
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Archive contains duplicate file path" in result.stderr
 
 
 @pytest.mark.parametrize(
