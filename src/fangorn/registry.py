@@ -3,14 +3,14 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from fangorn.git import WorktreeObservation
+from fangorn.git import GitError, WorktreeObservation, observe_worktree
 
 BUSY_TIMEOUT_SECONDS = 2.0
 SCHEMA_VERSION = 1
@@ -156,23 +156,49 @@ class Registry:
             root = home / ".local" / "state"
         return cls(root / "fangorn" / "registry.sqlite3")
 
-    def adopt(self, observation: WorktreeObservation) -> tuple[WorkspaceRecord, bool]:
-        observation_token = _observation_token(observation)
-        if observation.git_common_dir_generation is None:
-            raise RegistryError(
-                "Fangorn repository generation marker is missing; "
-                "Repository identity drifted"
-            )
-        if observation.git_dir_generation is None:
-            raise RegistryError(
-                "Fangorn worktree generation marker is missing; "
-                "Workspace identity drifted"
-            )
+    def adopt(
+        self,
+        observation: WorktreeObservation,
+        *,
+        reobserve: Callable[[Callable[[], int]], WorktreeObservation] | None = None,
+    ) -> tuple[WorkspaceRecord, bool]:
+        requested_path = observation.path
         with self._connection() as connection:
             self._migrate(connection)
-            created_at = _timestamp()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                reserved_token: int | None = None
+
+                def reserve_observation() -> int:
+                    nonlocal reserved_token
+                    reserved_token = _reserve_observation(connection)
+                    return reserved_token
+
+                observation = (
+                    reobserve(reserve_observation)
+                    if reobserve is not None
+                    else observe_worktree(
+                        requested_path,
+                        reserve_observation=reserve_observation,
+                    )
+                )
+                observation_token = _observation_token(observation)
+                if observation_token != reserved_token:
+                    raise RegistryError(
+                        "Final Git observation token was not reserved by the "
+                        "adoption transaction"
+                    )
+                if observation.git_common_dir_generation is None:
+                    raise RegistryError(
+                        "Fangorn repository generation marker is missing; "
+                        "Repository identity drifted"
+                    )
+                if observation.git_dir_generation is None:
+                    raise RegistryError(
+                        "Fangorn worktree generation marker is missing; "
+                        "Workspace identity drifted"
+                    )
+                created_at = _timestamp()
                 repository = connection.execute(
                     """
                     SELECT id, git_common_dir_generation
@@ -255,9 +281,9 @@ class Registry:
                         ),
                     )
                 connection.commit()
-            except (sqlite3.Error, RegistryError) as error:
+            except (sqlite3.Error, GitError, RegistryError) as error:
                 connection.rollback()
-                if isinstance(error, RegistryError):
+                if isinstance(error, (GitError, RegistryError)):
                     raise
                 raise _registry_error(error) from error
 
@@ -280,22 +306,7 @@ class Registry:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    """
-                    UPDATE observation_clock
-                    SET current_token = current_token + 1
-                    WHERE singleton = 1
-                    """
-                )
-                row = connection.execute(
-                    """
-                    SELECT current_token FROM observation_clock
-                    WHERE singleton = 1
-                    """
-                ).fetchone()
-                if row is None:
-                    raise RegistryError("Registry observation clock is unavailable")
-                token = int(row["current_token"])
+                token = _reserve_observation(connection)
                 connection.commit()
                 return token
             except (sqlite3.Error, RegistryError) as error:
@@ -521,6 +532,25 @@ def _observation_token(observation: WorktreeObservation) -> int:
     if token is None or token <= 0:
         raise RegistryError("Registry observation token is missing or invalid")
     return token
+
+
+def _reserve_observation(connection: sqlite3.Connection) -> int:
+    connection.execute(
+        """
+        UPDATE observation_clock
+        SET current_token = current_token + 1
+        WHERE singleton = 1
+        """
+    )
+    row = connection.execute(
+        """
+        SELECT current_token FROM observation_clock
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    if row is None:
+        raise RegistryError("Registry observation clock is unavailable")
+    return int(row["current_token"])
 
 
 def _validate_worktree_binding(

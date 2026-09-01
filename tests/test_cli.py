@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +24,7 @@ from git_helpers import git, initialize_repository
 
 import fangorn
 import fangorn.git as git_adapter
-from fangorn.git import GitError, observe_worktree
+from fangorn.git import GitError, WorktreeObservation, observe_worktree
 from fangorn.registry import Registry, RegistryError
 
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
@@ -428,6 +428,103 @@ def test_established_marker_loss_fails_after_one_fresh_reobservation(
     )
     with pytest.raises(RegistryError, match="generation marker is missing"):
         registry.marker_creation_requirements(retried, markerless_reobserved=True)
+
+
+def test_first_adoption_uses_the_transaction_bound_reobservation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    initial = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    reobserved: list[WorktreeObservation] = []
+
+    def reobserve(reserve_observation: Callable[[], int]) -> WorktreeObservation:
+        observation = observe_worktree(
+            repository,
+            reserve_observation=reserve_observation,
+        )
+        reobserved.append(observation)
+        return observation
+
+    workspace, created = registry.adopt(initial, reobserve=reobserve)
+
+    assert created is True
+    assert len(reobserved) == 1
+    final = reobserved[0]
+    assert cast(int, final.observation_token) > cast(int, initial.observation_token)
+    assert workspace.git_common_dir_generation == final.git_common_dir_generation
+    assert workspace.git_dir_generation == final.git_dir_generation
+    assert workspace.last_observed_at == final.observed_at
+    assert workspace.last_observation_token == final.observation_token
+
+
+def test_stale_first_adopter_binds_the_live_replacement_generation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    stale = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    git_dir = repository / ".git"
+    stale_git_dir = repository / ".git-stale"
+    git_dir.rename(stale_git_dir)
+    shutil.copytree(
+        stale_git_dir,
+        git_dir,
+        ignore=shutil.ignore_patterns(
+            GENERATION_MARKER_NAME,
+            REPOSITORY_GENERATION_MARKER_NAME,
+        ),
+    )
+    repository_generation = "c" * 64
+    worktree_generation = "d" * 64
+    repository_marker = git_dir / REPOSITORY_GENERATION_MARKER_NAME
+    worktree_marker = git_dir / GENERATION_MARKER_NAME
+    repository_marker.write_text(f"{repository_generation}\n", encoding="ascii")
+    worktree_marker.write_text(f"{worktree_generation}\n", encoding="ascii")
+    repository_marker.chmod(0o600)
+    worktree_marker.chmod(0o600)
+    live = observe_worktree(
+        repository,
+        reserve_observation=registry.reserve_observation,
+    )
+    lock_verified = False
+
+    def reobserve(reserve_observation: Callable[[], int]) -> WorktreeObservation:
+        nonlocal lock_verified
+        contender = sqlite3.connect(registry.path, timeout=0, isolation_level=None)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                contender.execute("BEGIN IMMEDIATE")
+        finally:
+            contender.close()
+        lock_verified = True
+        return observe_worktree(
+            repository,
+            reserve_observation=reserve_observation,
+        )
+
+    adopted, created = registry.adopt(stale, reobserve=reobserve)
+    equivalent, equivalent_created = registry.adopt(live)
+
+    assert lock_verified is True
+    assert created is True
+    assert equivalent_created is False
+    assert adopted.id == equivalent.id
+    assert adopted.git_common_dir_generation == repository_generation
+    assert adopted.git_dir_generation == worktree_generation
+    assert adopted.git_common_dir_generation != stale.git_common_dir_generation
+    assert adopted.git_dir_generation != stale.git_dir_generation
+    assert adopted.last_observation_token > cast(int, live.observation_token)
 
 
 def test_linked_worktree_uses_its_canonical_git_directory_generation_marker(
@@ -1200,9 +1297,13 @@ def test_registry_rejects_a_changed_worktree_generation(tmp_path: Path) -> None:
     )
 
     assert created is True
-    for operation in (registry.get_by_worktree, registry.adopt):
-        with pytest.raises(RegistryError, match=r"generation marker changed.*drifted"):
-            operation(recreated)
+    with pytest.raises(RegistryError, match=r"generation marker changed.*drifted"):
+        registry.get_by_worktree(recreated)
+    with pytest.raises(RegistryError, match=r"generation marker changed.*drifted"):
+        registry.adopt(
+            recreated,
+            reobserve=lambda reserve: replace(recreated, observation_token=reserve()),
+        )
     listed = registry.list_workspaces()
     assert len(listed) == 1
     assert listed[0].git_dir_generation == adopted.git_dir_generation
@@ -1424,12 +1525,20 @@ def test_causal_observation_token_wins_despite_reversed_write_and_clock_rollback
         observed_at="2020-01-01T00:00:00.000001Z",
     )
     newer_token = cast(int, newer.observation_token)
+    final_tokens: list[int] = []
 
-    refreshed, was_created = registry.adopt(newer)
+    def reobserve(_reserve_observation: Callable[[], int]) -> WorktreeObservation:
+        token = _reserve_observation()
+        final_tokens.append(token)
+        return replace(newer, observation_token=token)
+
+    refreshed, was_created = registry.adopt(newer, reobserve=reobserve)
     reversed_write = registry.get_by_worktree(older)
 
     assert was_created is True
     assert older_token < newer_token
+    assert len(final_tokens) == 1
+    assert newer_token < final_tokens[0]
     assert refreshed.branch == "newer-branch"
     assert refreshed.last_observed_at == newer.observed_at
     assert reversed_write.branch == "newer-branch"
@@ -1440,10 +1549,10 @@ def test_causal_observation_token_wins_despite_reversed_write_and_clock_rollback
     try:
         assert connection.execute(
             "SELECT last_observation_token FROM workspaces"
-        ).fetchone() == (newer_token,)
+        ).fetchone() == (final_tokens[0],)
         assert connection.execute(
             "SELECT current_token FROM observation_clock WHERE singleton = 1"
-        ).fetchone() == (newer_token,)
+        ).fetchone() == (final_tokens[0],)
     finally:
         connection.close()
 
@@ -1640,7 +1749,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
         assert workspace_columns["last_observation_token"][3] == 1
         assert connection.execute(
             "SELECT singleton, current_token FROM observation_clock"
-        ).fetchone() == (1, 4)
+        ).fetchone() == (1, 6)
         repositories = connection.execute(
             "SELECT id, git_common_dir FROM repositories ORDER BY git_common_dir"
         ).fetchall()
