@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from uuid import uuid4
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
 
 BUSY_TIMEOUT_SECONDS = 2.0
+ADOPTION_TIMEOUT_SECONDS = 5.0
+ADOPTION_RETRY_DELAY_SECONDS = 0.01
 SCHEMA_VERSION = 1
 
 
@@ -162,8 +165,41 @@ class Registry:
         *,
         reobserve: Callable[[Callable[[], int]], WorktreeObservation] | None = None,
     ) -> tuple[WorkspaceRecord, bool]:
+        deadline = time.monotonic() + ADOPTION_TIMEOUT_SECONDS
+        last_busy_error: RegistryError | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last_busy_error is not None:
+                    raise last_busy_error
+                raise RegistryError(
+                    f"Registry remained busy for {BUSY_TIMEOUT_SECONDS:g} seconds"
+                )
+            try:
+                return self._adopt_once(
+                    observation,
+                    reobserve=reobserve,
+                    timeout=min(BUSY_TIMEOUT_SECONDS, remaining),
+                )
+            except RegistryError as error:
+                if not _caused_by_sqlite_contention(error):
+                    raise
+                last_busy_error = error
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise last_busy_error
+            time.sleep(min(ADOPTION_RETRY_DELAY_SECONDS, remaining))
+
+    def _adopt_once(
+        self,
+        observation: WorktreeObservation,
+        *,
+        reobserve: Callable[[Callable[[], int]], WorktreeObservation] | None,
+        timeout: float,
+    ) -> tuple[WorkspaceRecord, bool]:
         requested_path = observation.path
-        with self._connection() as connection:
+        with self._connection(timeout=timeout) as connection:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -447,13 +483,15 @@ class Registry:
             return [_workspace_from_row(row) for row in rows]
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(
+        self, *, timeout: float | None = None
+    ) -> Iterator[sqlite3.Connection]:
         _prepare_state_directory(self.path.parent)
         _prepare_database_file(self.path)
         try:
             connection = sqlite3.connect(
                 self.path,
-                timeout=BUSY_TIMEOUT_SECONDS,
+                timeout=BUSY_TIMEOUT_SECONDS if timeout is None else timeout,
                 isolation_level=None,
             )
         except sqlite3.Error as error:
@@ -648,8 +686,25 @@ def _prepare_database_file(path: Path) -> None:
 
 
 def _registry_error(error: sqlite3.Error) -> RegistryError:
-    if "locked" in str(error).lower() or "busy" in str(error).lower():
+    if _is_sqlite_contention(error):
         return RegistryError(
             f"Registry remained busy for {BUSY_TIMEOUT_SECONDS:g} seconds"
         )
     return RegistryError(f"Registry operation failed: {error}")
+
+
+def _caused_by_sqlite_contention(error: RegistryError) -> bool:
+    cause = error.__cause__
+    while cause is not None:
+        if isinstance(cause, sqlite3.Error) and _is_sqlite_contention(cause):
+            return True
+        cause = cause.__cause__
+    return False
+
+
+def _is_sqlite_contention(error: sqlite3.Error) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }

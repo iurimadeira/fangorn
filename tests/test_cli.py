@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Event
 from typing import cast
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from git_helpers import git, initialize_repository
 
 import fangorn
 import fangorn.git as git_adapter
+import fangorn.registry as registry_adapter
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
 from fangorn.registry import Registry, RegistryError
 
@@ -525,6 +527,118 @@ def test_stale_first_adopter_binds_the_live_replacement_generation(
     assert adopted.git_common_dir_generation != stale.git_common_dir_generation
     assert adopted.git_dir_generation != stale.git_dir_generation
     assert adopted.last_observation_token > cast(int, live.observation_token)
+
+
+def test_concurrent_adopter_retries_while_transaction_reobservation_is_slow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    initial = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    reobserver_entered = Event()
+    release_reobserver = Event()
+    retry_started = Event()
+    original_sleep = time.sleep
+
+    monkeypatch.setattr(registry_adapter, "BUSY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(registry_adapter, "ADOPTION_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(registry_adapter, "ADOPTION_RETRY_DELAY_SECONDS", 0.001)
+
+    def record_retry(delay: float) -> None:
+        retry_started.set()
+        original_sleep(delay)
+
+    monkeypatch.setattr("fangorn.registry.time.sleep", record_retry)
+
+    def slow_reobserve(
+        reserve_observation: Callable[[], int],
+    ) -> WorktreeObservation:
+        reobserver_entered.set()
+        assert release_reobserver.wait(2)
+        return observe_worktree(
+            repository,
+            reserve_observation=reserve_observation,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            registry.adopt,
+            initial,
+            reobserve=slow_reobserve,
+        )
+        assert reobserver_entered.wait(1)
+        second = executor.submit(registry.adopt, initial)
+        try:
+            assert retry_started.wait(1)
+        finally:
+            release_reobserver.set()
+        first_workspace, first_created = first.result()
+        second_workspace, second_created = second.result()
+
+    assert first_created is True
+    assert second_created is False
+    assert second_workspace.id == first_workspace.id
+    assert second_workspace.last_observation_token > (
+        first_workspace.last_observation_token
+    )
+
+
+def test_adoption_lock_retry_stops_at_its_command_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    initial = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    holder = sqlite3.connect(registry.path, timeout=0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    real_connect = sqlite3.connect
+    clock = {"now": 0.0}
+    connection_attempts: list[float] = []
+
+    def connect_without_wait(
+        database: Path,
+        *,
+        timeout: float,
+        isolation_level: None,
+    ) -> sqlite3.Connection:
+        connection_attempts.append(timeout)
+        return real_connect(database, timeout=0.0, isolation_level=isolation_level)
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def advance_clock(delay: float) -> None:
+        clock["now"] += delay
+
+    monkeypatch.setattr(registry_adapter, "ADOPTION_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(registry_adapter, "ADOPTION_RETRY_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr("fangorn.registry.sqlite3.connect", connect_without_wait)
+    monkeypatch.setattr("fangorn.registry.time.monotonic", monotonic)
+    monkeypatch.setattr("fangorn.registry.time.sleep", advance_clock)
+    try:
+        with pytest.raises(
+            RegistryError,
+            match="Registry remained busy for 2 seconds",
+        ):
+            registry.adopt(initial)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert connection_attempts == pytest.approx([0.02, 0.01])
+    assert clock["now"] == pytest.approx(0.02)
 
 
 def test_linked_worktree_uses_its_canonical_git_directory_generation_marker(
