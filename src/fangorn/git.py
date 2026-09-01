@@ -7,6 +7,7 @@ import secrets
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -105,7 +106,7 @@ def observe_worktree(
     create_generation: bool = False,
     create_repository_generation: bool | None = None,
     create_worktree_generation: bool | None = None,
-    observation_token: int | None = None,
+    reserve_observation: Callable[[], int] | None = None,
 ) -> WorktreeObservation:
     requested_path = _resolve_requested_path(path)
     last_failure: GitError | None = None
@@ -114,31 +115,29 @@ def observe_worktree(
     if create_worktree_generation is None:
         create_worktree_generation = create_generation
 
+    def capture() -> _Snapshot:
+        if (
+            create_repository_generation == create_generation
+            and create_worktree_generation == create_generation
+        ):
+            return _capture_snapshot(
+                requested_path, create_generation=create_generation
+            )
+        return _capture_snapshot(
+            requested_path,
+            create_repository_generation=create_repository_generation,
+            create_worktree_generation=create_worktree_generation,
+        )
+
     for _ in range(OBSERVATION_ATTEMPTS):
         observed_at = _timestamp()
         try:
             _require_supported_git(requested_path)
-            if (
-                create_repository_generation == create_generation
-                and create_worktree_generation == create_generation
-            ):
-                first = _capture_snapshot(
-                    requested_path, create_generation=create_generation
-                )
-                second = _capture_snapshot(
-                    requested_path, create_generation=create_generation
-                )
-            else:
-                first = _capture_snapshot(
-                    requested_path,
-                    create_repository_generation=create_repository_generation,
-                    create_worktree_generation=create_worktree_generation,
-                )
-                second = _capture_snapshot(
-                    requested_path,
-                    create_repository_generation=create_repository_generation,
-                    create_worktree_generation=create_worktree_generation,
-                )
+            first = capture()
+            observation_token = (
+                reserve_observation() if reserve_observation is not None else None
+            )
+            second = capture()
         except GitError as error:
             last_failure = error
             continue

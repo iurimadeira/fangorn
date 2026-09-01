@@ -9,6 +9,8 @@ from fangorn import __version__
 from fangorn.git import GitError, observe_worktree
 from fangorn.registry import Registry, RegistryError, WorkspaceRecord
 
+ADOPTION_ATTEMPTS = 3
+
 
 @click.group()
 @click.version_option(__version__)
@@ -27,19 +29,28 @@ def adopt(path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
     try:
         registry = Registry.from_environment()
-        observation_token = registry.reserve_observation()
-        observation = observe_worktree(path, observation_token=observation_token)
-        create_repository_generation, create_worktree_generation = (
-            registry.marker_creation_requirements(observation)
-        )
-        if create_repository_generation or create_worktree_generation:
+        for _ in range(ADOPTION_ATTEMPTS):
             observation = observe_worktree(
                 path,
-                create_repository_generation=create_repository_generation,
-                create_worktree_generation=create_worktree_generation,
-                observation_token=observation_token,
+                reserve_observation=registry.reserve_observation,
             )
-        workspace, created = registry.adopt(observation)
+            requirements = registry.marker_creation_requirements(observation)
+            if requirements is None:
+                continue
+            create_repository_generation, create_worktree_generation = requirements
+            if create_repository_generation or create_worktree_generation:
+                observation = observe_worktree(
+                    path,
+                    create_repository_generation=create_repository_generation,
+                    create_worktree_generation=create_worktree_generation,
+                    reserve_observation=registry.reserve_observation,
+                )
+            workspace, created = registry.adopt(observation)
+            break
+        else:
+            raise RegistryError(
+                "Concurrent equivalent adoption did not settle; retry the command"
+            )
     except (GitError, RegistryError) as error:
         raise click.ClickException(_human(str(error))) from error
 
@@ -69,7 +80,7 @@ def info(path: Path, as_json: bool) -> None:
     try:
         registry = Registry.from_environment()
         observation = observe_worktree(
-            path, observation_token=registry.reserve_observation()
+            path, reserve_observation=registry.reserve_observation
         )
         workspace = registry.get_by_worktree(observation)
     except (GitError, RegistryError) as error:

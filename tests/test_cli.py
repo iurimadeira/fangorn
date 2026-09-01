@@ -303,6 +303,39 @@ def test_concurrent_adoption_converges_on_one_generation_and_workspace(
     assert marker.read_text(encoding="ascii") == f"{generation}\n"
 
 
+def test_markerless_observation_retries_when_equivalent_adoption_wins(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    markerless = observe_worktree(
+        repository,
+        reserve_observation=registry.reserve_observation,
+    )
+    winner = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    adopted, created = registry.adopt(winner)
+
+    assert created is True
+    assert registry.marker_creation_requirements(markerless) is None
+
+    retried = observe_worktree(
+        repository,
+        reserve_observation=registry.reserve_observation,
+    )
+    assert registry.marker_creation_requirements(retried) == (False, False)
+    equivalent, created = registry.adopt(retried)
+
+    assert created is False
+    assert equivalent.id == adopted.id
+    assert equivalent.git_dir_generation == adopted.git_dir_generation
+    assert equivalent.git_common_dir_generation == adopted.git_common_dir_generation
+
+
 def test_linked_worktree_uses_its_canonical_git_directory_generation_marker(
     tmp_path: Path,
 ) -> None:
@@ -526,6 +559,50 @@ exec "$FANGORN_TEST_REAL_GIT" "$@"
     for index, event in enumerate(recorded_events):
         if event == "timestamp":
             assert recorded_events[index + 1] == "git"
+
+
+def test_observation_reserves_token_between_snapshots_and_retries_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    old = git_adapter._capture_snapshot(repository)
+    new = replace(old, branch="newer-facts", head="f" * 40)
+    snapshots = [old, new, new, new]
+    tokens = iter((11, 12))
+    events: list[str] = []
+
+    def capture_snapshot(
+        _path: Path, *, create_generation: bool = False
+    ) -> git_adapter._Snapshot:
+        del create_generation
+        snapshot = snapshots.pop(0)
+        events.append(f"capture:{snapshot.branch}")
+        return snapshot
+
+    def reserve_observation() -> int:
+        token = next(tokens)
+        events.append(f"reserve:{token}")
+        return token
+
+    monkeypatch.setattr(git_adapter, "_capture_snapshot", capture_snapshot)
+
+    observation = observe_worktree(
+        repository,
+        reserve_observation=reserve_observation,
+    )
+
+    assert events == [
+        "capture:main",
+        "reserve:11",
+        "capture:newer-facts",
+        "capture:newer-facts",
+        "reserve:12",
+        "capture:newer-facts",
+    ]
+    assert observation.observation_token == 12
+    assert observation.branch == "newer-facts"
+    assert observation.head == "f" * 40
 
 
 def test_adopt_rejects_non_utf8_git_output_without_a_traceback(
@@ -864,7 +941,7 @@ def test_registry_rejects_a_changed_worktree_generation(tmp_path: Path) -> None:
     observation = observe_worktree(
         repository,
         create_generation=True,
-        observation_token=registry.reserve_observation(),
+        reserve_observation=registry.reserve_observation,
     )
     adopted, created = registry.adopt(observation)
     replacement = "f" * 64 if observation.git_dir_generation != "f" * 64 else "e" * 64
@@ -1077,24 +1154,27 @@ def test_causal_observation_token_wins_despite_reversed_write_and_clock_rollback
     repository = tmp_path / "repository"
     create_repository(repository)
     registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
-    older_token = registry.reserve_observation()
     older = replace(
         observe_worktree(
             repository,
             create_generation=True,
-            observation_token=older_token,
+            reserve_observation=registry.reserve_observation,
         ),
         observed_at="2030-01-01T00:00:00.000001Z",
     )
-    newer_token = registry.reserve_observation()
+    older_token = cast(int, older.observation_token)
     git(repository, "branch", "-m", "newer-branch")
     (repository / "newer.txt").write_text("newer\n", encoding="utf-8")
     git(repository, "add", "newer.txt")
     git(repository, "commit", "-m", "Newer observation")
     newer = replace(
-        observe_worktree(repository, observation_token=newer_token),
+        observe_worktree(
+            repository,
+            reserve_observation=registry.reserve_observation,
+        ),
         observed_at="2020-01-01T00:00:00.000001Z",
     )
+    newer_token = cast(int, newer.observation_token)
 
     refreshed, was_created = registry.adopt(newer)
     reversed_write = registry.get_by_worktree(older)
@@ -1306,11 +1386,12 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
             row[1]: row for row in connection.execute("PRAGMA table_info(workspaces)")
         }
         assert repository_columns["id"][3] == 1
+        assert repository_columns["created_observation_token"][3] == 1
         assert workspace_columns["id"][3] == 1
         assert workspace_columns["last_observation_token"][3] == 1
         assert connection.execute(
             "SELECT singleton, current_token FROM observation_clock"
-        ).fetchone() == (1, 2)
+        ).fetchone() == (1, 4)
         repositories = connection.execute(
             "SELECT id, git_common_dir FROM repositories ORDER BY git_common_dir"
         ).fetchall()
@@ -1415,6 +1496,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
             ("id", "changed-repository-id"),
             ("git_common_dir", f"{repository_common_dir}-changed"),
             ("git_common_dir_generation", "f" * 64),
+            ("created_observation_token", 999),
         ):
             with pytest.raises(sqlite3.IntegrityError, match="immutable"):
                 connection.execute(

@@ -65,6 +65,9 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                     length(git_common_dir_generation) = 64
                     AND git_common_dir_generation NOT GLOB '*[^0-9a-f]*'
                 ),
+                created_observation_token INTEGER NOT NULL CHECK (
+                    created_observation_token > 0
+                ),
                 created_at TEXT NOT NULL
             )
             """,
@@ -100,13 +103,16 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
             """
             CREATE TRIGGER repositories_immutable_identity
-            BEFORE UPDATE OF id, git_common_dir, git_common_dir_generation
+            BEFORE UPDATE OF id, git_common_dir, git_common_dir_generation,
+                created_observation_token
             ON repositories
             FOR EACH ROW
             WHEN NEW.id IS NOT OLD.id
                 OR NEW.git_common_dir IS NOT OLD.git_common_dir
                 OR NEW.git_common_dir_generation
                     IS NOT OLD.git_common_dir_generation
+                OR NEW.created_observation_token
+                    IS NOT OLD.created_observation_token
             BEGIN
                 SELECT RAISE(ABORT, 'repository identity is immutable');
             END
@@ -169,7 +175,8 @@ class Registry:
                 connection.execute("BEGIN IMMEDIATE")
                 repository = connection.execute(
                     """
-                    SELECT id, git_common_dir_generation
+                    SELECT id, git_common_dir_generation,
+                        created_observation_token
                     FROM repositories WHERE git_common_dir = ?
                     """,
                     (str(observation.repository_common_dir),),
@@ -179,13 +186,15 @@ class Registry:
                     connection.execute(
                         """
                         INSERT INTO repositories (
-                            id, git_common_dir, git_common_dir_generation, created_at
-                        ) VALUES (?, ?, ?, ?)
+                            id, git_common_dir, git_common_dir_generation,
+                            created_observation_token, created_at
+                        ) VALUES (?, ?, ?, ?, ?)
                         """,
                         (
                             repository_id,
                             str(observation.repository_common_dir),
                             observation.git_common_dir_generation,
+                            observation_token,
                             created_at,
                         ),
                     )
@@ -298,13 +307,15 @@ class Registry:
 
     def marker_creation_requirements(
         self, observation: WorktreeObservation
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool] | None:
+        observation_token = _observation_token(observation)
         with self._connection() as connection:
             self._migrate(connection)
             try:
                 repository = connection.execute(
                     """
-                    SELECT id, git_common_dir_generation
+                    SELECT id, git_common_dir_generation,
+                        created_observation_token
                     FROM repositories WHERE git_common_dir = ?
                     """,
                     (str(observation.repository_common_dir),),
@@ -316,8 +327,18 @@ class Registry:
             except sqlite3.Error as error:
                 raise _registry_error(error) from error
             if repository is not None:
+                if (
+                    observation.git_common_dir_generation is None
+                    and int(repository["created_observation_token"]) > observation_token
+                ):
+                    return None
                 _validate_repository_binding(repository, observation)
             if workspace is not None:
+                if (
+                    observation.git_dir_generation is None
+                    and int(workspace["last_observation_token"]) > observation_token
+                ):
+                    return None
                 repository_id = (
                     str(repository["id"])
                     if repository is not None
