@@ -10,6 +10,14 @@ from fangorn.git import GitError, observe_worktree
 from fangorn.registry import Registry, RegistryError, WorkspaceRecord
 
 ADOPTION_ATTEMPTS = 3
+COMMAND_PATH = click.Path(
+    path_type=Path,
+    exists=False,
+    file_okay=True,
+    dir_okay=True,
+    readable=False,
+    resolve_path=False,
+)
 
 
 @click.group()
@@ -23,7 +31,7 @@ def main() -> None:
 @click.argument(
     "path",
     default=".",
-    type=click.Path(path_type=Path, file_okay=False, resolve_path=True),
+    type=COMMAND_PATH,
 )
 def adopt(path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
@@ -73,7 +81,7 @@ def adopt(path: Path, as_json: bool) -> None:
 @click.argument(
     "path",
     default=".",
-    type=click.Path(path_type=Path, file_okay=False, resolve_path=True),
+    type=COMMAND_PATH,
 )
 def info(path: Path, as_json: bool) -> None:
     """Inspect the Workspace bound to a Git worktree."""

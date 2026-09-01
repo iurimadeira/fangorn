@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -450,6 +451,52 @@ def test_marker_cleanup_failure_without_a_primary_error_is_a_git_error(
         git_adapter._create_generation_marker(git_dir)
 
 
+def test_marker_lock_succeeds_after_bounded_contention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    monotonic_values = iter((10.0, 10.01, 10.02))
+    sleeps: list[float] = []
+
+    def contend_then_succeed(_descriptor: int, operation: int) -> None:
+        nonlocal attempts
+        assert operation & fcntl.LOCK_NB
+        attempts += 1
+        if attempts < 3:
+            raise BlockingIOError
+
+    monkeypatch.setattr("fangorn.git.fcntl.flock", contend_then_succeed)
+    monkeypatch.setattr("fangorn.git.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr("fangorn.git.time.sleep", sleeps.append)
+
+    git_adapter._acquire_marker_lock(123)
+
+    assert attempts == 3
+    assert sleeps == [
+        git_adapter.MARKER_LOCK_RETRY_SECONDS,
+        git_adapter.MARKER_LOCK_RETRY_SECONDS,
+    ]
+
+
+def test_marker_lock_contention_times_out_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_values = iter((0.0, git_adapter.MARKER_LOCK_TIMEOUT_SECONDS + 0.001))
+
+    def always_contended(_descriptor: int, _operation: int) -> None:
+        raise BlockingIOError
+
+    monkeypatch.setattr("fangorn.git.fcntl.flock", always_contended)
+    monkeypatch.setattr("fangorn.git.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(
+        "fangorn.git.time.sleep",
+        lambda _duration: pytest.fail("timeout path must not sleep"),
+    )
+
+    with pytest.raises(GitError, match="Timed out waiting for Fangorn marker lock"):
+        git_adapter._acquire_marker_lock(123)
+
+
 def test_adopt_target_wins_over_inherited_repository_git_environment(
     tmp_path: Path,
 ) -> None:
@@ -896,6 +943,50 @@ def test_adopt_distinguishes_missing_paths_from_resolution_failures(
     assert loop_result.returncode != 0
     assert loop_result.stdout == ""
     assert "Cannot resolve path" in loop_result.stderr
+
+
+@pytest.mark.parametrize("command", ["adopt", "info"])
+def test_command_path_validation_stays_inside_sanitized_error_boundary(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    unsafe = tmp_path / "not-directory\nansi\x1b[31m"
+    unsafe.write_text("not a directory\n", encoding="utf-8")
+
+    result = run_fangorn(
+        tmp_path / "state",
+        command,
+        "--json",
+        str(unsafe),
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Path is not a directory" in result.stderr
+    assert "\\x0a" in result.stderr
+    assert "\\x1b" in result.stderr
+    assert "\x1b" not in result.stderr
+    assert result.stderr.count("\n") == 1
+    assert "Traceback" not in result.stderr
+
+
+def test_git_reported_symlink_loop_is_translated_to_git_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reported = tmp_path / "reported-loop"
+    real_resolve = Path.resolve
+
+    def resolve(path: Path, *, strict: bool = False) -> Path:
+        if path == reported:
+            raise RuntimeError("synthetic symlink loop")
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    with pytest.raises(GitError, match="invalid Git common directory") as raised:
+        git_adapter._required_path(str(reported), "Git common directory")
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
 
 
 def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -> None:

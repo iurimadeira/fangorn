@@ -7,6 +7,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -65,6 +66,8 @@ REPOSITORY_LOCAL_ENVIRONMENT = (
 )
 OBSERVATION_ATTEMPTS = 3
 MINIMUM_GIT_VERSION = (2, 31)
+MARKER_LOCK_TIMEOUT_SECONDS = 0.25
+MARKER_LOCK_RETRY_SECONDS = 0.01
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
@@ -291,7 +294,7 @@ def _required_path(value: str | None, label: str) -> Path:
         raise GitError(f"Git did not report {label}")
     try:
         return Path(value).resolve(strict=True)
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         raise GitError(f"Git reported an invalid {label}: {value}") from error
 
 
@@ -425,7 +428,7 @@ def _create_generation_marker(
             raise GitError(
                 f"Git {identity} administrative path is not a directory: {directory}"
             )
-        fcntl.flock(directory_descriptor, fcntl.LOCK_EX)
+        _acquire_marker_lock(directory_descriptor)
 
         winner = _read_generation_marker(
             directory, marker_name=marker_name, identity=identity
@@ -494,6 +497,21 @@ def _cleanup_pending_marker(
         raise GitError(
             f"Cannot clean up Fangorn generation marker publication: {detail}"
         ) from error
+
+
+def _acquire_marker_lock(descriptor: int) -> None:
+    deadline = time.monotonic() + MARKER_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GitError(
+                    "Timed out waiting for Fangorn marker lock; retry the command"
+                ) from error
+            time.sleep(min(MARKER_LOCK_RETRY_SECONDS, remaining))
 
 
 def _close_descriptor(descriptor: int, *, context: str, ignore_errors: bool) -> None:
