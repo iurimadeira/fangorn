@@ -419,6 +419,7 @@ def _create_generation_marker(
     pending = directory / f".{marker_name}.pending"
     directory_descriptor: int | None = None
     pending_descriptor: int | None = None
+    lock_acquired = False
     try:
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
@@ -429,6 +430,7 @@ def _create_generation_marker(
                 f"Git {identity} administrative path is not a directory: {directory}"
             )
         _acquire_marker_lock(directory_descriptor)
+        lock_acquired = True
 
         winner = _read_generation_marker(
             directory, marker_name=marker_name, identity=identity
@@ -455,11 +457,11 @@ def _create_generation_marker(
         os.fsync(directory_descriptor)
         return generation
     except GitError:
-        if directory_descriptor is not None:
+        if directory_descriptor is not None and lock_acquired:
             _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=True)
         raise
     except OSError as error:
-        if directory_descriptor is not None:
+        if directory_descriptor is not None and lock_acquired:
             _cleanup_pending_marker(pending, directory_descriptor, ignore_errors=True)
         detail = error.strerror or str(error)
         raise GitError(

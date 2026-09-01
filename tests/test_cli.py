@@ -497,6 +497,30 @@ def test_marker_lock_contention_times_out_deterministically(
         git_adapter._acquire_marker_lock(123)
 
 
+def test_timed_out_contender_leaves_owner_pending_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    git_dir = repository / ".git"
+    pending = git_dir / f".{GENERATION_MARKER_NAME}.pending"
+    marker = git_dir / GENERATION_MARKER_NAME
+    owner_generation = "a" * 64
+    pending.write_text(f"{owner_generation}\n", encoding="ascii")
+
+    def time_out(_descriptor: int) -> None:
+        raise GitError("Timed out waiting for Fangorn marker lock; retry the command")
+
+    monkeypatch.setattr(git_adapter, "_acquire_marker_lock", time_out)
+
+    with pytest.raises(GitError, match="Timed out waiting for Fangorn marker lock"):
+        git_adapter._create_generation_marker(git_dir)
+
+    assert pending.read_text(encoding="ascii") == f"{owner_generation}\n"
+    os.replace(pending, marker)
+    assert git_adapter._read_generation_marker(git_dir) == owner_generation
+
+
 def test_adopt_target_wins_over_inherited_repository_git_environment(
     tmp_path: Path,
 ) -> None:
