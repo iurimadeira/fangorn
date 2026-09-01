@@ -175,8 +175,7 @@ class Registry:
                 connection.execute("BEGIN IMMEDIATE")
                 repository = connection.execute(
                     """
-                    SELECT id, git_common_dir_generation,
-                        created_observation_token
+                    SELECT id, git_common_dir_generation
                     FROM repositories WHERE git_common_dir = ?
                     """,
                     (str(observation.repository_common_dir),),
@@ -306,16 +305,18 @@ class Registry:
                 raise _registry_error(error) from error
 
     def marker_creation_requirements(
-        self, observation: WorktreeObservation
+        self,
+        observation: WorktreeObservation,
+        *,
+        markerless_reobserved: bool = False,
     ) -> tuple[bool, bool] | None:
-        observation_token = _observation_token(observation)
+        _observation_token(observation)
         with self._connection() as connection:
             self._migrate(connection)
             try:
                 repository = connection.execute(
                     """
-                    SELECT id, git_common_dir_generation,
-                        created_observation_token
+                    SELECT id, git_common_dir_generation
                     FROM repositories WHERE git_common_dir = ?
                     """,
                     (str(observation.repository_common_dir),),
@@ -329,15 +330,12 @@ class Registry:
             if repository is not None:
                 if (
                     observation.git_common_dir_generation is None
-                    and int(repository["created_observation_token"]) > observation_token
+                    and not markerless_reobserved
                 ):
                     return None
                 _validate_repository_binding(repository, observation)
             if workspace is not None:
-                if (
-                    observation.git_dir_generation is None
-                    and int(workspace["last_observation_token"]) > observation_token
-                ):
+                if observation.git_dir_generation is None and not markerless_reobserved:
                     return None
                 repository_id = (
                     str(repository["id"])

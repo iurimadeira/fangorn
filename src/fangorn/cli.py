@@ -37,13 +37,18 @@ def adopt(path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
     try:
         registry = Registry.from_environment()
+        markerless_reobserved = False
         for _ in range(ADOPTION_ATTEMPTS):
             observation = observe_worktree(
                 path,
                 reserve_observation=registry.reserve_observation,
             )
-            requirements = registry.marker_creation_requirements(observation)
+            requirements = registry.marker_creation_requirements(
+                observation,
+                markerless_reobserved=markerless_reobserved,
+            )
             if requirements is None:
+                markerless_reobserved = True
                 continue
             create_repository_generation, create_worktree_generation = requirements
             if create_repository_generation or create_worktree_generation:

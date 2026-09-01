@@ -337,6 +337,66 @@ def test_markerless_observation_retries_when_equivalent_adoption_wins(
     assert equivalent.git_common_dir_generation == adopted.git_common_dir_generation
 
 
+def test_markerless_observation_retries_after_lower_token_adoption_commits(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    observed = observe_worktree(repository, create_generation=True)
+    winner = replace(observed, observation_token=1)
+    markerless = replace(
+        observed,
+        git_common_dir_generation=None,
+        git_dir_generation=None,
+        observation_token=2,
+    )
+    adopted, created = registry.adopt(winner)
+
+    assert created is True
+    assert registry.marker_creation_requirements(markerless) is None
+
+    retried = observe_worktree(
+        repository,
+        reserve_observation=registry.reserve_observation,
+    )
+    assert registry.marker_creation_requirements(
+        retried, markerless_reobserved=True
+    ) == (False, False)
+    equivalent, created = registry.adopt(retried)
+
+    assert created is False
+    assert equivalent.id == adopted.id
+
+
+def test_established_marker_loss_fails_after_one_fresh_reobservation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "fangorn" / "registry.sqlite3")
+    observation = observe_worktree(
+        repository,
+        create_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+    registry.adopt(observation)
+    (observation.git_dir / GENERATION_MARKER_NAME).unlink()
+    markerless = observe_worktree(
+        repository,
+        reserve_observation=registry.reserve_observation,
+    )
+
+    assert registry.marker_creation_requirements(markerless) is None
+
+    retried = observe_worktree(
+        repository,
+        reserve_observation=registry.reserve_observation,
+    )
+    with pytest.raises(RegistryError, match="generation marker is missing"):
+        registry.marker_creation_requirements(retried, markerless_reobserved=True)
+
+
 def test_linked_worktree_uses_its_canonical_git_directory_generation_marker(
     tmp_path: Path,
 ) -> None:
@@ -1520,7 +1580,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
             (str(repository.resolve()),),
         ).fetchone()
         assert workspace is not None
-        workspace_id, repository_id, git_dir, _generation, path, head = workspace
+        workspace_id, repository_id, git_dir, _generation, _path, head = workspace
         repository_row = connection.execute(
             """
             SELECT git_common_dir_generation
@@ -1534,68 +1594,80 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
         other_repository_id = next(
             row[0] for row in repositories if row[0] != repository_id
         )
-        with pytest.raises(sqlite3.IntegrityError):
+        valid_generation = "a" * 64
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match=r"UNIQUE constraint failed: workspaces\.git_dir",
+        ):
             connection.execute(
                 """
                 INSERT INTO workspaces (
                     id, repository_id, git_dir, git_dir_generation,
                     path, branch, head,
-                    adopted_head, created_at, last_observed_at
+                    adopted_head, created_at, last_observed_at,
+                    last_observation_token
                 ) VALUES (
-                    'duplicate', ?, ?, 'different-generation', ?,
-                    'main', ?, ?, 'now', 'now'
+                    'duplicate', ?, ?, ?, '/worktree/duplicate',
+                    'main', ?, ?, 'now', 'now', 1
                 )
                 """,
-                (other_repository_id, git_dir, path, head, head),
+                (other_repository_id, git_dir, valid_generation, head, head),
             )
         connection.rollback()
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
             connection.execute(
                 """
                 INSERT INTO repositories (
-                    id, git_common_dir, git_common_dir_generation, created_at
+                    id, git_common_dir, git_common_dir_generation,
+                    created_observation_token, created_at
                 ) VALUES (
                     'invalid-repository-generation', '/git/common/invalid',
-                    'not-a-generation', 'now'
+                    'not-a-generation', 1, 'now'
                 )
                 """
             )
         connection.rollback()
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
             connection.execute(
                 """
                 INSERT INTO workspaces (
                     id, repository_id, git_dir, git_dir_generation,
                     path, branch, head,
-                    adopted_head, created_at, last_observed_at
+                    adopted_head, created_at, last_observed_at,
+                    last_observation_token
                 ) VALUES (
                     'invalid-generation', ?, '/git/invalid-generation',
                     'not-a-generation', '/worktree/invalid-generation',
-                    'main', 'head', 'head', 'now', 'now'
+                    'main', 'head', 'head', 'now', 'now', 1
                 )
                 """,
                 (repository_id,),
             )
         connection.rollback()
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"
+        ):
             connection.execute(
                 """
                 INSERT INTO workspaces (
                     id, repository_id, git_dir, git_dir_generation,
                     path, branch, head,
-                    adopted_head, created_at, last_observed_at
+                    adopted_head, created_at, last_observed_at,
+                    last_observation_token
                 ) VALUES (
-                    'orphan', 'missing', '/git/orphan', '1:2',
-                    '/worktree/orphan', NULL, 'head', 'head', 'now', 'now'
+                    'orphan', 'missing', '/git/orphan', ?,
+                    '/worktree/orphan', NULL, 'head', 'head', 'now', 'now', 1
                 )
-                """
+                """,
+                (valid_generation,),
             )
         connection.rollback()
+        replacement_generation = "b" * 64 if _generation != "b" * 64 else "c" * 64
         workspace_updates = (
             ("id", "changed-id"),
             ("repository_id", other_repository_id),
             ("git_dir", "/different/git-dir"),
-            ("git_dir_generation", "different-generation"),
+            ("git_dir_generation", replacement_generation),
         )
         for column, value in workspace_updates:
             with pytest.raises(sqlite3.IntegrityError, match="immutable"):
