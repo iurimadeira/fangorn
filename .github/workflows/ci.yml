@@ -44,3 +44,5 @@ jobs:
         run: uv run python scripts/check_publication.py --source . dist/*
       - name: Smoke-test installed wheel
         run: uv run --isolated --no-project --with dist/*.whl fangorn --help
+      - name: Smoke-test installed source distribution
+        run: uv run --isolated --no-project --with dist/*.tar.gz fangorn --help

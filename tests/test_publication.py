@@ -179,6 +179,14 @@ def test_publication_gate_accepts_the_public_source_tree() -> None:
     assert "pipx install fangorn-cli" in readme
 
 
+def test_ci_smoke_tests_the_installed_source_distribution() -> None:
+    workflow = (PROJECT_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert (
+        "uv run --isolated --no-project --with dist/*.tar.gz fangorn --help" in workflow
+    )
+
+
 def test_publication_gate_accepts_exact_release_artifact_set(tmp_path: Path) -> None:
     artifacts = write_valid_artifact_set(tmp_path)
 
