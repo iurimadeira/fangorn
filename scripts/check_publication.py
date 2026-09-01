@@ -9,7 +9,11 @@ import sys
 import tarfile
 import tomllib
 import zipfile
+from collections import Counter
 from collections.abc import Iterable
+from email import policy
+from email.message import Message
+from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 
 EXCLUDED_DIRECTORIES = {
@@ -425,35 +429,52 @@ def validate_artifact(
 
 
 def _validate_project_metadata(content: bytes, path: Path, *, version: str) -> None:
-    metadata = content.decode("utf-8")
+    metadata = BytesParser(policy=policy.default).parsebytes(content, headersonly=True)
     _require(
-        re.search(r"^Name: fangorn-cli$", metadata, re.MULTILINE) is not None,
-        f"Distribution project name does not match: {path}",
+        not metadata.defects,
+        f"Distribution metadata is malformed: {path}",
     )
+    expected_fields = (
+        (
+            "Name",
+            "fangorn-cli",
+            f"Distribution metadata project name does not match: {path}",
+        ),
+        (
+            "Version",
+            version,
+            f"Distribution metadata version does not match project: {path}",
+        ),
+        (
+            "License-Expression",
+            "MIT",
+            f"Distribution metadata License-Expression must be exactly MIT: {path}",
+        ),
+        (
+            "Requires-Python",
+            ">=3.12",
+            f"Distribution metadata Requires-Python must be exactly >=3.12: {path}",
+        ),
+        (
+            "Requires-Dist",
+            EXACT_RUNTIME_DEPENDENCY,
+            "Distribution metadata must contain exact Requires-Dist: "
+            f"{EXACT_RUNTIME_DEPENDENCY}: {path}",
+        ),
+    )
+    for field, expected, error in expected_fields:
+        _require(_metadata_values(metadata, field) == [expected], error)
+
+    project_urls = _metadata_values(metadata, "Project-URL")
+    expected_urls = [f"{label}, {url}" for label, url in EXPECTED_PROJECT_URLS.items()]
     _require(
-        re.search(rf"^Version: {re.escape(version)}$", metadata, re.MULTILINE)
-        is not None,
-        f"Distribution metadata version does not match project: {path}",
-    )
-    _require("License-Expression: MIT" in metadata, "MIT metadata missing")
-    _require("Requires-Python: >=3.12" in metadata, "Python metadata missing")
-    runtime_dependencies = re.findall(
-        r"^Requires-Dist:\s*(.+)$", metadata, re.MULTILINE
-    )
-    _require(
-        runtime_dependencies == [EXACT_RUNTIME_DEPENDENCY],
-        f"Distribution must contain exact Requires-Dist: {EXACT_RUNTIME_DEPENDENCY}",
-    )
-    project_urls = {
-        label: url
-        for label, url in re.findall(
-            r"^Project-URL:\s*([^,]+),\s*(\S+)$", metadata, re.MULTILINE
-        )
-    }
-    _require(
-        project_urls == EXPECTED_PROJECT_URLS,
+        Counter(project_urls) == Counter(expected_urls),
         f"Distribution project URLs do not match: {path}",
     )
+
+
+def _metadata_values(metadata: Message, field: str) -> list[str]:
+    return [str(value) for value in metadata.get_all(field, [])]
 
 
 def parse_arguments() -> argparse.Namespace:

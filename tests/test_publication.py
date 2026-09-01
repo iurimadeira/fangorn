@@ -71,15 +71,18 @@ def write_test_wheel(
     homepage: str = "https://github.com/iurimadeira/fangorn",
     metadata_version: str = PROJECT_VERSION,
     dependency: str = EXACT_CLICK_REQUIREMENT,
+    metadata_content: str | None = None,
     license_entries: dict[str, bytes] | None = None,
     extra_entries: tuple[tuple[str, bytes], ...] = (),
 ) -> None:
     root = f"fangorn_cli-{PROJECT_VERSION}.dist-info"
-    metadata = project_metadata(
-        version=metadata_version,
-        homepage=homepage,
-        dependency=dependency,
-    )
+    metadata = metadata_content
+    if metadata is None:
+        metadata = project_metadata(
+            version=metadata_version,
+            homepage=homepage,
+            dependency=dependency,
+        )
     if license_entries is None:
         license_entries = {
             f"{root}/licenses/LICENSE": LICENSE_BYTES,
@@ -116,6 +119,7 @@ def write_test_sdist(
     *,
     metadata_version: str = PROJECT_VERSION,
     dependency: str = EXACT_CLICK_REQUIREMENT,
+    metadata_content: str | None = None,
     license_entries: dict[str, bytes] | None = None,
     extra_entries: tuple[tuple[str, bytes], ...] = (),
 ) -> None:
@@ -125,11 +129,14 @@ def write_test_sdist(
             f"{root}/LICENSE": LICENSE_BYTES,
             f"{root}/THIRD_PARTY_NOTICES.md": NOTICES_BYTES,
         }
-    entries = {
-        f"{root}/PKG-INFO": project_metadata(
+    metadata = metadata_content
+    if metadata is None:
+        metadata = project_metadata(
             version=metadata_version,
             dependency=dependency,
-        ).encode(),
+        )
+    entries = {
+        f"{root}/PKG-INFO": metadata.encode(),
         f"{root}/fangorn/__init__.py": b"value = 1\n",
         **license_entries,
     }
@@ -297,6 +304,86 @@ def test_publication_gate_rejects_wrong_artifact_metadata_version(
     assert result.returncode != 0
     assert result.stdout == ""
     assert "metadata version" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Name", "fangorn-cli"),
+        ("Version", PROJECT_VERSION),
+        ("License-Expression", "MIT"),
+        ("Requires-Python", ">=3.12"),
+        ("Requires-Dist", EXACT_CLICK_REQUIREMENT),
+    ],
+)
+def test_publication_gate_rejects_duplicate_singleton_metadata_fields(
+    tmp_path: Path,
+    artifact_kind: str,
+    field: str,
+    value: str,
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    metadata = project_metadata().replace(
+        f"{field}: {value}\n",
+        f"{field}: unexpected\n{field}: {value}\n",
+    )
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, metadata_content=metadata)
+    else:
+        write_test_sdist(sdist, metadata_content=metadata)
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "metadata" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+def test_publication_gate_rejects_folded_metadata_additions(
+    tmp_path: Path,
+    artifact_kind: str,
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    metadata = project_metadata().replace(
+        f"Requires-Dist: {EXACT_CLICK_REQUIREMENT}\n",
+        f"Requires-Dist: {EXACT_CLICK_REQUIREMENT}\n unexpected\n",
+    )
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, metadata_content=metadata)
+    else:
+        write_test_sdist(sdist, metadata_content=metadata)
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Requires-Dist" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+def test_publication_gate_rejects_duplicate_project_url_labels(
+    tmp_path: Path,
+    artifact_kind: str,
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    homepage = "https://github.com/iurimadeira/fangorn"
+    metadata = project_metadata().replace(
+        f"Project-URL: Homepage, {homepage}\n",
+        "Project-URL: Homepage, https://unexpected.example.invalid/fangorn\n"
+        f"Project-URL: Homepage, {homepage}\n",
+    )
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, metadata_content=metadata)
+    else:
+        write_test_sdist(sdist, metadata_content=metadata)
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "project URLs do not match" in result.stderr
 
 
 def test_publication_gate_rejects_stale_extra_artifact(tmp_path: Path) -> None:
