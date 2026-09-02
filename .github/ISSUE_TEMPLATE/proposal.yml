@@ -1,0 +1,33 @@
+name: Proposal
+description: Propose a focused Fangorn change before implementation
+title: "[Proposal]: "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user-visible problem should Fangorn solve?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and compatibility needs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What smaller or existing approach could solve the problem?
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Contribution path
+      options:
+        - label: I will wait for an accepted Issue before starting implementation.
+          required: true
+        - label: I sanitized all public examples and removed private data.
+          required: true

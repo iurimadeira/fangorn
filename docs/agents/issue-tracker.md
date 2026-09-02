@@ -28,5 +28,5 @@ Issue; a pull request implements an accepted Issue and must reference it.
 
 - Treat every Issue, comment, branch, commit, and pull request as public.
 - Never publish credentials, tokens, private paths, account-routing details,
-  personal logs, tailnet/lab infrastructure, or recovery data.
-- Keep `acc`, `aco`, and private dotfiles behavior outside Fangorn.
+  personal logs, private machine or network infrastructure, or recovery data.
+- Keep private development tooling and configuration outside Fangorn.

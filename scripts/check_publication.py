@@ -15,6 +15,10 @@ from email import policy
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
+from typing import cast
+
+import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 EXCLUDED_DIRECTORIES = {
     ".coverage-data",
@@ -27,7 +31,6 @@ EXCLUDED_DIRECTORIES = {
     "build",
     "dist",
 }
-LOCALLY_EXCLUDED_UNTRACKED_FILES = {".hunk/agent-context.json"}
 SENSITIVE_NAMES = {
     ".env",
     "id_ed25519",
@@ -35,6 +38,7 @@ SENSITIVE_NAMES = {
     "registry.sqlite3",
 }
 SENSITIVE_SUFFIXES = {".key", ".p12", ".pem"}
+LOCAL_REVIEW_CONTEXT = PurePosixPath(".hunk/agent-context.json")
 CONTENT_PATTERNS = (
     re.compile(r"/(?:home|Users)/[^/\s]+/"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -42,12 +46,89 @@ CONTENT_PATTERNS = (
     re.compile(r"sk[-]proj-[A-Za-z0-9_-]{20,}"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
 )
+PRIVATE_INFRASTRUCTURE_IDENTIFIERS = (
+    "ac" + "c",
+    "ac" + "o",
+    "ai-account" + "-router",
+    "iuri-sync" + "-vault",
+    "iurimadeira" + "-dot-files",
+    "lab" + ".local",
+    "lab-" + "lan",
+    "lab-" + "tmux",
+    "mac-" + "import",
+    "oh-my-" + "fangorn",
+    "ws" + "n",
+)
+PRIVATE_INFRASTRUCTURE_PATTERNS = tuple(
+    re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    for identifier in PRIVATE_INFRASTRUCTURE_IDENTIFIERS
+)
 PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 EXPECTED_PROJECT_URLS = {
     "Homepage": "https://github.com/iurimadeira/fangorn",
     "Issues": "https://github.com/iurimadeira/fangorn/issues",
 }
 EXACT_RUNTIME_DEPENDENCY = "click>=8.1.8,<9"
+PRIVATE_REPORT_URL = "https://github.com/iurimadeira/fangorn/security/advisories/new"
+REQUIRED_PUBLIC_FILES = {
+    ".github/ISSUE_TEMPLATE/bug.yml": (
+        "Bug report",
+        "sanitized",
+        PRIVATE_REPORT_URL,
+    ),
+    ".github/ISSUE_TEMPLATE/config.yml": (PRIVATE_REPORT_URL,),
+    ".github/ISSUE_TEMPLATE/proposal.yml": ("Proposal", "accepted Issue"),
+    ".github/SECURITY.md": (
+        "Report vulnerabilities confidentially",
+        "Do not open a public Issue",
+        PRIVATE_REPORT_URL,
+    ),
+    ".github/pull_request_template.md": ("Closes #", "sanitized"),
+    "CODE_OF_CONDUCT.md": (
+        "Contributor Covenant",
+        "version 2.1",
+        PRIVATE_REPORT_URL,
+    ),
+    "CONTRIBUTING.md": (
+        "accepted Issue",
+        "uv sync --locked --dev",
+        "uv run coverage erase",
+        "uv run coverage run --branch -m pytest",
+        "uv run coverage combine",
+        "uv run coverage report --fail-under=85.0",
+        "uv run mypy src scripts tests",
+        "sanitized",
+        PRIVATE_REPORT_URL,
+    ),
+}
+REPORTING_LINK_LABELS = {
+    ".github/SECURITY.md": "GitHub Private Vulnerability Reporting",
+    "CODE_OF_CONDUCT.md": "GitHub Private Vulnerability Reporting",
+    "CONTRIBUTING.md": "GitHub Private Vulnerability Reporting",
+}
+REPORTING_POLICY_PATTERNS = {
+    ".github/ISSUE_TEMPLATE/bug.yml": re.compile(
+        r"Security reports do not belong in public Issues\. Use the\s+"
+        r"\[confidential reporting form\]\([^)]*\)\s+instead\."
+    ),
+    ".github/SECURITY.md": re.compile(
+        r"Report vulnerabilities confidentially with\s+"
+        r"\[GitHub Private Vulnerability Reporting\]\([^)]*\)\.\s+"
+        r"Do not open a public Issue, discussion, or pull request"
+    ),
+    "CODE_OF_CONDUCT.md": re.compile(
+        r"Instances of abusive, harassing, or otherwise unacceptable behavior may be "
+        r"reported through \[GitHub Private Vulnerability Reporting\]\([^)]*\)\."
+    ),
+    "CONTRIBUTING.md": re.compile(
+        r"Report vulnerabilities or conduct incidents through\s+"
+        r"\[GitHub Private Vulnerability Reporting\]\([^)]*\),\s+"
+        r"as described in \[the security policy\]\(\.github/SECURITY\.md\)\."
+    ),
+}
 
 
 class CheckFailure(RuntimeError):
@@ -78,8 +159,101 @@ def _terminal_safe(value: str) -> str:
 def _text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise CheckFailure(f"Required file is not valid UTF-8: {path}") from error
     except OSError as error:
         raise CheckFailure(f"Cannot read required file: {path}") from error
+
+
+def _visible_policy_text(text: str) -> str:
+    without_html_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return "\n".join(
+        line
+        for line in without_html_comments.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def _parse_yaml(text: str, name: str) -> Node:
+    try:
+        document = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as error:
+        raise CheckFailure(f"Required public YAML is invalid: {name}") from error
+    _require(document is not None, f"Required public YAML is empty: {name}")
+    document = cast(Node, document)
+    _reject_duplicate_yaml_keys(document, name)
+    return document
+
+
+def _reject_duplicate_yaml_keys(node: Node, name: str) -> None:
+    if isinstance(node, MappingNode):
+        _require(
+            node.tag == "tag:yaml.org,2002:map",
+            f"Required public YAML has an unsupported YAML tag: {name}",
+        )
+        keys: set[str] = set()
+        for key, value in node.value:
+            _require(
+                isinstance(key, ScalarNode) and key.tag == "tag:yaml.org,2002:str",
+                f"Required public YAML has a non-scalar key: {name}",
+            )
+            scalar_key = cast(ScalarNode, key)
+            _require(
+                scalar_key.value not in keys,
+                f"Required public YAML has a duplicate YAML key: {name}: "
+                f"{scalar_key.value}",
+            )
+            keys.add(scalar_key.value)
+            _reject_duplicate_yaml_keys(value, name)
+    elif isinstance(node, SequenceNode):
+        _require(
+            node.tag == "tag:yaml.org,2002:seq",
+            f"Required public YAML has an unsupported YAML tag: {name}",
+        )
+        for value in node.value:
+            _reject_duplicate_yaml_keys(value, name)
+    else:
+        _require(
+            isinstance(node, ScalarNode)
+            and node.tag in {"tag:yaml.org,2002:bool", "tag:yaml.org,2002:str"},
+            f"Required public YAML has an unsupported YAML tag: {name}",
+        )
+
+
+def _yaml_mapping(node: Node | None, name: str) -> dict[str, Node]:
+    _require(
+        isinstance(node, MappingNode),
+        f"Required public YAML is not a map: {name}",
+    )
+    mapping = cast(MappingNode, node)
+    return {
+        key.value: value for key, value in mapping.value if isinstance(key, ScalarNode)
+    }
+
+
+def _yaml_scalar(node: Node | None, name: str, field: str) -> str:
+    _require(
+        isinstance(node, ScalarNode),
+        f"Required public YAML field is not scalar: {name}: {field}",
+    )
+    scalar = cast(ScalarNode, node)
+    value = scalar.value
+    _require(
+        scalar.tag == "tag:yaml.org,2002:str" and isinstance(value, str),
+        f"Required public YAML field is not text: {name}: {field}",
+    )
+    return cast(str, value)
+
+
+def _yaml_scalar_values(node: Node) -> Iterable[str]:
+    if isinstance(node, ScalarNode):
+        yield node.value
+    elif isinstance(node, MappingNode):
+        for _key, value in node.value:
+            yield from _yaml_scalar_values(value)
+    elif isinstance(node, SequenceNode):
+        for value in node.value:
+            yield from _yaml_scalar_values(value)
 
 
 def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
@@ -93,7 +267,7 @@ def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
         name = relative.as_posix()
         if name in tracked_names:
             continue
-        if name in LOCALLY_EXCLUDED_UNTRACKED_FILES:
+        if PurePosixPath(name) == LOCAL_REVIEW_CONTEXT:
             continue
         if any(part in EXCLUDED_DIRECTORIES for part in relative.parts):
             continue
@@ -179,8 +353,13 @@ def _tracked_source_files(source: Path) -> Iterable[tuple[str, bytes]]:
 
 
 def _validate_public_content(name: str, content: bytes) -> None:
-    path = PurePosixPath(name)
+    path = PurePosixPath(name.replace("\\", "/"))
     lowered_name = path.name.lower()
+    _require(
+        tuple(part.lower() for part in path.parts[-2:])
+        != tuple(part.lower() for part in LOCAL_REVIEW_CONTEXT.parts),
+        f"Sensitive file included: {name}",
+    )
     _require(lowered_name not in SENSITIVE_NAMES, f"Sensitive file included: {name}")
     _require(
         path.suffix.lower() not in SENSITIVE_SUFFIXES,
@@ -197,6 +376,11 @@ def _validate_public_content(name: str, content: bytes) -> None:
     )
     for pattern in CONTENT_PATTERNS:
         _require(pattern.search(text) is None, f"Private data pattern found: {name}")
+    for pattern in PRIVATE_INFRASTRUCTURE_PATTERNS:
+        _require(
+            pattern.search(name) is None and pattern.search(text) is None,
+            f"Forbidden private infrastructure identifier found: {name}",
+        )
 
 
 def validate_source(source: Path) -> tuple[str, bytes, bytes]:
@@ -253,6 +437,180 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
             f"Missing required development tool: {tool}",
         )
 
+    public_text: dict[str, str] = {}
+    yaml_documents: dict[str, Node] = {}
+    for name, markers in REQUIRED_PUBLIC_FILES.items():
+        path = source / name
+        _require(path.is_file(), f"Missing required public file: {name}")
+        raw_text = _text(path)
+        if path.suffix == ".yml":
+            document = _parse_yaml(raw_text, name)
+            yaml_documents[name] = document
+            text = "\n".join(_yaml_scalar_values(document))
+        else:
+            text = _visible_policy_text(raw_text)
+        public_text[name] = text
+        for marker in markers:
+            _require(marker in text, f"Required public marker missing from {name}")
+
+    for name, label in REPORTING_LINK_LABELS.items():
+        destinations = re.findall(
+            rf"\[{re.escape(label)}\]\(([^)\s]+)\)", public_text[name]
+        )
+        _require(
+            destinations == [PRIVATE_REPORT_URL],
+            f"Required public reporting link is invalid in {name}",
+        )
+        _require(
+            REPORTING_POLICY_PATTERNS[name].search(public_text[name]) is not None,
+            f"Required public reporting guidance is invalid in {name}",
+        )
+
+    for name, expected_name in (
+        (".github/ISSUE_TEMPLATE/bug.yml", "Bug report"),
+        (".github/ISSUE_TEMPLATE/proposal.yml", "Proposal"),
+    ):
+        issue_form = _yaml_mapping(yaml_documents[name], name)
+        _require(
+            _yaml_scalar(issue_form.get("name"), name, "name") == expected_name,
+            f"Required public Issue-form name is invalid: {name}",
+        )
+
+    bug_name = ".github/ISSUE_TEMPLATE/bug.yml"
+    bug = _yaml_mapping(yaml_documents[bug_name], bug_name)
+    bug_body = bug.get("body")
+    _require(
+        isinstance(bug_body, SequenceNode),
+        f"Required public YAML field is not a list: {bug_name}: body",
+    )
+    markdown_values: list[str] = []
+    privacy_items: list[dict[str, Node]] = []
+    for item in cast(SequenceNode, bug_body).value:
+        item_mapping = _yaml_mapping(item, bug_name)
+        item_type = _yaml_scalar(item_mapping.get("type"), bug_name, "body.type")
+        if "id" in item_mapping and (
+            _yaml_scalar(item_mapping["id"], bug_name, "body.id") == "privacy"
+        ):
+            privacy_items.append(item_mapping)
+        if item_type != "markdown":
+            continue
+        attributes = _yaml_mapping(item_mapping.get("attributes"), bug_name)
+        markdown_values.append(
+            _yaml_scalar(attributes.get("value"), bug_name, "body.attributes.value")
+        )
+    _require(
+        len(markdown_values) == 1,
+        f"Required public reporting guidance is invalid in {bug_name}",
+    )
+    bug_guidance = markdown_values[0]
+    bug_destinations = re.findall(
+        r"\[confidential reporting form\]\(([^)\s]+)\)", bug_guidance
+    )
+    _require(
+        bug_destinations == [PRIVATE_REPORT_URL]
+        and REPORTING_POLICY_PATTERNS[bug_name].search(bug_guidance) is not None,
+        f"Required public reporting guidance is invalid in {bug_name}",
+    )
+
+    _require(
+        len(privacy_items) == 1
+        and _yaml_scalar(privacy_items[0].get("type"), bug_name, "body.type")
+        == "checkboxes",
+        f"Required public privacy checkbox is invalid in {bug_name}",
+    )
+    privacy_attributes = _yaml_mapping(privacy_items[0].get("attributes"), bug_name)
+    privacy_options = privacy_attributes.get("options")
+    _require(
+        isinstance(privacy_options, SequenceNode) and len(privacy_options.value) == 1,
+        f"Required public privacy checkbox is invalid in {bug_name}",
+    )
+    privacy_option = _yaml_mapping(
+        cast(SequenceNode, privacy_options).value[0], bug_name
+    )
+    privacy_required = privacy_option.get("required")
+    _require(
+        _yaml_scalar(privacy_option.get("label"), bug_name, "body.options.label")
+        == "I removed credentials, private paths, and private infrastructure details."
+        and isinstance(privacy_required, ScalarNode)
+        and privacy_required.tag == "tag:yaml.org,2002:bool"
+        and privacy_required.value == "true",
+        f"Required public privacy checkbox is invalid in {bug_name}",
+    )
+
+    proposal_name = ".github/ISSUE_TEMPLATE/proposal.yml"
+    proposal = _yaml_mapping(yaml_documents[proposal_name], proposal_name)
+    proposal_body = proposal.get("body")
+    _require(
+        isinstance(proposal_body, SequenceNode),
+        f"Required public YAML field is not a list: {proposal_name}: body",
+    )
+    readiness_items: list[dict[str, Node]] = []
+    for item in cast(SequenceNode, proposal_body).value:
+        item_mapping = _yaml_mapping(item, proposal_name)
+        if "id" in item_mapping and (
+            _yaml_scalar(item_mapping["id"], proposal_name, "body.id") == "readiness"
+        ):
+            readiness_items.append(item_mapping)
+    _require(
+        len(readiness_items) == 1
+        and _yaml_scalar(readiness_items[0].get("type"), proposal_name, "body.type")
+        == "checkboxes",
+        f"Required public proposal readiness is invalid in {proposal_name}",
+    )
+    readiness_attributes = _yaml_mapping(
+        readiness_items[0].get("attributes"), proposal_name
+    )
+    readiness_options = readiness_attributes.get("options")
+    expected_readiness_labels = (
+        "I will wait for an accepted Issue before starting implementation.",
+        "I sanitized all public examples and removed private data.",
+    )
+    _require(
+        isinstance(readiness_options, SequenceNode)
+        and len(readiness_options.value) == len(expected_readiness_labels),
+        f"Required public proposal readiness is invalid in {proposal_name}",
+    )
+    for option_node, expected_label in zip(
+        cast(SequenceNode, readiness_options).value,
+        expected_readiness_labels,
+        strict=True,
+    ):
+        option = _yaml_mapping(option_node, proposal_name)
+        required = option.get("required")
+        _require(
+            _yaml_scalar(option.get("label"), proposal_name, "body.options.label")
+            == expected_label
+            and isinstance(required, ScalarNode)
+            and required.tag == "tag:yaml.org,2002:bool"
+            and required.value == "true",
+            f"Required public proposal readiness is invalid in {proposal_name}",
+        )
+
+    config_name = ".github/ISSUE_TEMPLATE/config.yml"
+    config = _yaml_mapping(yaml_documents[config_name], config_name)
+    blank_issues = config.get("blank_issues_enabled")
+    _require(
+        isinstance(blank_issues, ScalarNode)
+        and blank_issues.tag == "tag:yaml.org,2002:bool"
+        and blank_issues.value == "false",
+        "Required public Issue-form configuration is invalid",
+    )
+    contact_links = config.get("contact_links")
+    _require(
+        isinstance(contact_links, SequenceNode) and len(contact_links.value) == 1,
+        "Required public Issue-form contact links are invalid",
+    )
+    contact = _yaml_mapping(cast(SequenceNode, contact_links).value[0], config_name)
+    _require(
+        _yaml_scalar(contact.get("name"), config_name, "contact_links.name")
+        == "Confidential security or conduct report"
+        and _yaml_scalar(contact.get("url"), config_name, "contact_links.url")
+        == PRIVATE_REPORT_URL
+        and _yaml_scalar(contact.get("about"), config_name, "contact_links.about")
+        == "Use GitHub Private Vulnerability Reporting instead of a public Issue.",
+        "Required public Issue-form reporting link is invalid",
+    )
+
     license_text = _text(source / "LICENSE")
     notices = _text(source / "THIRD_PARTY_NOTICES.md")
     readme = _text(source / "README.md")
@@ -283,6 +641,7 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
 
 
 def _canonical_archive_name(name: str, *, directory: bool) -> str:
+    _require("\\" not in name, f"Archive path uses a backslash: {name}")
     path = PurePosixPath(name)
     _require(not path.is_absolute(), f"Archive has an absolute path: {name}")
     _require(".." not in path.parts, f"Archive path escapes its root: {name}")
