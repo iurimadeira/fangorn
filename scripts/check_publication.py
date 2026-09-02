@@ -17,6 +17,7 @@ from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 
 EXCLUDED_DIRECTORIES = {
+    ".coverage-data",
     ".git",
     ".mypy_cache",
     ".pytest_cache",
@@ -173,8 +174,16 @@ def _tracked_source_files(source: Path) -> Iterable[tuple[str, bytes]]:
     ):
         environment.pop(name, None)
     try:
-        result = subprocess.run(
-            ["git", "-C", source, "ls-files", "--cached", "-z", "--"],
+        result = subprocess.run(  # noqa: S603 -- fixed Git argv, no shell
+            [  # noqa: S607 -- Git lookup intentionally follows process PATH
+                "git",
+                "-C",
+                source,
+                "ls-files",
+                "--cached",
+                "-z",
+                "--",
+            ],
             check=False,
             capture_output=True,
             env=environment,

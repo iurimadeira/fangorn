@@ -55,7 +55,7 @@ def run_fangorn(
                 environment.pop(name, None)
             else:
                 environment[name] = value
-    return subprocess.run(
+    return subprocess.run(  # noqa: S603 -- test controls executable and argv
         [fangorn_executable(), *arguments],
         check=False,
         capture_output=True,
@@ -74,7 +74,7 @@ def create_repository(path: Path) -> str:
 
 
 def test_help_exposes_bootstrap_commands() -> None:
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: S603 -- test controls executable and argv
         [fangorn_executable(), "--help"],
         check=False,
         capture_output=True,
@@ -107,7 +107,7 @@ def test_package_version_comes_from_distribution_metadata(
         monkeypatch.undo()
         importlib.reload(fangorn)
 
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: S603 -- test controls executable and argv
         [fangorn_executable(), "--version"],
         check=False,
         capture_output=True,
@@ -191,7 +191,11 @@ def test_git_older_than_231_fails_preflight_before_marker_creation(
     wrapper_directory.mkdir()
     wrapper = wrapper_directory / "git"
     real_git = subprocess.run(
-        ["sh", "-c", "command -v git"],
+        [  # noqa: S607 -- test resolves Git before installing a PATH wrapper
+            "sh",
+            "-c",
+            "command -v git",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -1010,7 +1014,11 @@ def test_each_observation_attempt_is_timestamped_before_its_first_git_read(
     events = tmp_path / "events"
     marker = tmp_path / "branch-changed"
     real_git = subprocess.run(
-        ["sh", "-c", "command -v git"],
+        [  # noqa: S607 -- test resolves Git before installing a PATH wrapper
+            "sh",
+            "-c",
+            "command -v git",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -1111,7 +1119,11 @@ def test_adopt_rejects_non_utf8_git_output_without_a_traceback(
     wrapper_directory.mkdir()
     wrapper = wrapper_directory / "git"
     real_git = subprocess.run(
-        ["sh", "-c", "command -v git"],
+        [  # noqa: S607 -- test resolves Git before installing a PATH wrapper
+            "sh",
+            "-c",
+            "command -v git",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -1161,7 +1173,11 @@ def test_adopt_ignores_inherited_git_config_source_overrides(tmp_path: Path) -> 
     wrapper_directory.mkdir()
     wrapper = wrapper_directory / "git"
     real_git = subprocess.run(
-        ["sh", "-c", "command -v git"],
+        [  # noqa: S607 -- test resolves Git before installing a PATH wrapper
+            "sh",
+            "-c",
+            "command -v git",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -1268,7 +1284,11 @@ def test_adopt_revalidates_a_deterministic_concurrent_branch_change(
     wrapper = wrapper_directory / "git"
     marker = tmp_path / "branch-changed"
     real_git = subprocess.run(
-        ["sh", "-c", "command -v git"],
+        [  # noqa: S607 -- test resolves Git before installing a PATH wrapper
+            "sh",
+            "-c",
+            "command -v git",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -1316,7 +1336,11 @@ def test_adopt_reports_symbolic_ref_and_subprocess_os_failures(tmp_path: Path) -
     wrapper_directory.mkdir()
     wrapper = wrapper_directory / "git"
     real_git = subprocess.run(
-        ["sh", "-c", "command -v git"],
+        [  # noqa: S607 -- test resolves Git before installing a PATH wrapper
+            "sh",
+            "-c",
+            "command -v git",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -2050,7 +2074,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
         for column, value in workspace_updates:
             with pytest.raises(sqlite3.IntegrityError, match="immutable"):
                 connection.execute(
-                    f"UPDATE workspaces SET {column} = ? WHERE id = ?",
+                    f"UPDATE workspaces SET {column} = ? WHERE id = ?",  # noqa: S608 -- column is fixed by test table
                     (value, workspace_id),
                 )
             connection.rollback()
@@ -2065,7 +2089,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
         ):
             with pytest.raises(sqlite3.IntegrityError, match="immutable"):
                 connection.execute(
-                    f"UPDATE repositories SET {column} = ? WHERE id = ?",
+                    f"UPDATE repositories SET {column} = ? WHERE id = ?",  # noqa: S608 -- column is fixed by test table
                     (value, repository_id),
                 )
             connection.rollback()
