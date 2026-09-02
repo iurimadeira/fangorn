@@ -15,6 +15,10 @@ from email import policy
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
+from typing import cast
+
+import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 EXCLUDED_DIRECTORIES = {
     ".coverage-data",
@@ -71,15 +75,12 @@ EXACT_RUNTIME_DEPENDENCY = "click>=8.1.8,<9"
 PRIVATE_REPORT_URL = "https://github.com/iurimadeira/fangorn/security/advisories/new"
 REQUIRED_PUBLIC_FILES = {
     ".github/ISSUE_TEMPLATE/bug.yml": (
-        "name: Bug report",
+        "Bug report",
         "sanitized",
         PRIVATE_REPORT_URL,
     ),
-    ".github/ISSUE_TEMPLATE/config.yml": (
-        "blank_issues_enabled: false",
-        PRIVATE_REPORT_URL,
-    ),
-    ".github/ISSUE_TEMPLATE/proposal.yml": ("name: Proposal", "accepted Issue"),
+    ".github/ISSUE_TEMPLATE/config.yml": (PRIVATE_REPORT_URL,),
+    ".github/ISSUE_TEMPLATE/proposal.yml": ("Proposal", "accepted Issue"),
     ".github/SECURITY.md": (
         "Report vulnerabilities confidentially",
         "Do not open a public Issue",
@@ -104,7 +105,6 @@ REQUIRED_PUBLIC_FILES = {
     ),
 }
 REPORTING_LINK_LABELS = {
-    ".github/ISSUE_TEMPLATE/bug.yml": "confidential reporting form",
     ".github/SECURITY.md": "GitHub Private Vulnerability Reporting",
     "CODE_OF_CONDUCT.md": "GitHub Private Vulnerability Reporting",
     "CONTRIBUTING.md": "GitHub Private Vulnerability Reporting",
@@ -172,6 +172,73 @@ def _visible_policy_text(text: str) -> str:
         for line in without_html_comments.splitlines()
         if not line.lstrip().startswith("#")
     )
+
+
+def _parse_yaml(text: str, name: str) -> Node:
+    try:
+        document = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as error:
+        raise CheckFailure(f"Required public YAML is invalid: {name}") from error
+    _require(document is not None, f"Required public YAML is empty: {name}")
+    document = cast(Node, document)
+    _reject_duplicate_yaml_keys(document, name)
+    return document
+
+
+def _reject_duplicate_yaml_keys(node: Node, name: str) -> None:
+    if isinstance(node, MappingNode):
+        keys: set[str] = set()
+        for key, value in node.value:
+            _require(
+                isinstance(key, ScalarNode),
+                f"Required public YAML has a non-scalar key: {name}",
+            )
+            scalar_key = cast(ScalarNode, key)
+            _require(
+                scalar_key.value not in keys,
+                f"Required public YAML has a duplicate YAML key: {name}: "
+                f"{scalar_key.value}",
+            )
+            keys.add(scalar_key.value)
+            _reject_duplicate_yaml_keys(value, name)
+    elif isinstance(node, SequenceNode):
+        for value in node.value:
+            _reject_duplicate_yaml_keys(value, name)
+
+
+def _yaml_mapping(node: Node | None, name: str) -> dict[str, Node]:
+    _require(
+        isinstance(node, MappingNode),
+        f"Required public YAML is not a map: {name}",
+    )
+    mapping = cast(MappingNode, node)
+    return {
+        key.value: value for key, value in mapping.value if isinstance(key, ScalarNode)
+    }
+
+
+def _yaml_scalar(node: Node | None, name: str, field: str) -> str:
+    _require(
+        isinstance(node, ScalarNode),
+        f"Required public YAML field is not scalar: {name}: {field}",
+    )
+    value = cast(ScalarNode, node).value
+    _require(
+        isinstance(value, str),
+        f"Required public YAML field is not text: {name}: {field}",
+    )
+    return cast(str, value)
+
+
+def _yaml_scalar_values(node: Node) -> Iterable[str]:
+    if isinstance(node, ScalarNode):
+        yield node.value
+    elif isinstance(node, MappingNode):
+        for _key, value in node.value:
+            yield from _yaml_scalar_values(value)
+    elif isinstance(node, SequenceNode):
+        for value in node.value:
+            yield from _yaml_scalar_values(value)
 
 
 def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
@@ -356,10 +423,17 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
         )
 
     public_text: dict[str, str] = {}
+    yaml_documents: dict[str, Node] = {}
     for name, markers in REQUIRED_PUBLIC_FILES.items():
         path = source / name
         _require(path.is_file(), f"Missing required public file: {name}")
-        text = _visible_policy_text(_text(path))
+        raw_text = _text(path)
+        if path.suffix == ".yml":
+            document = _parse_yaml(raw_text, name)
+            yaml_documents[name] = document
+            text = "\n".join(_yaml_scalar_values(document))
+        else:
+            text = _visible_policy_text(raw_text)
         public_text[name] = text
         for marker in markers:
             _require(marker in text, f"Required public marker missing from {name}")
@@ -377,16 +451,68 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
             f"Required public reporting guidance is invalid in {name}",
         )
 
-    config_lines = public_text[".github/ISSUE_TEMPLATE/config.yml"].splitlines()
+    for name, expected_name in (
+        (".github/ISSUE_TEMPLATE/bug.yml", "Bug report"),
+        (".github/ISSUE_TEMPLATE/proposal.yml", "Proposal"),
+    ):
+        issue_form = _yaml_mapping(yaml_documents[name], name)
+        _require(
+            _yaml_scalar(issue_form.get("name"), name, "name") == expected_name,
+            f"Required public Issue-form name is invalid: {name}",
+        )
+
+    bug_name = ".github/ISSUE_TEMPLATE/bug.yml"
+    bug = _yaml_mapping(yaml_documents[bug_name], bug_name)
+    bug_body = bug.get("body")
     _require(
-        config_lines.count("blank_issues_enabled: false") == 1,
+        isinstance(bug_body, SequenceNode),
+        f"Required public YAML field is not a list: {bug_name}: body",
+    )
+    markdown_values: list[str] = []
+    for item in cast(SequenceNode, bug_body).value:
+        item_mapping = _yaml_mapping(item, bug_name)
+        if _yaml_scalar(item_mapping.get("type"), bug_name, "body.type") != "markdown":
+            continue
+        attributes = _yaml_mapping(item_mapping.get("attributes"), bug_name)
+        markdown_values.append(
+            _yaml_scalar(attributes.get("value"), bug_name, "body.attributes.value")
+        )
+    _require(
+        len(markdown_values) == 1,
+        f"Required public reporting guidance is invalid in {bug_name}",
+    )
+    bug_guidance = markdown_values[0]
+    bug_destinations = re.findall(
+        r"\[confidential reporting form\]\(([^)\s]+)\)", bug_guidance
+    )
+    _require(
+        bug_destinations == [PRIVATE_REPORT_URL]
+        and REPORTING_POLICY_PATTERNS[bug_name].search(bug_guidance) is not None,
+        f"Required public reporting guidance is invalid in {bug_name}",
+    )
+
+    config_name = ".github/ISSUE_TEMPLATE/config.yml"
+    config = _yaml_mapping(yaml_documents[config_name], config_name)
+    blank_issues = config.get("blank_issues_enabled")
+    _require(
+        isinstance(blank_issues, ScalarNode)
+        and blank_issues.tag == "tag:yaml.org,2002:bool"
+        and blank_issues.value == "false",
         "Required public Issue-form configuration is invalid",
     )
-    config_urls = [
-        line.strip() for line in config_lines if line.lstrip().startswith("url:")
-    ]
+    contact_links = config.get("contact_links")
     _require(
-        config_urls == [f"url: {PRIVATE_REPORT_URL}"],
+        isinstance(contact_links, SequenceNode) and len(contact_links.value) == 1,
+        "Required public Issue-form contact links are invalid",
+    )
+    contact = _yaml_mapping(cast(SequenceNode, contact_links).value[0], config_name)
+    _require(
+        _yaml_scalar(contact.get("name"), config_name, "contact_links.name")
+        == "Confidential security or conduct report"
+        and _yaml_scalar(contact.get("url"), config_name, "contact_links.url")
+        == PRIVATE_REPORT_URL
+        and _yaml_scalar(contact.get("about"), config_name, "contact_links.about")
+        == "Use GitHub Private Vulnerability Reporting instead of a public Issue.",
         "Required public Issue-form reporting link is invalid",
     )
 

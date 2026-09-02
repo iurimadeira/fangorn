@@ -280,13 +280,16 @@ def test_publication_gate_requires_public_contribution_markers(
     source = copy_source_to_temporary_repository(tmp_path)
     path = source / relative_name
     content = path.read_text(encoding="utf-8")
-    path.write_text(content.replace(marker, "removed marker"), encoding="utf-8")
+    replacement = "removed marker"
+    if path.suffix == ".yml" and ": " in marker:
+        replacement = f"{marker.split(':', 1)[0]}: removed marker"
+    path.write_text(content.replace(marker, replacement), encoding="utf-8")
 
     result = run_publication_gate(source=source)
 
     assert result.returncode != 0
     assert result.stdout == ""
-    assert "Required public marker missing" in result.stderr
+    assert "Required public" in result.stderr
 
 
 def test_publication_gate_rejects_non_utf8_public_file(tmp_path: Path) -> None:
@@ -306,7 +309,7 @@ def test_publication_gate_rejects_non_utf8_public_file(tmp_path: Path) -> None:
         (
             ".github/ISSUE_TEMPLATE/bug.yml",
             ((PRIVATE_REPORT_URL, "https://example.invalid/report"),),
-            f"# {PRIVATE_REPORT_URL}\n",
+            f"description: placeholder # {PRIVATE_REPORT_URL}\n",
         ),
         (
             ".github/ISSUE_TEMPLATE/config.yml",
@@ -359,6 +362,20 @@ def test_publication_gate_rejects_hidden_public_policy_markers(
 
     assert result.returncode != 0
     assert "Required public" in result.stderr
+
+
+def test_publication_gate_rejects_duplicate_issue_form_keys(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    config = source / ".github/ISSUE_TEMPLATE/config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8") + "blank_issues_enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "duplicate YAML key" in result.stderr
 
 
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
