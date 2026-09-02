@@ -17,6 +17,7 @@ from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 
 EXCLUDED_DIRECTORIES = {
+    ".coverage-data",
     ".git",
     ".mypy_cache",
     ".pytest_cache",
@@ -26,6 +27,7 @@ EXCLUDED_DIRECTORIES = {
     "build",
     "dist",
 }
+LOCALLY_EXCLUDED_UNTRACKED_FILES = {".hunk/agent-context.json"}
 SENSITIVE_NAMES = {
     ".env",
     "id_ed25519",
@@ -91,6 +93,8 @@ def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
         name = relative.as_posix()
         if name in tracked_names:
             continue
+        if name in LOCALLY_EXCLUDED_UNTRACKED_FILES:
+            continue
         if any(part in EXCLUDED_DIRECTORIES for part in relative.parts):
             continue
         if path.is_symlink():
@@ -119,8 +123,16 @@ def _tracked_source_files(source: Path) -> Iterable[tuple[str, bytes]]:
     ):
         environment.pop(name, None)
     try:
-        result = subprocess.run(
-            ["git", "-C", source, "ls-files", "--cached", "-z", "--"],
+        result = subprocess.run(  # noqa: S603 -- fixed Git argv, no shell
+            [  # noqa: S607 -- Git lookup intentionally follows process PATH
+                "git",
+                "-C",
+                source,
+                "ls-files",
+                "--cached",
+                "-z",
+                "--",
+            ],
             check=False,
             capture_output=True,
             env=environment,

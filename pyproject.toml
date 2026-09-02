@@ -33,13 +33,14 @@ Issues = "https://github.com/iurimadeira/fangorn/issues"
 
 [dependency-groups]
 dev = [
+  "coverage>=7.10,<8",
   "mypy>=1.15,<2",
   "pytest>=8.3,<10",
   "ruff>=0.11,<1",
 ]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -47,7 +48,10 @@ line-length = 88
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+select = ["E", "F", "I", "UP", "B", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
 
 [tool.uv.build-backend]
 module-name = "fangorn"
@@ -56,4 +60,13 @@ source-include = [".github/**", "scripts/**", "tests/**", "uv.lock"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "scripts", "tests"]
+warn_unreachable = true
+
+[tool.coverage.run]
+branch = true
+data_file = ".coverage-data/.coverage"
+parallel = true
+patch = ["subprocess"]
+relative_files = true
+source = ["src", "scripts"]

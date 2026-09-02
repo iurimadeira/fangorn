@@ -26,8 +26,8 @@ def initialize_repository(path: Path) -> None:
     path.mkdir(exist_ok=True)
     template = path.parent / ".git-fixture-template"
     template.mkdir(exist_ok=True)
-    subprocess.run(
-        [
+    subprocess.run(  # noqa: S603 -- test controls executable and argv
+        [  # noqa: S607 -- test intentionally exercises PATH Git lookup
             "git",
             "init",
             "--initial-branch=main",
@@ -44,8 +44,13 @@ def initialize_repository(path: Path) -> None:
 
 
 def git(repository: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", repository, *arguments],
+    result = subprocess.run(  # noqa: S603 -- test controls executable and argv
+        [  # noqa: S607 -- test intentionally exercises PATH Git lookup
+            "git",
+            "-C",
+            repository,
+            *arguments,
+        ],
         check=True,
         capture_output=True,
         text=True,

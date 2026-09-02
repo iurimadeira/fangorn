@@ -29,7 +29,7 @@ def run_publication_gate(
     *artifacts: Path,
     source: Path = PROJECT_ROOT,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return subprocess.run(  # noqa: S603 -- test controls executable and argv
         [
             sys.executable,
             PROJECT_ROOT / "scripts" / "check_publication.py",
@@ -49,7 +49,9 @@ def copy_source_to_temporary_repository(tmp_path: Path) -> Path:
         PROJECT_ROOT,
         source,
         ignore=shutil.ignore_patterns(
+            ".coverage-data",
             ".git",
+            ".hunk",
             ".mypy_cache",
             ".pytest_cache",
             ".ruff_cache",
@@ -186,6 +188,40 @@ def test_publication_gate_accepts_the_public_source_tree() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "uv tool install fangorn-cli" in readme
     assert "pipx install fangorn-cli" in readme
+
+
+def test_publication_gate_ignores_untracked_coverage_data(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    coverage_data = source / ".coverage-data"
+    coverage_data.mkdir()
+    (coverage_data / ".coverage.worker").write_bytes(b"\x00coverage database")
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "Publication checks passed: source tree\n"
+
+
+def test_publication_gate_ignores_only_untracked_local_review_context(
+    tmp_path: Path,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    review_context = source / ".hunk" / "agent-context.json"
+    review_context.parent.mkdir()
+    review_context.write_text(
+        '{"path":"/' + 'home/private-user/worktree"}\n',
+        encoding="utf-8",
+    )
+
+    untracked_result = run_publication_gate(source=source)
+
+    assert untracked_result.returncode == 0, untracked_result.stderr
+
+    git(source, "add", "-f", "--", ".hunk/agent-context.json")
+    tracked_result = run_publication_gate(source=source)
+
+    assert tracked_result.returncode != 0
+    assert "Private data pattern found" in tracked_result.stderr
 
 
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
@@ -490,6 +526,7 @@ def test_publication_gate_rejects_duplicate_canonical_license_paths(
 @pytest.mark.parametrize(
     "relative_name",
     [
+        ".coverage-data/sensitive.pem",
         "dist/sensitive.pem",
         "nested/build/sensitive.pem",
         ".venv/sensitive.pem",

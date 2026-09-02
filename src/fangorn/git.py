@@ -81,8 +81,13 @@ def _run_git(
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
     try:
-        result = subprocess.run(
-            ["git", "-C", str(path), *arguments],
+        result = subprocess.run(  # noqa: S603 -- fixed Git argv, no shell
+            [  # noqa: S607 -- Git lookup intentionally follows process PATH
+                "git",
+                "-C",
+                str(path),
+                *arguments,
+            ],
             check=False,
             capture_output=True,
             env=environment,
