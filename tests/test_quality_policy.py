@@ -37,6 +37,10 @@ def test_local_quality_configuration_matches_the_public_contract() -> None:
 def test_ci_exposes_one_stable_aggregate_result() -> None:
     workflow = (PROJECT_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
+    assert (
+        "group: ${{ github.workflow }}-"
+        "${{ github.event.pull_request.number || github.run_id }}" in workflow
+    )
     assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
     assert re.search(r"^  quality:\n(?:.*\n)*?    timeout-minutes: 15$", workflow, re.M)
     assert re.search(
