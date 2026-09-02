@@ -395,6 +395,25 @@ def test_publication_gate_rejects_unsafe_bug_privacy_checkbox(tmp_path: Path) ->
     assert "privacy checkbox" in result.stderr
 
 
+def test_publication_gate_rejects_optional_proposal_readiness(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    proposal = source / ".github/ISSUE_TEMPLATE/proposal.yml"
+    proposal.write_text(
+        proposal.read_text(encoding="utf-8").replace(
+            "I will wait for an accepted Issue before starting implementation.\n"
+            "          required: true",
+            "I will wait for an accepted Issue before starting implementation.\n"
+            "          required: false",
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "proposal readiness" in result.stderr
+
+
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
     workflow = (PROJECT_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 

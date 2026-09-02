@@ -522,6 +522,55 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
         f"Required public privacy checkbox is invalid in {bug_name}",
     )
 
+    proposal_name = ".github/ISSUE_TEMPLATE/proposal.yml"
+    proposal = _yaml_mapping(yaml_documents[proposal_name], proposal_name)
+    proposal_body = proposal.get("body")
+    _require(
+        isinstance(proposal_body, SequenceNode),
+        f"Required public YAML field is not a list: {proposal_name}: body",
+    )
+    readiness_items: list[dict[str, Node]] = []
+    for item in cast(SequenceNode, proposal_body).value:
+        item_mapping = _yaml_mapping(item, proposal_name)
+        if "id" in item_mapping and (
+            _yaml_scalar(item_mapping["id"], proposal_name, "body.id") == "readiness"
+        ):
+            readiness_items.append(item_mapping)
+    _require(
+        len(readiness_items) == 1
+        and _yaml_scalar(readiness_items[0].get("type"), proposal_name, "body.type")
+        == "checkboxes",
+        f"Required public proposal readiness is invalid in {proposal_name}",
+    )
+    readiness_attributes = _yaml_mapping(
+        readiness_items[0].get("attributes"), proposal_name
+    )
+    readiness_options = readiness_attributes.get("options")
+    expected_readiness_labels = (
+        "I will wait for an accepted Issue before starting implementation.",
+        "I sanitized all public examples and removed private data.",
+    )
+    _require(
+        isinstance(readiness_options, SequenceNode)
+        and len(readiness_options.value) == len(expected_readiness_labels),
+        f"Required public proposal readiness is invalid in {proposal_name}",
+    )
+    for option_node, expected_label in zip(
+        cast(SequenceNode, readiness_options).value,
+        expected_readiness_labels,
+        strict=True,
+    ):
+        option = _yaml_mapping(option_node, proposal_name)
+        required = option.get("required")
+        _require(
+            _yaml_scalar(option.get("label"), proposal_name, "body.options.label")
+            == expected_label
+            and isinstance(required, ScalarNode)
+            and required.tag == "tag:yaml.org,2002:bool"
+            and required.value == "true",
+            f"Required public proposal readiness is invalid in {proposal_name}",
+        )
+
     config_name = ".github/ISSUE_TEMPLATE/config.yml"
     config = _yaml_mapping(yaml_documents[config_name], config_name)
     blank_issues = config.get("blank_issues_enabled")
