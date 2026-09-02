@@ -187,10 +187,14 @@ def _parse_yaml(text: str, name: str) -> Node:
 
 def _reject_duplicate_yaml_keys(node: Node, name: str) -> None:
     if isinstance(node, MappingNode):
+        _require(
+            node.tag == "tag:yaml.org,2002:map",
+            f"Required public YAML has an unsupported YAML tag: {name}",
+        )
         keys: set[str] = set()
         for key, value in node.value:
             _require(
-                isinstance(key, ScalarNode),
+                isinstance(key, ScalarNode) and key.tag == "tag:yaml.org,2002:str",
                 f"Required public YAML has a non-scalar key: {name}",
             )
             scalar_key = cast(ScalarNode, key)
@@ -202,8 +206,18 @@ def _reject_duplicate_yaml_keys(node: Node, name: str) -> None:
             keys.add(scalar_key.value)
             _reject_duplicate_yaml_keys(value, name)
     elif isinstance(node, SequenceNode):
+        _require(
+            node.tag == "tag:yaml.org,2002:seq",
+            f"Required public YAML has an unsupported YAML tag: {name}",
+        )
         for value in node.value:
             _reject_duplicate_yaml_keys(value, name)
+    else:
+        _require(
+            isinstance(node, ScalarNode)
+            and node.tag in {"tag:yaml.org,2002:bool", "tag:yaml.org,2002:str"},
+            f"Required public YAML has an unsupported YAML tag: {name}",
+        )
 
 
 def _yaml_mapping(node: Node | None, name: str) -> dict[str, Node]:

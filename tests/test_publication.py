@@ -393,7 +393,34 @@ def test_publication_gate_rejects_custom_tagged_issue_form_scalar(
     result = run_publication_gate(source=source)
 
     assert result.returncode != 0
-    assert "not text" in result.stderr
+    assert "unsupported YAML tag" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        ("name: Bug report", "!unsafe\nname: Bug report"),
+        ("body:\n", "body: !unsafe\n"),
+        ("      options:\n", "      options: !unsafe\n"),
+    ],
+    ids=("root-map", "body-sequence", "options-sequence"),
+)
+def test_publication_gate_rejects_custom_tagged_issue_form_collections(
+    tmp_path: Path,
+    target: str,
+    replacement: str,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    bug_form = source / ".github/ISSUE_TEMPLATE/bug.yml"
+    bug_form.write_text(
+        bug_form.read_text(encoding="utf-8").replace(target, replacement, 1),
+        encoding="utf-8",
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "unsupported YAML tag" in result.stderr
 
 
 def test_publication_gate_rejects_unsafe_bug_privacy_checkbox(tmp_path: Path) -> None:
