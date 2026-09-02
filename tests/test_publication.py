@@ -378,6 +378,23 @@ def test_publication_gate_rejects_duplicate_issue_form_keys(tmp_path: Path) -> N
     assert "duplicate YAML key" in result.stderr
 
 
+def test_publication_gate_rejects_unsafe_bug_privacy_checkbox(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    bug_form = source / ".github/ISSUE_TEMPLATE/bug.yml"
+    bug_form.write_text(
+        bug_form.read_text(encoding="utf-8").replace(
+            "I removed credentials, private paths, and private infrastructure details.",
+            "I included credentials and private paths for debugging.",
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "privacy checkbox" in result.stderr
+
+
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
     workflow = (PROJECT_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 

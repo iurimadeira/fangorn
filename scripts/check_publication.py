@@ -469,9 +469,15 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
         f"Required public YAML field is not a list: {bug_name}: body",
     )
     markdown_values: list[str] = []
+    privacy_items: list[dict[str, Node]] = []
     for item in cast(SequenceNode, bug_body).value:
         item_mapping = _yaml_mapping(item, bug_name)
-        if _yaml_scalar(item_mapping.get("type"), bug_name, "body.type") != "markdown":
+        item_type = _yaml_scalar(item_mapping.get("type"), bug_name, "body.type")
+        if "id" in item_mapping and (
+            _yaml_scalar(item_mapping["id"], bug_name, "body.id") == "privacy"
+        ):
+            privacy_items.append(item_mapping)
+        if item_type != "markdown":
             continue
         attributes = _yaml_mapping(item_mapping.get("attributes"), bug_name)
         markdown_values.append(
@@ -489,6 +495,31 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
         bug_destinations == [PRIVATE_REPORT_URL]
         and REPORTING_POLICY_PATTERNS[bug_name].search(bug_guidance) is not None,
         f"Required public reporting guidance is invalid in {bug_name}",
+    )
+
+    _require(
+        len(privacy_items) == 1
+        and _yaml_scalar(privacy_items[0].get("type"), bug_name, "body.type")
+        == "checkboxes",
+        f"Required public privacy checkbox is invalid in {bug_name}",
+    )
+    privacy_attributes = _yaml_mapping(privacy_items[0].get("attributes"), bug_name)
+    privacy_options = privacy_attributes.get("options")
+    _require(
+        isinstance(privacy_options, SequenceNode) and len(privacy_options.value) == 1,
+        f"Required public privacy checkbox is invalid in {bug_name}",
+    )
+    privacy_option = _yaml_mapping(
+        cast(SequenceNode, privacy_options).value[0], bug_name
+    )
+    privacy_required = privacy_option.get("required")
+    _require(
+        _yaml_scalar(privacy_option.get("label"), bug_name, "body.options.label")
+        == "I removed credentials, private paths, and private infrastructure details."
+        and isinstance(privacy_required, ScalarNode)
+        and privacy_required.tag == "tag:yaml.org,2002:bool"
+        and privacy_required.value == "true",
+        f"Required public privacy checkbox is invalid in {bug_name}",
     )
 
     config_name = ".github/ISSUE_TEMPLATE/config.yml"
