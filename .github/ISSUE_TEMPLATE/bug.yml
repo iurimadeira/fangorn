@@ -5,7 +5,10 @@ labels: []
 body:
   - type: markdown
     attributes:
-      value: Security reports do not belong in public Issues. Use the confidential reporting link instead.
+      value: >-
+        Security reports do not belong in public Issues. Use the
+        [confidential reporting form](https://github.com/iurimadeira/fangorn/security/advisories/new)
+        instead.
   - type: textarea
     id: summary
     attributes:

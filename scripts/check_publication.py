@@ -68,13 +68,33 @@ EXPECTED_PROJECT_URLS = {
 }
 EXACT_RUNTIME_DEPENDENCY = "click>=8.1.8,<9"
 REQUIRED_PUBLIC_FILES = {
-    ".github/ISSUE_TEMPLATE/bug.yml": ("name: Bug report", "sanitized"),
-    ".github/ISSUE_TEMPLATE/config.yml": ("blank_issues_enabled: false",),
+    ".github/ISSUE_TEMPLATE/bug.yml": (
+        "name: Bug report",
+        "sanitized",
+        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+    ),
+    ".github/ISSUE_TEMPLATE/config.yml": (
+        "blank_issues_enabled: false",
+        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+    ),
     ".github/ISSUE_TEMPLATE/proposal.yml": ("name: Proposal", "accepted Issue"),
-    ".github/SECURITY.md": ("Private Vulnerability Reporting", "public Issue"),
+    ".github/SECURITY.md": (
+        "Report vulnerabilities confidentially",
+        "Do not open a public Issue",
+        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+    ),
     ".github/pull_request_template.md": ("Closes #", "sanitized"),
-    "CODE_OF_CONDUCT.md": ("Contributor Covenant", "version 2.1"),
-    "CONTRIBUTING.md": ("accepted Issue", "uv sync --locked --dev", "sanitized"),
+    "CODE_OF_CONDUCT.md": (
+        "Contributor Covenant",
+        "version 2.1",
+        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+    ),
+    "CONTRIBUTING.md": (
+        "accepted Issue",
+        "uv sync --locked --dev",
+        "sanitized",
+        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+    ),
 }
 
 
@@ -106,6 +126,8 @@ def _terminal_safe(value: str) -> str:
 def _text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise CheckFailure(f"Required file is not valid UTF-8: {path}") from error
     except OSError as error:
         raise CheckFailure(f"Cannot read required file: {path}") from error
 
@@ -224,7 +246,7 @@ def _validate_public_content(name: str, content: bytes) -> None:
         _require(pattern.search(text) is None, f"Private data pattern found: {name}")
     for pattern in PRIVATE_INFRASTRUCTURE_PATTERNS:
         _require(
-            pattern.search(text) is None,
+            pattern.search(name) is None and pattern.search(text) is None,
             f"Forbidden private infrastructure identifier found: {name}",
         )
 

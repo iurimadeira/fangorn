@@ -33,5 +33,6 @@ sanitized. Never include credentials, private paths, private infrastructure,
 complete environment dumps, or raw log bundles.
 
 By participating, you agree to follow [the Code of Conduct](CODE_OF_CONDUCT.md).
-Report vulnerabilities or conduct incidents through the confidential channel
-described in [the security policy](.github/SECURITY.md).
+Report vulnerabilities or conduct incidents through
+[GitHub Private Vulnerability Reporting](https://github.com/iurimadeira/fangorn/security/advisories/new),
+as described in [the security policy](.github/SECURITY.md).

@@ -36,6 +36,34 @@ PRIVATE_INFRASTRUCTURE_IDENTIFIERS = (
     "oh-my-" + "fangorn",
     "ws" + "n",
 )
+PRIVATE_PATHS = (
+    "/home/" + "example/private/",
+    "/Users/" + "example/private/",
+)
+PRIVATE_REPORT_URL = (
+    "https://github.com/iurimadeira/fangorn/security/" + "advisories/new"
+)
+REQUIRED_PUBLIC_MARKERS = (
+    (".github/ISSUE_TEMPLATE/bug.yml", "name: Bug report"),
+    (".github/ISSUE_TEMPLATE/bug.yml", "sanitized"),
+    (".github/ISSUE_TEMPLATE/bug.yml", PRIVATE_REPORT_URL),
+    (".github/ISSUE_TEMPLATE/config.yml", "blank_issues_enabled: false"),
+    (".github/ISSUE_TEMPLATE/config.yml", PRIVATE_REPORT_URL),
+    (".github/ISSUE_TEMPLATE/proposal.yml", "name: Proposal"),
+    (".github/ISSUE_TEMPLATE/proposal.yml", "accepted Issue"),
+    (".github/SECURITY.md", "Report vulnerabilities confidentially"),
+    (".github/SECURITY.md", "Do not open a public Issue"),
+    (".github/SECURITY.md", PRIVATE_REPORT_URL),
+    (".github/pull_request_template.md", "Closes #"),
+    (".github/pull_request_template.md", "sanitized"),
+    ("CODE_OF_CONDUCT.md", "Contributor Covenant"),
+    ("CODE_OF_CONDUCT.md", "version 2.1"),
+    ("CODE_OF_CONDUCT.md", PRIVATE_REPORT_URL),
+    ("CONTRIBUTING.md", "accepted Issue"),
+    ("CONTRIBUTING.md", "uv sync --locked --dev"),
+    ("CONTRIBUTING.md", "sanitized"),
+    ("CONTRIBUTING.md", PRIVATE_REPORT_URL),
+)
 
 
 def run_publication_gate(
@@ -225,6 +253,33 @@ def test_publication_gate_requires_public_contribution_files(
     assert result.returncode != 0
     assert result.stdout == ""
     assert "Missing required public file" in result.stderr
+
+
+@pytest.mark.parametrize(("relative_name", "marker"), REQUIRED_PUBLIC_MARKERS)
+def test_publication_gate_requires_public_contribution_markers(
+    tmp_path: Path, relative_name: str, marker: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    path = source / relative_name
+    content = path.read_text(encoding="utf-8")
+    path.write_text(content.replace(marker, "removed marker"), encoding="utf-8")
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Required public marker missing" in result.stderr
+
+
+def test_publication_gate_rejects_non_utf8_public_file(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    (source / "CONTRIBUTING.md").write_bytes(b"invalid: \xff\n")
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Required file is not valid UTF-8" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
@@ -631,6 +686,72 @@ def test_publication_gate_rejects_private_infrastructure_identifiers_in_artifact
 
     assert result.returncode != 0
     assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize("identifier", PRIVATE_INFRASTRUCTURE_IDENTIFIERS)
+def test_publication_gate_rejects_private_infrastructure_identifiers_in_source_paths(
+    tmp_path: Path, identifier: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    payload = source / "docs" / f"{identifier}.txt"
+    payload.write_text("public text\n", encoding="utf-8")
+    git(source, "add", "--", str(payload.relative_to(source)))
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("identifier", PRIVATE_INFRASTRUCTURE_IDENTIFIERS)
+def test_publication_gate_rejects_private_infrastructure_identifiers_in_archive_paths(
+    tmp_path: Path, artifact_kind: str, identifier: str
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    entry = (f"docs/{identifier}.txt", b"public text\n")
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, extra_entries=(entry,))
+    else:
+        write_test_sdist(sdist, extra_entries=(entry,))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize("private_path", PRIVATE_PATHS)
+def test_publication_gate_rejects_private_paths_in_source(
+    tmp_path: Path, private_path: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    payload = source / "private-path.txt"
+    payload.write_text(f"path={private_path}\n", encoding="utf-8")
+    git(source, "add", "--", payload.name)
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Private data pattern found" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("private_path", PRIVATE_PATHS)
+def test_publication_gate_rejects_private_paths_in_artifacts(
+    tmp_path: Path, artifact_kind: str, private_path: str
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    payload = f"path={private_path}\n".encode()
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, payload=payload)
+    else:
+        write_test_sdist(sdist, extra_entries=(("private-path.txt", payload),))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert "Private data pattern found" in result.stderr
 
 
 def test_publication_gate_renders_dynamic_error_paths_on_one_safe_line(
