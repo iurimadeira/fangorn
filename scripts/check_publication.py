@@ -222,9 +222,10 @@ def _yaml_scalar(node: Node | None, name: str, field: str) -> str:
         isinstance(node, ScalarNode),
         f"Required public YAML field is not scalar: {name}: {field}",
     )
-    value = cast(ScalarNode, node).value
+    scalar = cast(ScalarNode, node)
+    value = scalar.value
     _require(
-        isinstance(value, str),
+        scalar.tag == "tag:yaml.org,2002:str" and isinstance(value, str),
         f"Required public YAML field is not text: {name}: {field}",
     )
     return cast(str, value)

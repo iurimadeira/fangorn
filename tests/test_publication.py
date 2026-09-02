@@ -378,6 +378,24 @@ def test_publication_gate_rejects_duplicate_issue_form_keys(tmp_path: Path) -> N
     assert "duplicate YAML key" in result.stderr
 
 
+def test_publication_gate_rejects_custom_tagged_issue_form_scalar(
+    tmp_path: Path,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    bug_form = source / ".github/ISSUE_TEMPLATE/bug.yml"
+    bug_form.write_text(
+        bug_form.read_text(encoding="utf-8").replace(
+            "name: Bug report", "name: !unsafe Bug report"
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "not text" in result.stderr
+
+
 def test_publication_gate_rejects_unsafe_bug_privacy_checkbox(tmp_path: Path) -> None:
     source = copy_source_to_temporary_repository(tmp_path)
     bug_form = source / ".github/ISSUE_TEMPLATE/bug.yml"
