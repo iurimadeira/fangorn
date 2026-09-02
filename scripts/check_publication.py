@@ -33,6 +33,7 @@ SENSITIVE_NAMES = {
     "registry.sqlite3",
 }
 SENSITIVE_SUFFIXES = {".key", ".p12", ".pem"}
+LOCAL_REVIEW_CONTEXT = PurePosixPath(".hunk/agent-context.json")
 CONTENT_PATTERNS = (
     re.compile(r"/(?:home|Users)/[^/\s]+/"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -40,12 +41,41 @@ CONTENT_PATTERNS = (
     re.compile(r"sk[-]proj-[A-Za-z0-9_-]{20,}"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
 )
+PRIVATE_INFRASTRUCTURE_IDENTIFIERS = (
+    "ac" + "c",
+    "ac" + "o",
+    "ai-account" + "-router",
+    "iuri-sync" + "-vault",
+    "iurimadeira" + "-dot-files",
+    "lab" + ".local",
+    "lab-" + "lan",
+    "lab-" + "tmux",
+    "mac-" + "import",
+    "oh-my-" + "fangorn",
+    "ws" + "n",
+)
+PRIVATE_INFRASTRUCTURE_PATTERNS = tuple(
+    re.compile(
+        rf"(?<![A-Za-z0-9_-]){re.escape(identifier)}(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    )
+    for identifier in PRIVATE_INFRASTRUCTURE_IDENTIFIERS
+)
 PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 EXPECTED_PROJECT_URLS = {
     "Homepage": "https://github.com/iurimadeira/fangorn",
     "Issues": "https://github.com/iurimadeira/fangorn/issues",
 }
 EXACT_RUNTIME_DEPENDENCY = "click>=8.1.8,<9"
+REQUIRED_PUBLIC_FILES = {
+    ".github/ISSUE_TEMPLATE/bug.yml": ("name: Bug report", "sanitized"),
+    ".github/ISSUE_TEMPLATE/config.yml": ("blank_issues_enabled: false",),
+    ".github/ISSUE_TEMPLATE/proposal.yml": ("name: Proposal", "accepted Issue"),
+    ".github/SECURITY.md": ("Private Vulnerability Reporting", "public Issue"),
+    ".github/pull_request_template.md": ("Closes #", "sanitized"),
+    "CODE_OF_CONDUCT.md": ("Contributor Covenant", "version 2.1"),
+    "CONTRIBUTING.md": ("accepted Issue", "uv sync --locked --dev", "sanitized"),
+}
 
 
 class CheckFailure(RuntimeError):
@@ -90,6 +120,8 @@ def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
         relative = path.relative_to(source)
         name = relative.as_posix()
         if name in tracked_names:
+            continue
+        if PurePosixPath(name) == LOCAL_REVIEW_CONTEXT:
             continue
         if any(part in EXCLUDED_DIRECTORIES for part in relative.parts):
             continue
@@ -169,6 +201,11 @@ def _tracked_source_files(source: Path) -> Iterable[tuple[str, bytes]]:
 def _validate_public_content(name: str, content: bytes) -> None:
     path = PurePosixPath(name)
     lowered_name = path.name.lower()
+    _require(
+        tuple(part.lower() for part in path.parts[-2:])
+        != tuple(part.lower() for part in LOCAL_REVIEW_CONTEXT.parts),
+        f"Sensitive file included: {name}",
+    )
     _require(lowered_name not in SENSITIVE_NAMES, f"Sensitive file included: {name}")
     _require(
         path.suffix.lower() not in SENSITIVE_SUFFIXES,
@@ -185,6 +222,11 @@ def _validate_public_content(name: str, content: bytes) -> None:
     )
     for pattern in CONTENT_PATTERNS:
         _require(pattern.search(text) is None, f"Private data pattern found: {name}")
+    for pattern in PRIVATE_INFRASTRUCTURE_PATTERNS:
+        _require(
+            pattern.search(text) is None,
+            f"Forbidden private infrastructure identifier found: {name}",
+        )
 
 
 def validate_source(source: Path) -> tuple[str, bytes, bytes]:
@@ -240,6 +282,13 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
             ),
             f"Missing required development tool: {tool}",
         )
+
+    for name, markers in REQUIRED_PUBLIC_FILES.items():
+        path = source / name
+        _require(path.is_file(), f"Missing required public file: {name}")
+        text = _text(path)
+        for marker in markers:
+            _require(marker in text, f"Required public marker missing from {name}")
 
     license_text = _text(source / "LICENSE")
     notices = _text(source / "THIRD_PARTY_NOTICES.md")

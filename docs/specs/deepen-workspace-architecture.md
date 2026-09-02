@@ -138,10 +138,11 @@ exist. Each slice preserves the currently supported public behavior.
 
 ## Out of scope
 
-- Parent/child Workspace commands, persistence, tree navigation, or tmux UI.
+- Parent/child Workspace commands, persistence, tree navigation, or terminal UI.
 - Workspace creation, removal, reparenting, merging, or ticket orchestration.
 - Rebinding an existing Workspace to another worktree.
-- WSN migration, dotfiles integration, `oh-my-fangorn`, `acc`, or `aco` changes.
+- Migration from private workspace tooling, private configuration integration,
+  or related agent-launcher changes.
 - New CLI output schemas or Registry schema versions.
 - A third publication format, archive streaming, signatures, or deterministic
   build comparison.

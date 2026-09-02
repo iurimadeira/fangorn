@@ -23,6 +23,19 @@ PRIVATE_KEY_HEADERS = tuple(
     "-----BEGIN " + prefix + "PRIVATE KEY-----"
     for prefix in ("", "RSA ", "EC ", "DSA ", "OPENSSH ")
 )
+PRIVATE_INFRASTRUCTURE_IDENTIFIERS = (
+    "ac" + "c",
+    "ac" + "o",
+    "ai-account" + "-router",
+    "iuri-sync" + "-vault",
+    "iurimadeira" + "-dot-files",
+    "lab" + ".local",
+    "lab-" + "lan",
+    "lab-" + "tmux",
+    "mac-" + "import",
+    "oh-my-" + "fangorn",
+    "ws" + "n",
+)
 
 
 def run_publication_gate(
@@ -50,6 +63,7 @@ def copy_source_to_temporary_repository(tmp_path: Path) -> Path:
         source,
         ignore=shutil.ignore_patterns(
             ".git",
+            ".hunk",
             ".mypy_cache",
             ".pytest_cache",
             ".ruff_cache",
@@ -186,6 +200,31 @@ def test_publication_gate_accepts_the_public_source_tree() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "uv tool install fangorn-cli" in readme
     assert "pipx install fangorn-cli" in readme
+
+
+@pytest.mark.parametrize(
+    "relative_name",
+    [
+        ".github/ISSUE_TEMPLATE/bug.yml",
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/ISSUE_TEMPLATE/proposal.yml",
+        ".github/SECURITY.md",
+        ".github/pull_request_template.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+    ],
+)
+def test_publication_gate_requires_public_contribution_files(
+    tmp_path: Path, relative_name: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    (source / relative_name).unlink()
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Missing required public file" in result.stderr
 
 
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
@@ -518,6 +557,80 @@ def test_publication_gate_scans_force_tracked_files_in_excluded_directories(
         assert "\\u202e" in result.stderr
         assert "\x1b" not in result.stderr
         assert "\u202e" not in result.stderr
+
+
+def test_publication_gate_skips_untracked_local_review_context(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    context = source / ".hunk" / "agent-context.json"
+    context.parent.mkdir()
+    context.write_text("local review notes\n", encoding="utf-8")
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_publication_gate_rejects_tracked_local_review_context(tmp_path: Path) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    context = source / ".hunk" / "agent-context.json"
+    context.parent.mkdir()
+    context.write_text("local review notes\n", encoding="utf-8")
+    git(source, "add", "-f", "--", ".hunk/agent-context.json")
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Sensitive file included" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+def test_publication_gate_rejects_archived_local_review_context(
+    tmp_path: Path, artifact_kind: str
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    entry = (".hunk/agent-context.json", b"local review notes\n")
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, extra_entries=(entry,))
+    else:
+        write_test_sdist(sdist, extra_entries=(entry,))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert "Sensitive file included" in result.stderr
+
+
+@pytest.mark.parametrize("identifier", PRIVATE_INFRASTRUCTURE_IDENTIFIERS)
+def test_publication_gate_rejects_private_infrastructure_identifiers_in_source(
+    tmp_path: Path, identifier: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    payload = source / "private-identifier.txt"
+    payload.write_text(f"endpoint={identifier}\n", encoding="utf-8")
+    git(source, "add", "--", payload.name)
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("identifier", PRIVATE_INFRASTRUCTURE_IDENTIFIERS)
+def test_publication_gate_rejects_private_infrastructure_identifiers_in_artifacts(
+    tmp_path: Path, artifact_kind: str, identifier: str
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    payload = f"endpoint={identifier}\n".encode()
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, payload=payload)
+    else:
+        write_test_sdist(sdist, extra_entries=(("private-identifier.txt", payload),))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert "Forbidden private infrastructure identifier" in result.stderr
 
 
 def test_publication_gate_renders_dynamic_error_paths_on_one_safe_line(

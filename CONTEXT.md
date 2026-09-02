@@ -8,7 +8,7 @@ between those identities.
 **Workspace**: Fangorn's durable identity for exactly one Git worktree. In
 user-facing prose, "workspace" may stand for its bound worktree because the
 mapping is one-to-one.
-_Avoid_: tmux session, arbitrary directory
+_Avoid_: terminal session, arbitrary directory
 
 **Git worktree**: The Git checkout and administrative identity bound to one
 Workspace.
