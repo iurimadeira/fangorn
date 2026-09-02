@@ -11,10 +11,13 @@ development environment and run the deterministic checks:
 
 ```sh
 uv sync --locked --dev
-uv run pytest
-uv run ruff check .
 uv run ruff format --check .
-uv run mypy
+uv run ruff check .
+uv run mypy src scripts tests
+uv run coverage erase
+uv run coverage run --branch -m pytest
+uv run coverage combine
+uv run coverage report --fail-under=85.0
 uv build
 uv run python scripts/check_publication.py --source . dist/*
 ```

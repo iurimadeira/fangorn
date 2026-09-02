@@ -61,6 +61,11 @@ REQUIRED_PUBLIC_MARKERS = (
     ("CODE_OF_CONDUCT.md", PRIVATE_REPORT_URL),
     ("CONTRIBUTING.md", "accepted Issue"),
     ("CONTRIBUTING.md", "uv sync --locked --dev"),
+    ("CONTRIBUTING.md", "uv run coverage erase"),
+    ("CONTRIBUTING.md", "uv run coverage run --branch -m pytest"),
+    ("CONTRIBUTING.md", "uv run coverage combine"),
+    ("CONTRIBUTING.md", "uv run coverage report --fail-under=85.0"),
+    ("CONTRIBUTING.md", "uv run mypy src scripts tests"),
     ("CONTRIBUTING.md", "sanitized"),
     ("CONTRIBUTING.md", PRIVATE_REPORT_URL),
 )
@@ -293,6 +298,67 @@ def test_publication_gate_rejects_non_utf8_public_file(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "Required file is not valid UTF-8" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_name", "replacements", "hidden_markers"),
+    [
+        (
+            ".github/ISSUE_TEMPLATE/bug.yml",
+            ((PRIVATE_REPORT_URL, "https://example.invalid/report"),),
+            f"# {PRIVATE_REPORT_URL}\n",
+        ),
+        (
+            ".github/ISSUE_TEMPLATE/config.yml",
+            (
+                ("blank_issues_enabled: false", "blank_issues_enabled: true"),
+                (PRIVATE_REPORT_URL, "https://example.invalid/report"),
+            ),
+            f"# blank_issues_enabled: false\n# {PRIVATE_REPORT_URL}\n",
+        ),
+        (
+            ".github/SECURITY.md",
+            (
+                (
+                    "Report vulnerabilities confidentially",
+                    "Publish vulnerabilities openly",
+                ),
+                ("Do not open a public Issue", "Open a public Issue"),
+                (PRIVATE_REPORT_URL, "https://example.invalid/report"),
+            ),
+            "<!-- Report vulnerabilities confidentially\n"
+            "Do not open a public Issue\n"
+            f"{PRIVATE_REPORT_URL} -->\n",
+        ),
+        (
+            "CODE_OF_CONDUCT.md",
+            ((PRIVATE_REPORT_URL, "https://example.invalid/report"),),
+            f"<!-- {PRIVATE_REPORT_URL} -->\n",
+        ),
+        (
+            "CONTRIBUTING.md",
+            ((PRIVATE_REPORT_URL, "https://example.invalid/report"),),
+            f"<!-- {PRIVATE_REPORT_URL} -->\n",
+        ),
+    ],
+)
+def test_publication_gate_rejects_hidden_public_policy_markers(
+    tmp_path: Path,
+    relative_name: str,
+    replacements: tuple[tuple[str, str], ...],
+    hidden_markers: str,
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    path = source / relative_name
+    content = path.read_text(encoding="utf-8")
+    for expected, replacement in replacements:
+        content = content.replace(expected, replacement)
+    path.write_text(content + hidden_markers, encoding="utf-8")
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Required public" in result.stderr
 
 
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
@@ -736,6 +802,84 @@ def test_publication_gate_rejects_private_infrastructure_identifiers_in_archive_
 
     assert result.returncode != 0
     assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize("separator", ["-", "_"])
+def test_publication_gate_rejects_delimited_private_identifier_in_source(
+    tmp_path: Path, separator: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    identifier = "lab-" + "tmux"
+    payload = source / "private-identifier.txt"
+    payload.write_text(
+        f"value=public{separator}{identifier}{separator}notes\n",
+        encoding="utf-8",
+    )
+    git(source, "add", "--", payload.name)
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("separator", ["-", "_"])
+def test_publication_gate_rejects_delimited_private_identifier_in_archive_path(
+    tmp_path: Path, artifact_kind: str, separator: str
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    identifier = "lab-" + "tmux"
+    entry = (f"public{separator}{identifier}{separator}notes.txt", b"public text\n")
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, extra_entries=(entry,))
+    else:
+        write_test_sdist(sdist, extra_entries=(entry,))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert "Forbidden private infrastructure identifier" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "relative_name",
+    [".hunk\\agent-context.json", "nested/.hunk\\agent-context.json"],
+)
+def test_publication_gate_rejects_backslash_local_review_context_in_source(
+    tmp_path: Path, relative_name: str
+) -> None:
+    source = copy_source_to_temporary_repository(tmp_path)
+    context = source / relative_name
+    context.parent.mkdir(exist_ok=True)
+    context.write_text("local review notes\n", encoding="utf-8")
+    git(source, "add", "--", relative_name)
+
+    result = run_publication_gate(source=source)
+
+    assert result.returncode != 0
+    assert "Sensitive file included" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    "relative_name",
+    [".hunk\\agent-context.json", "nested/.hunk\\agent-context.json"],
+)
+def test_publication_gate_rejects_backslash_local_review_context_in_artifacts(
+    tmp_path: Path, artifact_kind: str, relative_name: str
+) -> None:
+    wheel, sdist = write_valid_artifact_set(tmp_path)
+    entry = (relative_name, b"local review notes\n")
+    if artifact_kind == "wheel":
+        write_test_wheel(wheel, extra_entries=(entry,))
+    else:
+        write_test_sdist(sdist, extra_entries=(entry,))
+
+    result = run_publication_gate(wheel, sdist)
+
+    assert result.returncode != 0
+    assert "backslash" in result.stderr or "Sensitive file included" in result.stderr
 
 
 @pytest.mark.parametrize("private_path", PRIVATE_PATHS)

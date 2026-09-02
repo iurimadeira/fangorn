@@ -57,7 +57,7 @@ PRIVATE_INFRASTRUCTURE_IDENTIFIERS = (
 )
 PRIVATE_INFRASTRUCTURE_PATTERNS = tuple(
     re.compile(
-        rf"(?<![A-Za-z0-9_-]){re.escape(identifier)}(?![A-Za-z0-9_-])",
+        rf"(?<![A-Za-z0-9]){re.escape(identifier)}(?![A-Za-z0-9])",
         re.IGNORECASE,
     )
     for identifier in PRIVATE_INFRASTRUCTURE_IDENTIFIERS
@@ -68,33 +68,65 @@ EXPECTED_PROJECT_URLS = {
     "Issues": "https://github.com/iurimadeira/fangorn/issues",
 }
 EXACT_RUNTIME_DEPENDENCY = "click>=8.1.8,<9"
+PRIVATE_REPORT_URL = "https://github.com/iurimadeira/fangorn/security/advisories/new"
 REQUIRED_PUBLIC_FILES = {
     ".github/ISSUE_TEMPLATE/bug.yml": (
         "name: Bug report",
         "sanitized",
-        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+        PRIVATE_REPORT_URL,
     ),
     ".github/ISSUE_TEMPLATE/config.yml": (
         "blank_issues_enabled: false",
-        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+        PRIVATE_REPORT_URL,
     ),
     ".github/ISSUE_TEMPLATE/proposal.yml": ("name: Proposal", "accepted Issue"),
     ".github/SECURITY.md": (
         "Report vulnerabilities confidentially",
         "Do not open a public Issue",
-        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+        PRIVATE_REPORT_URL,
     ),
     ".github/pull_request_template.md": ("Closes #", "sanitized"),
     "CODE_OF_CONDUCT.md": (
         "Contributor Covenant",
         "version 2.1",
-        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+        PRIVATE_REPORT_URL,
     ),
     "CONTRIBUTING.md": (
         "accepted Issue",
         "uv sync --locked --dev",
+        "uv run coverage erase",
+        "uv run coverage run --branch -m pytest",
+        "uv run coverage combine",
+        "uv run coverage report --fail-under=85.0",
+        "uv run mypy src scripts tests",
         "sanitized",
-        "https://github.com/iurimadeira/fangorn/security/advisories/new",
+        PRIVATE_REPORT_URL,
+    ),
+}
+REPORTING_LINK_LABELS = {
+    ".github/ISSUE_TEMPLATE/bug.yml": "confidential reporting form",
+    ".github/SECURITY.md": "GitHub Private Vulnerability Reporting",
+    "CODE_OF_CONDUCT.md": "GitHub Private Vulnerability Reporting",
+    "CONTRIBUTING.md": "GitHub Private Vulnerability Reporting",
+}
+REPORTING_POLICY_PATTERNS = {
+    ".github/ISSUE_TEMPLATE/bug.yml": re.compile(
+        r"Security reports do not belong in public Issues\. Use the\s+"
+        r"\[confidential reporting form\]\([^)]*\)\s+instead\."
+    ),
+    ".github/SECURITY.md": re.compile(
+        r"Report vulnerabilities confidentially with\s+"
+        r"\[GitHub Private Vulnerability Reporting\]\([^)]*\)\.\s+"
+        r"Do not open a public Issue, discussion, or pull request"
+    ),
+    "CODE_OF_CONDUCT.md": re.compile(
+        r"Instances of abusive, harassing, or otherwise unacceptable behavior may be "
+        r"reported through \[GitHub Private Vulnerability Reporting\]\([^)]*\)\."
+    ),
+    "CONTRIBUTING.md": re.compile(
+        r"Report vulnerabilities or conduct incidents through\s+"
+        r"\[GitHub Private Vulnerability Reporting\]\([^)]*\),\s+"
+        r"as described in \[the security policy\]\(\.github/SECURITY\.md\)\."
     ),
 }
 
@@ -131,6 +163,15 @@ def _text(path: Path) -> str:
         raise CheckFailure(f"Required file is not valid UTF-8: {path}") from error
     except OSError as error:
         raise CheckFailure(f"Cannot read required file: {path}") from error
+
+
+def _visible_policy_text(text: str) -> str:
+    without_html_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return "\n".join(
+        line
+        for line in without_html_comments.splitlines()
+        if not line.lstrip().startswith("#")
+    )
 
 
 def _source_files(source: Path) -> Iterable[tuple[str, bytes]]:
@@ -230,7 +271,7 @@ def _tracked_source_files(source: Path) -> Iterable[tuple[str, bytes]]:
 
 
 def _validate_public_content(name: str, content: bytes) -> None:
-    path = PurePosixPath(name)
+    path = PurePosixPath(name.replace("\\", "/"))
     lowered_name = path.name.lower()
     _require(
         tuple(part.lower() for part in path.parts[-2:])
@@ -314,12 +355,40 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
             f"Missing required development tool: {tool}",
         )
 
+    public_text: dict[str, str] = {}
     for name, markers in REQUIRED_PUBLIC_FILES.items():
         path = source / name
         _require(path.is_file(), f"Missing required public file: {name}")
-        text = _text(path)
+        text = _visible_policy_text(_text(path))
+        public_text[name] = text
         for marker in markers:
             _require(marker in text, f"Required public marker missing from {name}")
+
+    for name, label in REPORTING_LINK_LABELS.items():
+        destinations = re.findall(
+            rf"\[{re.escape(label)}\]\(([^)\s]+)\)", public_text[name]
+        )
+        _require(
+            destinations == [PRIVATE_REPORT_URL],
+            f"Required public reporting link is invalid in {name}",
+        )
+        _require(
+            REPORTING_POLICY_PATTERNS[name].search(public_text[name]) is not None,
+            f"Required public reporting guidance is invalid in {name}",
+        )
+
+    config_lines = public_text[".github/ISSUE_TEMPLATE/config.yml"].splitlines()
+    _require(
+        config_lines.count("blank_issues_enabled: false") == 1,
+        "Required public Issue-form configuration is invalid",
+    )
+    config_urls = [
+        line.strip() for line in config_lines if line.lstrip().startswith("url:")
+    ]
+    _require(
+        config_urls == [f"url: {PRIVATE_REPORT_URL}"],
+        "Required public Issue-form reporting link is invalid",
+    )
 
     license_text = _text(source / "LICENSE")
     notices = _text(source / "THIRD_PARTY_NOTICES.md")
@@ -351,6 +420,7 @@ def validate_source(source: Path) -> tuple[str, bytes, bytes]:
 
 
 def _canonical_archive_name(name: str, *, directory: bool) -> str:
+    _require("\\" not in name, f"Archive path uses a backslash: {name}")
     path = PurePosixPath(name)
     _require(not path.is_absolute(), f"Archive has an absolute path: {name}")
     _require(".." not in path.parts, f"Archive path escapes its root: {name}")
