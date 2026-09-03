@@ -71,12 +71,8 @@ def normalize_repository_source(value: str) -> RepositorySource:
 
 
 def resolve_commit(repository: Path, ref: str | None, *, remote: bool = False) -> str:
-    selected = ref or ("refs/remotes/origin/HEAD" if remote else "HEAD")
-    candidates = (
-        (f"refs/remotes/origin/{ref}", ref)
-        if remote and ref is not None
-        else (selected,)
-    )
+    selected = ref or "HEAD"
+    candidates = _remote_ref_candidates(ref) if remote else (selected,)
     error: GitError | None = None
     for candidate in candidates:
         try:
@@ -90,6 +86,16 @@ def resolve_commit(repository: Path, ref: str | None, *, remote: bool = False) -
             raise GitError(f"Git returned an invalid commit for {candidate}")
         return value
     raise GitError(f"Cannot resolve Git base {selected}: {error}")
+
+
+def _remote_ref_candidates(ref: str | None) -> tuple[str, ...]:
+    if ref is None or ref == "HEAD":
+        return ("refs/remotes/origin/HEAD",)
+    if ref.startswith("refs/heads/"):
+        return (f"refs/remotes/origin/{ref.removeprefix('refs/heads/')}",)
+    if ref.startswith("refs/") or re.fullmatch(r"[0-9a-f]{40,64}", ref):
+        return (ref,)
+    return (f"refs/remotes/origin/{ref}", f"refs/tags/{ref}")
 
 
 def validate_branch_name(branch: str) -> None:
@@ -176,6 +182,7 @@ def materialize_cache(
             os.replace(clone, cache_path)
         except FileExistsError:
             _verify_bare_repository(cache_path, source.normalized)
+        _fsync_directory(cache_path.parent, "Repository cache publication")
         _refresh_bare_repository(cache_path)
         return cache_path
     finally:
@@ -313,14 +320,13 @@ def create_worktree(
 
 
 def _create_staging_receipt(path: Path, ownership_token: str) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    temporary: Path | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError as error:
-        raise GitError("Workspace staging ownership receipt is unavailable") from error
-    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary = Path(temporary_name)
         payload = ownership_token.encode()
         written = 0
         while written < len(payload):
@@ -329,9 +335,19 @@ def _create_staging_receipt(path: Path, ownership_token: str) -> None:
                 raise OSError("short write")
             written += count
         os.fsync(descriptor)
+        os.link(temporary, path, follow_symlinks=False)
+        _fsync_directory(path.parent, "Workspace staging ownership")
+    except OSError as error:
+        raise GitError("Workspace staging ownership receipt is unavailable") from error
     finally:
-        os.close(descriptor)
-    _fsync_directory(path.parent)
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+                _fsync_directory(path.parent, "Workspace staging ownership")
+            except OSError:
+                pass
 
 
 def _require_staging_receipt(path: Path, ownership_token: str) -> None:
@@ -365,10 +381,10 @@ def _remove_staging_receipt(path: Path, ownership_token: str) -> None:
         raise GitError(
             "Workspace staging ownership receipt cannot be removed"
         ) from error
-    _fsync_directory(path.parent)
+    _fsync_directory(path.parent, "Workspace staging ownership")
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(path: Path, label: str) -> None:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -379,9 +395,7 @@ def _fsync_directory(path: Path) -> None:
         finally:
             os.close(descriptor)
     except OSError as error:
-        raise GitError(
-            "Workspace staging ownership directory is not durable"
-        ) from error
+        raise GitError(f"{label} directory is not durable") from error
 
 
 def inspect_owned_worktree(

@@ -328,6 +328,64 @@ def test_new_clone_create_refreshes_cached_remote_head(tmp_path: Path) -> None:
     assert second.workspace.definition.created_from_sha == second_sha
 
 
+def test_new_clone_create_refreshes_fully_qualified_remote_branch(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="first",
+            path=tmp_path / "worktrees" / "first",
+        )
+    )
+    (repository / "later-qualified.txt").write_text("later\n", encoding="utf-8")
+    git(repository, "add", "later-qualified.txt")
+    git(repository, "commit", "-m", "later qualified")
+    expected = git(repository, "rev-parse", "HEAD")
+
+    result = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="qualified",
+            base="refs/heads/main",
+            path=tmp_path / "worktrees" / "qualified",
+        )
+    )
+
+    assert result.workspace.definition.created_from_sha == expected
+
+
+def test_clone_create_does_not_resolve_deleted_remote_branch_from_local_cache(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    git(repository, "branch", "ephemeral")
+    workspaces = facade(tmp_path)
+    workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="first",
+            base="refs/heads/ephemeral",
+            path=tmp_path / "worktrees" / "first",
+        )
+    )
+    git(repository, "branch", "-D", "ephemeral")
+
+    with pytest.raises(WorkspaceError, match="Cannot resolve Git base"):
+        workspaces.create(
+            CreateWorkspace(
+                repository=repository.as_uri(),
+                branch="second",
+                base="refs/heads/ephemeral",
+                path=tmp_path / "worktrees" / "second",
+            )
+        )
+
+
 def test_new_clone_create_tracks_changed_remote_default_branch(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)

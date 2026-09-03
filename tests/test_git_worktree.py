@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -174,6 +176,25 @@ def test_clone_cache_cleans_invocation_when_owner_metadata_write_fails(
     assert list(cache.parent.glob("clone-*")) == []
 
 
+def test_clone_cache_fsyncs_publication_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_repository = tmp_path / "source"
+    repository(source_repository)
+    cache = tmp_path / "cache" / "repository.git"
+    original = os.fsync
+    synced_modes: list[int] = []
+
+    def record_fsync(descriptor: int) -> None:
+        synced_modes.append(os.fstat(descriptor).st_mode)
+        original(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    materialize_cache(normalize_repository_source(source_repository.as_uri()), cache)
+
+    assert any(stat.S_ISDIR(mode) for mode in synced_modes)
+
+
 def test_git_adapter_forces_stable_diagnostics_locale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -279,6 +300,61 @@ def test_worktree_adapter_rejects_markerless_matching_staging(tmp_path: Path) ->
 
     assert staging.exists()
     assert not target.exists()
+
+
+def test_worktree_receipt_is_atomically_published_and_directory_synced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    target = tmp_path / "target"
+    token = "1" * 64
+    receipt = target.parent / f".fangorn-{token}.intent"
+    original_write = os.write
+    interrupted = False
+
+    def interrupt_write(descriptor: int, value: bytes) -> int:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            original_write(descriptor, value[:3])
+            raise OSError("interrupted receipt write")
+        return original_write(descriptor, value)
+
+    monkeypatch.setattr(os, "write", interrupt_write)
+    with pytest.raises(GitError, match="receipt is unavailable"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=False,
+        )
+    assert not receipt.exists()
+    assert not (target.parent / f".fangorn-{token}").exists()
+
+    monkeypatch.setattr(os, "write", original_write)
+    original_fsync = os.fsync
+    synced_modes: list[int] = []
+
+    def record_fsync(descriptor: int) -> None:
+        synced_modes.append(os.fstat(descriptor).st_mode)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    created = create_worktree(
+        source,
+        target=target,
+        branch="topic",
+        commit=commit,
+        ownership_token=token,
+        reconcile=True,
+    )
+
+    assert created.git_dir_generation == token
+    assert any(stat.S_ISREG(mode) for mode in synced_modes)
+    assert sum(stat.S_ISDIR(mode) for mode in synced_modes) >= 2
 
 
 def test_worktree_recovery_never_claims_markerless_final_target(
