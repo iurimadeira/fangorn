@@ -1081,6 +1081,7 @@ def _run_supervised_git(
                         os.close(anchor_control_read)
                         anchor_control_read = -1
                         os.write(anchor_control_write, b"a")
+                        _retain_quiescence_guardian(anchor.pid, liveness_fd=liveness_fd)
                         supervisor = [
                             sys.executable,
                             "-I",
@@ -1150,9 +1151,6 @@ def _run_supervised_git(
                                 deadline=min(deadline, time.monotonic() + 5),
                             )
                         except GitError as error:
-                            _retain_quiescence_guardian(
-                                process_group, liveness_fd=liveness_fd
-                            )
                             raise GitQuiescenceError(
                                 "Cannot confirm Git process-group termination"
                             ) from error
@@ -1315,7 +1313,6 @@ def _settle_process(process: subprocess.Popen[bytes]) -> None:
 
 def _retain_quiescence_guardian(process_group: int, *, liveness_fd: int) -> None:
     ready_read, ready_write = os.pipe()
-    guardian: subprocess.Popen[bytes] | None = None
     blocked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
     try:
@@ -1334,6 +1331,9 @@ def _retain_quiescence_guardian(process_group: int, *, liveness_fd: int) -> None
             pass_fds=(liveness_fd, ready_write),
             process_group=0,
         )
+    except BaseException:
+        os.close(ready_read)
+        raise
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         os.close(ready_write)
@@ -1344,7 +1344,8 @@ def _retain_quiescence_guardian(process_group: int, *, liveness_fd: int) -> None
     if ready != b"r\n":
         _settle_process(guardian)
         raise GitQuiescenceError("Cannot establish Git quiescence guardian")
-    Thread(target=guardian.wait, daemon=True).start()
+    with suppress(RuntimeError):
+        Thread(target=guardian.wait, daemon=True).start()
 
 
 def _read_capture(stream: BinaryIO, limit: int) -> bytes:

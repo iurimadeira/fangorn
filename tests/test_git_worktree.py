@@ -19,6 +19,7 @@ import pytest
 from git_helpers import git, initialize_repository
 
 import fangorn._git_anchor as git_anchor
+import fangorn._git_guardian as git_guardian
 import fangorn._git_supervisor as git_supervisor
 import fangorn.git as git_adapter
 import fangorn.git_worktree as git_worktree_adapter
@@ -498,6 +499,11 @@ def test_supervised_git_rejects_missing_child_handshake(
 
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FailedSupervisor())
     monkeypatch.setattr(
+        git_worktree_adapter,
+        "_retain_quiescence_guardian",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
         git_worktree_adapter, "_process_group_running", lambda *_args, **_kwargs: False
     )
     write = os.write
@@ -817,6 +823,23 @@ def test_supervisor_rejects_completion_without_proven_group_stop(
     assert diagnostics == ["Git process-group termination could not be confirmed"]
 
 
+@pytest.mark.parametrize(
+    "message",
+    ["Git operation exceeded one hour", "Git diagnostic output exceeded 8 MiB"],
+)
+def test_supervisor_limits_preserve_unproven_group_result(
+    message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diagnostics: list[str] = []
+    monkeypatch.setattr(git_supervisor, "_replace_output", diagnostics.append)
+
+    assert (
+        git_supervisor._limit_result(False, message)
+        == git_supervisor.UNPROVEN_GROUP_TERMINATION
+    )
+    assert diagnostics == ["Git process-group termination could not be confirmed"]
+
+
 def test_supervisor_capture_finish_stops_at_deadline() -> None:
     reader, writer = os.pipe()
     captures = {reader: [1, 0]}
@@ -920,6 +943,40 @@ def test_parent_rejects_completion_without_final_group_proof(
 
     with pytest.raises(GitQuiescenceError, match="Cannot confirm"):
         git_worktree_adapter._run_git_process(tmp_path, "--version")
+
+
+def test_parent_does_not_start_git_without_ready_guardian(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Anchor:
+        pid = 123
+
+    commands: list[list[str]] = []
+    write = os.write
+
+    def start(command: list[str], **_kwargs: object) -> Anchor:
+        commands.append(command)
+        return Anchor()
+
+    monkeypatch.setattr(subprocess, "Popen", start)
+    monkeypatch.setattr(
+        os,
+        "write",
+        lambda descriptor, data: 1 if data == b"a" else write(descriptor, data),
+    )
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_retain_quiescence_guardian",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("guardian failed")),
+    )
+    monkeypatch.setattr(git_worktree_adapter, "_cancel_process_group", lambda *_: None)
+    monkeypatch.setattr(git_worktree_adapter, "_settle_process", lambda *_: None)
+
+    with pytest.raises(GitError, match="guardian failed"):
+        git_worktree_adapter._run_git_process(tmp_path, "--version")
+
+    assert len(commands) == 1
+    assert commands[0][2].endswith("_git_anchor.py")
 
 
 def test_parent_group_probe_rejects_malformed_ps(
@@ -1446,6 +1503,18 @@ def test_quiescence_guardian_holds_invocation_until_group_is_absent(
         )
         == epoch + 1
     )
+
+
+def test_quiescence_guardian_treats_zombie_only_group_as_stopped() -> None:
+    process = subprocess.Popen([sys.executable, "-c", "pass"], process_group=0)
+    try:
+        deadline = time.monotonic() + 2
+        while git_worktree_adapter._process_group_running(process.pid):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert git_guardian._process_group_running(process.pid) is False
+    finally:
+        process.wait(timeout=2)
 
 
 def test_receipt_staging_cleanup_failure_is_visible(

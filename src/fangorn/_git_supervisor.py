@@ -96,17 +96,18 @@ def _supervise(
     while True:
         if time.monotonic() >= deadline:
             _close_captures(captures)
-            _drain(child, process_group)
-            _replace_output("Git operation exceeded one hour")
-            return 124
+            return _limit_result(
+                _drain(child, process_group), "Git operation exceeded one hour"
+            )
         if not _child_running(child):
             break
         readable, _, _ = select.select((control, *captures), (), (), 0.01)
         if _forward_captures(readable, captures, output_limit):
             _close_captures(captures)
-            _drain(child, process_group)
-            _replace_output("Git diagnostic output exceeded 8 MiB")
-            return 124
+            return _limit_result(
+                _drain(child, process_group),
+                "Git diagnostic output exceeded 8 MiB",
+            )
         if not readable:
             continue
         if control not in readable:
@@ -142,6 +143,14 @@ def _supervise(
         _replace_output("Git operation exceeded one hour")
         return 124
     return child.returncode
+
+
+def _limit_result(stopped: bool, message: str) -> int:
+    if not stopped:
+        _replace_output("Git process-group termination could not be confirmed")
+        return UNPROVEN_GROUP_TERMINATION
+    _replace_output(message)
+    return 124
 
 
 def _forward_captures(
