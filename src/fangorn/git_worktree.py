@@ -74,6 +74,12 @@ def resolve_commit(repository: Path, ref: str | None) -> str:
     return value
 
 
+def validate_branch_name(branch: str) -> None:
+    result = _run_git_process(Path.cwd(), "check-ref-format", "--branch", branch)
+    if result.returncode != 0:
+        raise GitError("Workspace branch is invalid")
+
+
 def read_configuration(repository: Path, commit: str, explicit: Path | None) -> bytes:
     if explicit is not None:
         try:
@@ -115,7 +121,6 @@ def materialize_cache(source: RepositorySource, cache_path: Path) -> Path:
             cache_path.parent,
             "clone",
             "--bare",
-            "--no-tags",
             "--",
             source.clone_url,
             str(clone),

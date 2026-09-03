@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ from fangorn.git_worktree import (
     normalize_repository_source,
     read_configuration,
     resolve_commit,
+    validate_branch_name,
 )
 from fangorn.registry import (
     CreateAlreadyCompleted,
@@ -36,7 +38,7 @@ from fangorn.registry import (
 from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
 
 ADOPTION_ATTEMPTS = 3
-_ACTIVE_INVOCATIONS: set[str] = set()
+_ACTIVE_INVOCATIONS: dict[str, tuple[int, Path]] = {}
 _ACTIVE_INVOCATIONS_LOCK = Lock()
 
 
@@ -157,6 +159,7 @@ class Workspaces:
         self._data_home = data_home or _xdg_home("XDG_DATA_HOME", ".local/share")
         self._cache_home = cache_home or _xdg_home("XDG_CACHE_HOME", ".cache")
         self._process_identity = process_identity
+        self._invocation_root = registry.path.parent / "invocations"
 
     @classmethod
     def from_environment(cls) -> Workspaces:
@@ -207,9 +210,8 @@ class Workspaces:
                 )
             if not request.repository:
                 raise WorkspaceError("A root Workspace requires a repository source")
-            _validate_branch(request.branch)
+            validate_branch_name(request.branch)
             source = normalize_repository_source(request.repository)
-            owner = self._invocation_process_identity()
             target = _target_path(request, source, self._data_home)
             request_value = {
                 "base": request.base,
@@ -237,13 +239,14 @@ class Workspaces:
             )
             if intent.status == "completed":
                 return self._completed_create(intent.workspace_id)
+            owner = self._invocation_process_identity()
             try:
                 lease_epoch = self._registry.acquire_lease(
                     scope_kind="workspace",
                     scope_key=intent.workspace_id,
                     operation_id=intent.operation_id,
                     owner=owner,
-                    owner_status=_owner_status,
+                    owner_status=self._owner_status,
                 )
             except CreateAlreadyCompleted:
                 return self._completed_create(intent.workspace_id)
@@ -393,8 +396,7 @@ class Workspaces:
             raise
         finally:
             if owner is not None:
-                with _ACTIVE_INVOCATIONS_LOCK:
-                    _ACTIVE_INVOCATIONS.discard(owner.process_instance_id)
+                self._finish_invocation(owner)
 
     def list(self) -> list[Workspace]:
         try:
@@ -427,7 +429,7 @@ class Workspaces:
             scope_key=source.normalized,
             operation_id=operation_id,
             owner=owner,
-            owner_status=_owner_status,
+            owner_status=self._owner_status,
         )
         try:
             previous = self._registry.start_operation_step(
@@ -529,15 +531,72 @@ class Workspaces:
 
     def _invocation_process_identity(self) -> ProcessIdentity:
         identity = self._process_identity or _current_process_identity()
+        try:
+            self._invocation_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        except OSError as error:
+            raise WorkspaceError("Cannot create Workspace invocation marker") from error
+        if self._invocation_root.is_symlink() or not self._invocation_root.is_dir():
+            raise WorkspaceError("Workspace invocation marker directory is unsafe")
+        process_instance_id = str(uuid4())
+        marker = self._invocation_root / process_instance_id
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(marker, flags, 0o600)
+        except OSError as error:
+            raise WorkspaceError(
+                "Cannot establish Workspace invocation marker"
+            ) from error
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            os.close(descriptor)
+            with suppress(OSError):
+                marker.unlink()
+            raise WorkspaceError(
+                "Cannot establish Workspace invocation marker"
+            ) from error
         invocation = ProcessIdentity(
-            process_instance_id=str(uuid4()),
+            process_instance_id=process_instance_id,
             boot_identity=identity.boot_identity,
             pid=identity.pid,
             process_start_identity=identity.process_start_identity,
         )
         with _ACTIVE_INVOCATIONS_LOCK:
-            _ACTIVE_INVOCATIONS.add(invocation.process_instance_id)
+            _ACTIVE_INVOCATIONS[invocation.process_instance_id] = (descriptor, marker)
         return invocation
+
+    def _finish_invocation(self, owner: ProcessIdentity) -> None:
+        with _ACTIVE_INVOCATIONS_LOCK:
+            held = _ACTIVE_INVOCATIONS.pop(owner.process_instance_id, None)
+        if held is None:
+            return
+        descriptor, marker = held
+        with suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(descriptor)
+        with suppress(OSError):
+            marker.unlink()
+
+    def _owner_status(self, owner: ProcessIdentity) -> str:
+        status = _process_owner_status(owner)
+        if status != "live":
+            return status
+        marker = self._invocation_root / owner.process_instance_id
+        try:
+            descriptor = os.open(marker, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return "dead"
+        except OSError:
+            return "inconclusive"
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return "live"
+            return "dead"
+        finally:
+            os.close(descriptor)
 
 
 def _create_definition(
@@ -601,7 +660,7 @@ def _target_path(
     request: CreateWorkspace, source: RepositorySource, data_home: Path
 ) -> Path:
     if request.path is not None:
-        return request.path.expanduser().absolute()
+        return request.path.expanduser().resolve(strict=False)
     material = json.dumps(
         {
             "base": request.base,
@@ -616,7 +675,7 @@ def _target_path(
     safe_branch = re_sub_path(request.branch)
     return (
         data_home / "fangorn" / "worktrees" / source.name / f"{safe_branch}-{suffix}"
-    ).absolute()
+    ).resolve(strict=False)
 
 
 def re_sub_path(value: str) -> str:
@@ -627,15 +686,6 @@ def re_sub_path(value: str) -> str:
     return rendered.strip(".-") or "workspace"
 
 
-def _validate_branch(branch: str) -> None:
-    if (
-        not branch
-        or branch.startswith("-")
-        or any(character in branch for character in ("\x00", "\n", "\r"))
-    ):
-        raise WorkspaceError("Workspace branch is invalid")
-
-
 def _configuration_value(content: bytes) -> dict[str, object]:
     if not content:
         return {"schema_version": 1}
@@ -644,6 +694,12 @@ def _configuration_value(content: bytes) -> dict[str, object]:
         raise WorkspaceError("fangorn.toml requires schema_version = 1")
     if value.get("services"):
         raise WorkspaceError("Service Resources are not available in this release")
+    try:
+        json.dumps(value, sort_keys=True)
+    except TypeError as error:
+        raise WorkspaceError(
+            "fangorn.toml contains a value unsupported by schema-2 JSON"
+        ) from error
     return value
 
 
@@ -689,7 +745,7 @@ def _process_start_identity(pid: int) -> str:
         return result.stdout.strip()
 
 
-def _owner_status(owner: ProcessIdentity) -> str:
+def _process_owner_status(owner: ProcessIdentity) -> str:
     if owner.boot_identity != _boot_identity():
         return "dead"
     try:
@@ -704,9 +760,4 @@ def _owner_status(owner: ProcessIdentity) -> str:
         return "inconclusive"
     if current_start != owner.process_start_identity:
         return "dead"
-    if owner.pid == os.getpid():
-        with _ACTIVE_INVOCATIONS_LOCK:
-            return (
-                "live" if owner.process_instance_id in _ACTIVE_INVOCATIONS else "dead"
-            )
     return "live"

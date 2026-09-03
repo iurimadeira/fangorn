@@ -192,6 +192,24 @@ def test_create_from_clone_url_uses_journaled_shared_cache(tmp_path: Path) -> No
         ]
 
 
+def test_clone_url_resolves_tag_base(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    tagged_sha = create_repository(repository)
+    git(repository, "tag", "release-base")
+
+    result = facade(tmp_path).create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="from-tag",
+            base="release-base",
+            path=tmp_path / "worktrees" / "from-tag",
+            headless=True,
+        )
+    )
+
+    assert result.workspace.definition.created_from_sha == tagged_sha
+
+
 def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
@@ -346,6 +364,73 @@ def test_inconclusive_lease_owner_is_not_taken_over(tmp_path: Path) -> None:
             owner=ProcessIdentity("new", "boot", 1002, "start-new"),
             owner_status=lambda _owner: "inconclusive",
         )
+
+
+def test_cross_process_ended_invocation_is_proven_dead_while_process_lives(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "registry.sqlite3"
+    script = """
+import json
+import sys
+from pathlib import Path
+from dataclasses import asdict
+from fangorn.registry import Registry
+from fangorn.workspaces import Workspaces
+w = Workspaces(Registry(Path(sys.argv[1])))
+owner = w._invocation_process_identity()
+print(json.dumps(asdict(owner)), flush=True)
+sys.stdin.readline()
+w._finish_invocation(owner)
+print("released", flush=True)
+sys.stdin.readline()
+"""
+    child = subprocess.Popen(  # noqa: S603 -- fixed interpreter and test script
+        [sys.executable, "-c", script, str(database)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    try:
+        owner = ProcessIdentity(**json.loads(child.stdout.readline()))
+        registry = Registry(database)
+        intent, _ = registry.begin_create_intent(
+            request_key="cross-process",
+            request_id="cross-process",
+            request_json="{}",
+            target_path=str(tmp_path / "cross-process"),
+            workspace_id="cross-process",
+            operation_id="cross-process",
+            prepare_cache=False,
+        )
+        old_epoch = registry.acquire_lease(
+            scope_kind="workspace",
+            scope_key=intent.workspace_id,
+            operation_id=intent.operation_id,
+            owner=owner,
+            owner_status=lambda _owner: "live",
+        )
+        checker = facade(tmp_path)
+        assert checker._owner_status(owner) == "live"
+
+        child.stdin.write("release\n")
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == "released"
+        assert child.poll() is None
+        new_epoch = registry.acquire_lease(
+            scope_kind="workspace",
+            scope_key=intent.workspace_id,
+            operation_id=intent.operation_id,
+            owner=ProcessIdentity("new", "boot", os.getpid(), "start"),
+            owner_status=checker._owner_status,
+        )
+        assert new_epoch == old_epoch + 1
+    finally:
+        child.stdin.write("exit\n")
+        child.stdin.flush()
+        child.wait(timeout=5)
 
 
 def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
@@ -768,6 +853,57 @@ def test_local_source_without_base_uses_that_checkout_head(tmp_path: Path) -> No
     assert git(target, "rev-parse", "HEAD") == source_head
 
 
+def test_explicit_target_is_canonicalized_before_definition(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    requested = linked_parent / "unused" / ".." / "topic"
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="canonical-target",
+        path=requested,
+        request_id="canonical-target",
+        headless=True,
+    )
+
+    created = facade(tmp_path).create(request)
+    retried = facade(tmp_path).create(request)
+
+    assert created.workspace.path == str((real_parent / "topic").resolve())
+    assert retried.workspace.definition.id == created.workspace.definition.id
+
+
+def test_invalid_git_branch_does_not_poison_target(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "worktrees" / "reusable"
+    workspaces = facade(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="branch is invalid"):
+        workspaces.create(
+            CreateWorkspace(
+                repository=str(repository),
+                branch="bad..name",
+                path=target,
+                headless=True,
+            )
+        )
+    assert not (tmp_path / "state").exists()
+
+    created = workspaces.create(
+        CreateWorkspace(
+            repository=str(repository),
+            branch="valid-name",
+            path=target,
+            headless=True,
+        )
+    )
+    assert created.workspace.state == "ready"
+
+
 def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational(
     tmp_path: Path,
 ) -> None:
@@ -988,6 +1124,10 @@ def test_create_rejects_unsupported_definition_before_state(
             "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
             "Service Resources are not available",
         ),
+        (
+            "schema_version = 1\nrelease_date = 2026-09-02\n",
+            "unsupported by schema-2 JSON",
+        ),
     ],
 )
 def test_create_rejects_configuration_outside_f2_scope(
@@ -1010,3 +1150,42 @@ def test_create_rejects_configuration_outside_f2_scope(
         )
 
     assert not (tmp_path / "target").exists()
+
+
+def test_cli_rejects_temporal_configuration_with_domain_error(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    config = tmp_path / "fangorn.toml"
+    config.write_text(
+        "schema_version = 1\nrelease_date = 2026-09-02\n", encoding="utf-8"
+    )
+    executable = Path(sys.executable).with_name("fangorn")
+
+    completed = subprocess.run(  # noqa: S603 -- test controls installed executable
+        [
+            executable,
+            "workspace",
+            "create",
+            "--repo",
+            str(repository),
+            "--branch",
+            "temporal-config",
+            "--path",
+            str(tmp_path / "target"),
+            "--config",
+            str(config),
+            "--headless",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **dict(os.environ),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+            "XDG_DATA_HOME": str(tmp_path / "data"),
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        },
+    )
+
+    assert completed.returncode != 0
+    assert "unsupported by schema-2 JSON" in completed.stderr
