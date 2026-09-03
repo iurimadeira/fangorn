@@ -606,6 +606,7 @@ class Registry:
                         "Final Git observation token was not reserved by the "
                         "adoption transaction"
                     )
+                _reject_incomplete_create_target(connection, observation.path)
                 if observation.git_common_dir_generation is None:
                     raise RegistryError(
                         "Fangorn repository generation marker is missing; "
@@ -625,7 +626,9 @@ class Registry:
                     (str(observation.repository_common_dir),),
                 ).fetchone()
                 if repository is None:
-                    repository_id = str(uuid4())
+                    repository_id = _repository_id(
+                        str(observation.repository_common_dir)
+                    )
                     connection.execute(
                         """
                         INSERT INTO repositories (
@@ -746,6 +749,7 @@ class Registry:
         with self._connection() as connection:
             self._migrate(connection)
             try:
+                _reject_incomplete_create_target(connection, observation.path)
                 repository = connection.execute(
                     """
                     SELECT id, git_common_dir_generation
@@ -881,11 +885,25 @@ class Registry:
                     raise
                 raise _registry_error(error) from error
 
-    def persist_resolved_sha(self, operation_id: str, sha: str) -> str:
+    def persist_resolved_sha(
+        self,
+        operation_id: str,
+        sha: str,
+        *,
+        workspace_id: str,
+        lease_epoch: int,
+    ) -> str:
         with self._connection() as connection:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind="workspace",
+                    scope_key=workspace_id,
+                    lease_epoch=lease_epoch,
+                )
                 row = connection.execute(
                     "SELECT resolved_sha FROM workspace_create_intents "
                     "WHERE operation_id = ?",
@@ -917,12 +935,14 @@ class Registry:
             ).fetchone()
             if row is not None:
                 return str(row["id"])
-            return str(uuid5(NAMESPACE_URL, f"fangorn-repository:{common_dir}"))
+            return _repository_id(common_dir)
 
     def record_workspace_definition(
         self,
         *,
         workspace_id: str,
+        operation_id: str,
+        lease_epoch: int,
         definition: dict[str, object],
     ) -> None:
         encoded = json.dumps(definition, sort_keys=True, separators=(",", ":"))
@@ -930,6 +950,13 @@ class Registry:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind="workspace",
+                    scope_key=workspace_id,
+                    lease_epoch=lease_epoch,
+                )
                 row = connection.execute(
                     "SELECT definition_json FROM workspace_aggregates "
                     "WHERE workspace_id = ?",
@@ -955,6 +982,8 @@ class Registry:
         self,
         operation_id: str,
         *,
+        workspace_id: str,
+        lease_epoch: int,
         resolved: dict[str, object],
         steps: tuple[tuple[str, str], ...],
     ) -> dict[str, object]:
@@ -962,6 +991,13 @@ class Registry:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind="workspace",
+                    scope_key=workspace_id,
+                    lease_epoch=lease_epoch,
+                )
                 row = connection.execute(
                     "SELECT * FROM workspace_create_intents WHERE operation_id = ?",
                     (operation_id,),
@@ -1950,6 +1986,37 @@ def _reserve_observation(connection: sqlite3.Connection) -> int:
     if row is None:
         raise RegistryError("Registry observation clock is unavailable")
     return int(row["current_token"])
+
+
+def _repository_id(common_dir: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f"fangorn-repository:{common_dir}"))
+
+
+def _reject_incomplete_create_target(
+    connection: sqlite3.Connection, path: Path
+) -> None:
+    for row in connection.execute(
+        "SELECT target_path, resolved_json FROM workspace_create_intents "
+        "WHERE status <> 'completed'"
+    ):
+        target = Path(str(row["target_path"]))
+        if path == target:
+            raise RegistryError(
+                "Workspace creation is incomplete for this target; retry later"
+            )
+        if row["resolved_json"] is None:
+            continue
+        try:
+            resolved = json.loads(str(row["resolved_json"]))
+            token = (
+                resolved.get("ownership_token") if isinstance(resolved, dict) else None
+            )
+        except (TypeError, ValueError):
+            token = None
+        if isinstance(token, str) and path == target.parent / f".fangorn-{token}":
+            raise RegistryError(
+                "Workspace creation is incomplete for this target; retry later"
+            )
 
 
 def _validate_worktree_binding(

@@ -259,6 +259,8 @@ class Workspaces:
                     commit = self._registry.persist_resolved_sha(
                         intent.operation_id,
                         resolve_commit(repository, request.base),
+                        workspace_id=intent.workspace_id,
+                        lease_epoch=lease_epoch,
                     )
                 configuration = read_configuration(repository, commit, request.config)
                 configuration_value = _configuration_value(configuration)
@@ -283,6 +285,8 @@ class Workspaces:
                 }
                 resolved = self._registry.enrich_create_intent(
                     intent.operation_id,
+                    workspace_id=intent.workspace_id,
+                    lease_epoch=lease_epoch,
                     resolved=resolved,
                     steps=tuple(
                         (step.action, step.resource_name) for step in lifecycle.steps
@@ -295,6 +299,8 @@ class Workspaces:
                 resolved = cast(dict[str, object], loaded)
             self._registry.record_workspace_definition(
                 workspace_id=intent.workspace_id,
+                operation_id=intent.operation_id,
+                lease_epoch=lease_epoch,
                 definition=_create_definition(intent, target, resolved),
             )
 
@@ -424,7 +430,16 @@ class Workspaces:
             return source.path
         operation_id = intent.operation_id
         digest = hashlib.sha256(source.normalized.encode()).hexdigest()
-        cache_path = self._cache_home / "fangorn" / "repositories" / f"{digest}.git"
+        registry_namespace = hashlib.sha256(
+            str(self._registry.path.resolve()).encode()
+        ).hexdigest()
+        cache_path = (
+            self._cache_home
+            / "fangorn"
+            / "repositories"
+            / registry_namespace
+            / f"{digest}.git"
+        )
         epoch = self._registry.acquire_lease(
             scope_kind="repository",
             scope_key=source.normalized,

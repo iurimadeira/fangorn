@@ -34,6 +34,42 @@ def facade(tmp_path: Path) -> Workspaces:
     )
 
 
+def test_adoption_cannot_claim_an_incomplete_create_target(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    registry.begin_create_intent(
+        request_key="create-target",
+        request_id=None,
+        request_json="{}",
+        target_path=str(repository.resolve()),
+        workspace_id="workspace-create",
+        operation_id="operation-create",
+        prepare_cache=False,
+    )
+
+    with pytest.raises(WorkspaceError, match="creation is incomplete"):
+        Workspaces(registry).adopt(repository)
+
+
+def test_adoption_and_create_use_the_same_repository_identity(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    observation = observe_worktree(
+        repository,
+        create_repository_generation=True,
+        create_worktree_generation=True,
+        reserve_observation=registry.reserve_observation,
+    )
+
+    adopted, _ = registry.adopt(observation)
+
+    assert adopted.repository_id == registry.repository_id_for_common_dir(
+        str(observation.repository_common_dir)
+    )
+
+
 @pytest.mark.parametrize(
     ("start", "expected_state"),
     [(True, "ready"), (False, "stopped")],
@@ -177,7 +213,9 @@ def test_create_from_clone_url_uses_journaled_shared_cache(tmp_path: Path) -> No
     )
 
     assert result.workspace.definition.created_from_sha == created_from_sha
-    cache_entries = list((tmp_path / "cache" / "fangorn" / "repositories").iterdir())
+    cache_entries = list(
+        (tmp_path / "cache" / "fangorn" / "repositories").glob("*/*.git")
+    )
     assert len(cache_entries) == 1
     assert git(cache_entries[0], "rev-parse", "--is-bare-repository") == "true"
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
@@ -191,6 +229,28 @@ def test_create_from_clone_url_uses_journaled_shared_cache(tmp_path: Path) -> No
             ("start", "worktree", "completed"),
             ("inspect", "worktree", "completed"),
         ]
+
+
+def test_clone_cache_is_namespaced_by_registry_identity(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    cache_home = tmp_path / "cache"
+    for name in ("a", "b"):
+        Workspaces(
+            Registry(tmp_path / f"state-{name}" / "registry.sqlite3"),
+            data_home=tmp_path / f"data-{name}",
+            cache_home=cache_home,
+        ).create(
+            CreateWorkspace(
+                repository=repository.as_uri(),
+                branch=f"topic-{name}",
+                path=tmp_path / "worktrees" / name,
+            )
+        )
+
+    caches = list((cache_home / "fangorn" / "repositories").glob("*/*.git"))
+    assert len(caches) == 2
+    assert caches[0].parent != caches[1].parent
 
 
 def test_clone_url_resolves_tag_base(tmp_path: Path) -> None:
@@ -293,11 +353,6 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
         operation_id="operation-2",
         prepare_cache=False,
     )
-    registry.enrich_create_intent(
-        intent.operation_id,
-        resolved={"created_from_sha": "a" * 40},
-        steps=(("create", "worktree"),),
-    )
     old_owner = ProcessIdentity("old", "boot", 1001, "start-old")
     old_epoch = registry.acquire_lease(
         scope_kind="workspace",
@@ -305,6 +360,13 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
         operation_id=intent.operation_id,
         owner=old_owner,
         owner_status=lambda _owner: "live",
+    )
+    registry.enrich_create_intent(
+        intent.operation_id,
+        workspace_id=intent.workspace_id,
+        lease_epoch=old_epoch,
+        resolved={"created_from_sha": "a" * 40},
+        steps=(("create", "worktree"),),
     )
     registry.start_operation_step(
         intent.operation_id,
@@ -323,6 +385,28 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
     )
 
     assert new_epoch == old_epoch + 1
+    with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.persist_resolved_sha(
+            intent.operation_id,
+            "a" * 40,
+            workspace_id=intent.workspace_id,
+            lease_epoch=old_epoch,
+        )
+    with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.enrich_create_intent(
+            intent.operation_id,
+            workspace_id=intent.workspace_id,
+            lease_epoch=old_epoch,
+            resolved={"created_from_sha": "b" * 40},
+            steps=(("create", "worktree"),),
+        )
+    with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.record_workspace_definition(
+            workspace_id=intent.workspace_id,
+            operation_id=intent.operation_id,
+            lease_epoch=old_epoch,
+            definition={"id": intent.workspace_id},
+        )
     with pytest.raises(RegistryError, match="Stale operation result"):
         registry.finish_operation_step(
             intent.operation_id,
@@ -369,17 +453,19 @@ def test_inconclusive_lease_owner_is_not_taken_over(tmp_path: Path) -> None:
         operation_id="operation-1",
         prepare_cache=False,
     )
-    registry.enrich_create_intent(
-        intent.operation_id,
-        resolved={"created_from_sha": "a" * 40},
-        steps=(("create", "worktree"),),
-    )
-    registry.acquire_lease(
+    epoch = registry.acquire_lease(
         scope_kind="workspace",
         scope_key=intent.workspace_id,
         operation_id=intent.operation_id,
         owner=ProcessIdentity("old", "boot", 1001, "start-old"),
         owner_status=lambda _owner: "live",
+    )
+    registry.enrich_create_intent(
+        intent.operation_id,
+        workspace_id=intent.workspace_id,
+        lease_epoch=epoch,
+        resolved={"created_from_sha": "a" * 40},
+        steps=(("create", "worktree"),),
     )
 
     with pytest.raises(RegistryError, match="Workspace mutation is busy"):
@@ -736,10 +822,15 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         assert json.loads(aggregate_row[0])["created_from_sha"]
         assert aggregate_row[1] == "create_failed"
 
+    with pytest.raises(WorkspaceError, match="creation is incomplete"):
+        facade(tmp_path).adopt(target)
     recovered = facade(tmp_path).create(request)
+    adopted = facade(tmp_path).adopt(target)
 
     assert recovered.created is False
     assert recovered.workspace.state == "ready"
+    assert adopted.created is False
+    assert adopted.workspace.binding.id == recovered.workspace.definition.id
     assert (
         git(target, "rev-parse", "HEAD")
         == recovered.workspace.definition.created_from_sha

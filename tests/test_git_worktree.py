@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 from git_helpers import git, initialize_repository
@@ -139,6 +141,53 @@ def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> N
     )
 
     assert not abandoned.exists()
+
+
+def test_clone_cache_cleans_invocation_when_owner_metadata_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_repository = tmp_path / "source"
+    repository(source_repository)
+    cache = tmp_path / "cache" / "repository.git"
+    original = Path.write_text
+
+    def fail_owner(
+        path: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        if path.name == "owner.json":
+            raise OSError("metadata unavailable")
+        return original(path, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", fail_owner)
+    with pytest.raises(OSError, match="metadata unavailable"):
+        materialize_cache(
+            normalize_repository_source(source_repository.as_uri()),
+            cache,
+            owner=ProcessIdentity("live", "boot", 1002, "start"),
+            owner_status=lambda _owner: "live",
+        )
+
+    assert list(cache.parent.glob("clone-*")) == []
+
+
+def test_git_adapter_forces_stable_diagnostics_locale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured.update(cast(dict[str, str], kwargs["env"]))
+        return subprocess.CompletedProcess([], 0, b"a" * 40, b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    resolve_commit(tmp_path, None)
+
+    assert captured["LC_ALL"] == "C"
+    assert captured["LANG"] == "C"
 
 
 def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -> None:

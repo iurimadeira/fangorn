@@ -131,21 +131,21 @@ def materialize_cache(
     require_supported_git(cache_path.parent)
     prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
     invocation = Path(tempfile.mkdtemp(prefix=prefix, dir=cache_path.parent))
-    if owner is not None:
-        (invocation / "owner.json").write_text(
-            json.dumps(
-                {
-                    "boot_identity": owner.boot_identity,
-                    "pid": owner.pid,
-                    "process_instance_id": owner.process_instance_id,
-                    "process_start_identity": owner.process_start_identity,
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
     clone = invocation / "repository.git"
     try:
+        if owner is not None:
+            (invocation / "owner.json").write_text(
+                json.dumps(
+                    {
+                        "boot_identity": owner.boot_identity,
+                        "pid": owner.pid,
+                        "process_instance_id": owner.process_instance_id,
+                        "process_start_identity": owner.process_start_identity,
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
         result = _run_git_process(
             cache_path.parent,
             "clone",
@@ -331,6 +331,8 @@ def _run_git_process(
         command.extend(location)
     command.extend(arguments)
     environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
     try:
