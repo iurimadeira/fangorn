@@ -97,7 +97,7 @@ def test_commit_and_configuration_reads_are_immutable(tmp_path: Path) -> None:
 
     assert resolve_commit(source, None) == commit
     assert read_configuration(source, commit, explicit) == b"schema_version = 1\n"
-    assert read_configuration(source, commit, None) == b""
+    assert read_configuration(source, commit, None) is None
     with pytest.raises(GitError, match="unknown-ref"):
         resolve_commit(source, "unknown-ref")
 
@@ -350,6 +350,41 @@ def test_successful_git_drains_term_ignoring_descendants(
     assert not git_worktree_adapter._process_group_running(
         int(group.read_text(encoding="ascii"))
     )
+
+
+def test_git_cleanup_blocks_repeated_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    original = git_worktree_adapter._drain_git_group
+    masks: list[bool] = []
+
+    def interrupt_first_cleanup(process: subprocess.Popen[bytes]) -> None:
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        masks.append(signal.SIGINT in blocked)
+        if len(masks) == 1:
+            raise KeyboardInterrupt
+        original(process)
+
+    monkeypatch.setattr(
+        git_worktree_adapter, "_drain_git_group", interrupt_first_cleanup
+    )
+    liveness, writer = os.pipe()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            git_worktree_adapter._run_git_process(
+                tmp_path, "fetch", liveness_fd=liveness
+            )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+    assert masks == [False, True]
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:

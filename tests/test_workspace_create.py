@@ -1905,6 +1905,31 @@ def test_create_rejects_configuration_outside_f2_scope(
     assert not (tmp_path / "target").exists()
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_create_rejects_present_empty_configuration(
+    tmp_path: Path, explicit: bool
+) -> None:
+    source = tmp_path / "repository"
+    create_repository(source)
+    config = tmp_path / "explicit.toml" if explicit else source / "fangorn.toml"
+    config.write_bytes(b"")
+    if not explicit:
+        git(source, "add", "fangorn.toml")
+        git(source, "commit", "-m", "add empty configuration")
+
+    with pytest.raises(WorkspaceError, match="requires schema_version = 1"):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(source),
+                branch="empty-config",
+                path=tmp_path / "target",
+                config=config if explicit else None,
+            )
+        )
+
+    assert not (tmp_path / "target").exists()
+
+
 def test_cli_rejects_temporal_configuration_with_domain_error(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)

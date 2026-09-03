@@ -115,7 +115,9 @@ def validate_branch_name(branch: str) -> None:
         raise GitError("Workspace branch is invalid")
 
 
-def read_configuration(repository: Path, commit: str, explicit: Path | None) -> bytes:
+def read_configuration(
+    repository: Path, commit: str, explicit: Path | None
+) -> bytes | None:
     if explicit is not None:
         try:
             descriptor = os.open(explicit, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -144,7 +146,7 @@ def read_configuration(repository: Path, commit: str, explicit: Path | None) -> 
         b"does not exist" in result.stderr
         or b"exists on disk, but not in" in result.stderr
     ):
-        return b""
+        return None
     raise GitError(_git_error(result))
 
 
@@ -701,22 +703,18 @@ def _run_git_process(
             Thread(target=_read_pipe, args=(stdout_pipe, stdout_parts)),
             Thread(target=_read_pipe, args=(stderr_pipe, stderr_parts)),
         )
-        for reader in readers:
-            reader.start()
+        started: list[Thread] = []
         try:
-            process.wait()
-        except BaseException:
-            if finish_on_parent_exit:
-                process.wait()
-                _drain_git_group(process)
-            else:
-                _cancel_git_group(process)
             for reader in readers:
+                reader.start()
+                started.append(reader)
+            process.wait()
+            _drain_git_group(process)
+            for reader in started:
                 reader.join()
+        except BaseException:
+            _settle_interrupted_git(process, started, finish=finish_on_parent_exit)
             raise
-        _drain_git_group(process)
-        for reader in readers:
-            reader.join()
         return subprocess.CompletedProcess(
             command,
             process.returncode,
@@ -727,6 +725,22 @@ def _run_git_process(
         raise GitError("Git executable was not found") from error
     except OSError as error:
         raise GitError(f"Cannot run Git: {error}") from error
+
+
+def _settle_interrupted_git(
+    process: subprocess.Popen[bytes], readers: list[Thread], *, finish: bool
+) -> None:
+    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        if finish:
+            process.wait()
+            _drain_git_group(process)
+        else:
+            _cancel_git_group(process)
+        for reader in readers:
+            reader.join()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
 
 
 def _cancel_git_group(process: subprocess.Popen[bytes]) -> None:

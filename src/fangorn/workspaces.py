@@ -278,8 +278,11 @@ class Workspaces:
                         workspace_id=intent.workspace_id,
                         lease_epoch=lease_epoch,
                     )
-                configuration = read_configuration(repository, commit, request.config)
-                configuration_value = _configuration_value(configuration)
+                loaded_configuration = read_configuration(
+                    repository, commit, request.config
+                )
+                configuration_value = _configuration_value(loaded_configuration)
+                configuration = loaded_configuration or b""
                 resource_token = secrets.token_hex(32)
                 common_dir = (
                     source.normalized
@@ -790,8 +793,8 @@ def re_sub_path(value: str) -> str:
     return rendered.strip(".-") or "workspace"
 
 
-def _configuration_value(content: bytes) -> dict[str, object]:
-    if not content:
+def _configuration_value(content: bytes | None) -> dict[str, object]:
+    if content is None:
         return {"schema_version": 1}
     value = tomllib.loads(content.decode("utf-8"))
     unknown = value.keys() - {"schema_version", "services"}
