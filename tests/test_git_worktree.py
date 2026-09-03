@@ -2230,6 +2230,33 @@ def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -
         )
 
 
+def test_worktree_reconciliation_rejects_another_repository(tmp_path: Path) -> None:
+    expected = tmp_path / "expected"
+    commit = repository(expected)
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "--no-hardlinks", str(expected), str(other))
+    target = tmp_path / "target"
+    token = "8" * 64
+    create_worktree(
+        other,
+        target=target,
+        branch="topic",
+        commit=commit,
+        ownership_token=token,
+        reconcile=False,
+    )
+
+    with pytest.raises(GitError, match="Repository identity"):
+        create_worktree(
+            expected,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
+
+
 def test_worktree_creation_disables_repository_hooks(tmp_path: Path) -> None:
     source = tmp_path / "repository"
     commit = repository(source)

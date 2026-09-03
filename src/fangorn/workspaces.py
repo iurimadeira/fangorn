@@ -364,6 +364,12 @@ class Workspaces:
                     if source.clone_url is None
                     else str(repository.resolve())
                 )
+                repository_common_dir = Path(common_dir)
+                expected_repository_generation = repository_generation(
+                    repository_common_dir, create=True
+                )
+                if expected_repository_generation is None:
+                    raise WorkspaceError("Repository generation marker is unavailable")
                 repository_id = self._registry.repository_id_for_common_dir(common_dir)
                 lifecycle = plan_create(
                     (LifecycleResource("worktree", "worktree"),),
@@ -375,6 +381,8 @@ class Workspaces:
                     "configuration_value": configuration_value,
                     "created_from_sha": commit,
                     "ownership_token": resource_token,
+                    "repository_common_dir": str(repository_common_dir),
+                    "repository_generation": expected_repository_generation,
                     "repository_id": repository_id,
                 }
                 resolved = self._registry.enrich_create_intent(
@@ -404,6 +412,19 @@ class Workspaces:
             position = 1 if source.clone_url is not None else 0
             ownership_token = str(resolved["ownership_token"])
             commit = str(resolved["created_from_sha"])
+            repository_common_value = resolved.get("repository_common_dir")
+            repository_generation_value = resolved.get("repository_generation")
+            if (
+                not isinstance(repository_common_value, str)
+                or not Path(repository_common_value).is_absolute()
+                or not isinstance(repository_generation_value, str)
+                or not repository_generation_value
+            ):
+                raise WorkspaceError(
+                    "Stored Workspace Repository identity is malformed"
+                )
+            expected_repository_common_dir = Path(repository_common_value)
+            expected_repository_generation = repository_generation_value
             observation = None
             for step in lifecycle.steps:
                 previous = self._registry.start_operation_step(
@@ -422,6 +443,8 @@ class Workspaces:
                         commit=commit,
                         ownership_token=ownership_token,
                         reconcile=previous != "pending",
+                        expected_repository_common_dir=(expected_repository_common_dir),
+                        expected_repository_generation=expected_repository_generation,
                         liveness_fd=self._invocation_descriptor(owner),
                     )
                 elif previous != "completed":
@@ -430,6 +453,8 @@ class Workspaces:
                         expected_commit=commit,
                         expected_branch=request.branch,
                         ownership_token=ownership_token,
+                        expected_repository_common_dir=(expected_repository_common_dir),
+                        expected_repository_generation=expected_repository_generation,
                         liveness_fd=self._invocation_descriptor(owner),
                     )
                 if previous != "completed":
@@ -447,6 +472,8 @@ class Workspaces:
                 expected_commit=commit,
                 expected_branch=request.branch,
                 ownership_token=ownership_token,
+                expected_repository_common_dir=expected_repository_common_dir,
+                expected_repository_generation=expected_repository_generation,
                 liveness_fd=self._invocation_descriptor(owner),
             )
             state = finish_create(
@@ -461,6 +488,8 @@ class Workspaces:
             self._registry.complete_workspace_create(
                 intent=intent,
                 observation=observation,
+                expected_repository_common_dir=str(expected_repository_common_dir),
+                expected_repository_generation=expected_repository_generation,
                 created_from_sha=commit,
                 configuration=configuration,
                 configuration_json=json.dumps(

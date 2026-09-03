@@ -700,8 +700,37 @@ def create_worktree(
     commit: str,
     ownership_token: str,
     reconcile: bool,
+    expected_repository_common_dir: Path | None = None,
+    expected_repository_generation: str | None = None,
     liveness_fd: int | None = None,
 ) -> WorktreeObservation:
+    repository_common_dir = _required_git_path(
+        repository,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        liveness_fd=liveness_fd,
+    )
+    repository_common_generation = repository_generation(
+        repository_common_dir, create=True
+    )
+    if repository_common_generation is None:
+        raise GitError("Repository generation marker is unavailable")
+    if (expected_repository_common_dir is None) != (
+        expected_repository_generation is None
+    ):
+        raise GitError("Expected Repository identity is incomplete")
+    expected_repository_common_dir = (
+        expected_repository_common_dir or repository_common_dir
+    )
+    expected_repository_generation = (
+        expected_repository_generation or repository_common_generation
+    )
+    if (
+        repository_common_dir != expected_repository_common_dir
+        or repository_common_generation != expected_repository_generation
+    ):
+        raise GitError("Repository identity changed during Workspace creation")
     staging = target.parent / f".fangorn-{ownership_token}"
     receipt = target.parent / f".fangorn-{ownership_token}.intent"
     parent = _prepare_target_parent(target.parent)
@@ -711,6 +740,11 @@ def create_worktree(
             if target_kind == "symlink" or not reconcile:
                 raise GitError(f"Workspace target path already exists: {target}")
             observation = observe_worktree(target, liveness_fd=liveness_fd)
+            _require_expected_repository(
+                observation,
+                expected_repository_common_dir,
+                expected_repository_generation,
+            )
             if observation.git_dir_generation != ownership_token:
                 raise GitError("Existing target is not owned by this Workspace create")
             if observation.head != commit or observation.branch != branch:
@@ -720,6 +754,11 @@ def create_worktree(
                 create_repository_generation=True,
                 create_worktree_generation=False,
                 liveness_fd=liveness_fd,
+            )
+            _require_expected_repository(
+                result,
+                expected_repository_common_dir,
+                expected_repository_generation,
             )
             _remove_staging_receipt(receipt, ownership_token, parent.descriptor)
             return result
@@ -747,6 +786,11 @@ def create_worktree(
                 raise GitError("Workspace staging path is unsafe")
             _secure_staging_directory(parent.descriptor, staging.name)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
+            _require_expected_repository(
+                observation,
+                expected_repository_common_dir,
+                expected_repository_generation,
+            )
             if observation.git_dir_generation not in {None, ownership_token}:
                 raise GitError("Staged Worktree belongs to another Workspace create")
             if observation.head != commit or observation.branch not in {None, branch}:
@@ -814,8 +858,18 @@ def create_worktree(
             _require_target_parent(parent)
             _secure_staging_directory(parent.descriptor, staging.name)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
+            _require_expected_repository(
+                observation,
+                expected_repository_common_dir,
+                expected_repository_generation,
+            )
         establish_worktree_generation(observation.git_dir, ownership_token)
         observation = observe_worktree(staging, liveness_fd=liveness_fd)
+        _require_expected_repository(
+            observation,
+            expected_repository_common_dir,
+            expected_repository_generation,
+        )
         if observation.head != commit or observation.branch != branch:
             branch_exists = _run_git_process(
                 repository,
@@ -859,6 +913,11 @@ def create_worktree(
                 raise GitError(_git_error(selected))
             _require_target_parent(parent)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
+            _require_expected_repository(
+                observation,
+                expected_repository_common_dir,
+                expected_repository_generation,
+            )
             if observation.head != commit or observation.branch != branch:
                 raise GitError("Staged Worktree does not match the interrupted create")
         _fsync_descriptor(parent.descriptor, "Workspace staging publication")
@@ -889,6 +948,11 @@ def create_worktree(
             create_repository_generation=True,
             create_worktree_generation=False,
             liveness_fd=liveness_fd,
+        )
+        _require_expected_repository(
+            result,
+            expected_repository_common_dir,
+            expected_repository_generation,
         )
         _remove_staging_receipt(receipt, ownership_token, parent.descriptor)
         return result
@@ -1260,11 +1324,21 @@ def inspect_owned_worktree(
     expected_commit: str | None,
     expected_branch: str | None,
     ownership_token: str | None = None,
+    expected_repository_common_dir: Path | None = None,
+    expected_repository_generation: str | None = None,
     liveness_fd: int | None = None,
 ) -> WorktreeObservation:
     if not target.exists():
         raise GitError(f"Worktree Resource is absent: {target}")
     observation = observe_worktree(target, liveness_fd=liveness_fd)
+    if expected_repository_common_dir is not None:
+        if expected_repository_generation is None:
+            raise GitError("Expected Repository identity is incomplete")
+        _require_expected_repository(
+            observation,
+            expected_repository_common_dir,
+            expected_repository_generation,
+        )
     if expected_commit is not None and observation.head != expected_commit:
         raise GitError("Worktree Resource does not match its immutable definition")
     if expected_branch is not None and observation.branch != expected_branch:
@@ -1275,6 +1349,18 @@ def inspect_owned_worktree(
     ):
         raise GitError("Worktree Resource ownership token does not match")
     return observation
+
+
+def _require_expected_repository(
+    observation: WorktreeObservation,
+    expected_common_dir: Path,
+    expected_generation: str,
+) -> None:
+    if (
+        observation.repository_common_dir != expected_common_dir
+        or observation.git_common_dir_generation != expected_generation
+    ):
+        raise GitError("Repository identity changed during Workspace creation")
 
 
 def _verify_bare_repository(

@@ -1529,6 +1529,8 @@ class Registry:
         *,
         intent: CreateIntentRecord,
         observation: WorktreeObservation,
+        expected_repository_common_dir: str,
+        expected_repository_generation: str,
         created_from_sha: str,
         configuration: bytes,
         configuration_json: str,
@@ -1548,6 +1550,15 @@ class Registry:
                     scope_key=intent.workspace_id,
                     lease_epoch=lease_epoch,
                 )
+                if (
+                    str(observation.repository_common_dir)
+                    != expected_repository_common_dir
+                    or observation.git_common_dir_generation
+                    != expected_repository_generation
+                ):
+                    raise RegistryError(
+                        "Repository identity changed during Workspace creation"
+                    )
                 if observation.git_common_dir_generation is None:
                     raise RegistryError("Repository generation marker is unavailable")
                 if observation.git_dir_generation is None:

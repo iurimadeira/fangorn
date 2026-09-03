@@ -1031,6 +1031,12 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
         registry.complete_workspace_create(
             intent=intent,
             observation=observe_worktree(repository),
+            expected_repository_common_dir=str(
+                observe_worktree(repository).repository_common_dir
+            ),
+            expected_repository_generation=str(
+                observe_worktree(repository).git_common_dir_generation
+            ),
             created_from_sha="a" * 40,
             configuration=b"",
             configuration_json="{}",
@@ -1059,6 +1065,84 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
         )
         == "unknown"
     )
+
+
+def test_completion_rejects_observation_from_another_repository(
+    tmp_path: Path,
+) -> None:
+    expected = tmp_path / "expected"
+    create_repository(expected)
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "--no-hardlinks", str(expected), str(other))
+    expected_observation = observe_worktree(expected, create_generation=True)
+    other_observation = observe_worktree(other, create_generation=True)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    intent, _ = registry.begin_create_intent(
+        request_key="repository-mismatch",
+        request_id=None,
+        request_json="{}",
+        target_path=str(other_observation.path),
+        workspace_id="workspace-mismatch",
+        operation_id="operation-mismatch",
+        prepare_cache=False,
+    )
+    epoch = registry.acquire_lease(
+        scope_kind="workspace",
+        scope_key=intent.workspace_id,
+        operation_id=intent.operation_id,
+        owner=ProcessIdentity("owner", "boot", 1001, "start"),
+        owner_status=lambda _owner: "live",
+    )
+    registry.enrich_create_intent(
+        intent.operation_id,
+        workspace_id=intent.workspace_id,
+        lease_epoch=epoch,
+        resolved={"created_from_sha": other_observation.head},
+        steps=(("create", "worktree"),),
+    )
+    registry.record_workspace_definition(
+        workspace_id=intent.workspace_id,
+        operation_id=intent.operation_id,
+        lease_epoch=epoch,
+        definition={
+            "id": intent.workspace_id,
+            "repository_id": "repository-expected",
+            "created_from_sha": other_observation.head,
+            "configuration": "",
+            "configuration_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "resources": [
+                {
+                    "locator": str(other_observation.path),
+                    "ownership_token": other_observation.git_dir_generation,
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(RegistryError, match="Repository identity"):
+        registry.complete_workspace_create(
+            intent=intent,
+            observation=other_observation,
+            expected_repository_common_dir=str(
+                expected_observation.repository_common_dir
+            ),
+            expected_repository_generation=str(
+                expected_observation.git_common_dir_generation
+            ),
+            created_from_sha=str(other_observation.head),
+            configuration=b"",
+            configuration_json="{}",
+            configuration_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            repository_id="repository-expected",
+            state="ready",
+            lease_epoch=epoch,
+        )
+
+    with sqlite3.connect(registry.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM repositories").fetchone() == (
+            0,
+        )
+        assert connection.execute("SELECT COUNT(*) FROM workspaces").fetchone() == (0,)
 
 
 def test_inconclusive_lease_owner_is_not_taken_over(tmp_path: Path) -> None:
