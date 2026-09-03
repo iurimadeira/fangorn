@@ -8,6 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from typing import Any, cast
 
 import pytest
 from git_helpers import git, initialize_repository
@@ -16,7 +17,12 @@ import fangorn.workspaces as workspaces_module
 from fangorn.git import observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
-from fangorn.workspaces import CreateWorkspace, WorkspaceError, Workspaces
+from fangorn.workspaces import (
+    CreateWorkspace,
+    ResourceDefinition,
+    WorkspaceError,
+    Workspaces,
+)
 
 
 def create_repository(path: Path) -> str:
@@ -1812,6 +1818,24 @@ def test_boot_identity_fails_without_a_stable_probe(
         workspaces_module._current_process_identity()
 
 
+def test_portable_identity_probes_fail_closed_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(args[0], 2)
+        ),
+    )
+
+    with pytest.raises(WorkspaceError, match="host boot identity"):
+        workspaces_module._boot_identity()
+    with pytest.raises(WorkspaceError, match="process start identity"):
+        workspaces_module._process_start_identity(123)
+
+
 def test_symlink_loop_target_fails_as_workspace_error_before_state(
     tmp_path: Path,
 ) -> None:
@@ -1882,6 +1906,11 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
     )
     database = tmp_path / "state" / "registry.sqlite3"
 
+    with pytest.raises(TypeError):
+        cast(Any, created.definition.configuration_value)["schema_version"] = 2
+    with pytest.raises(TypeError):
+        cast(Any, created.definition.resources[0].configuration)["changed"] = True
+
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         with pytest.raises(sqlite3.IntegrityError, match="definition is immutable"):
@@ -1906,6 +1935,7 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
                 "NULL, ?, ?, 'created')",
                 (created.definition.id, str(tmp_path / "extra"), "f" * 64),
             )
+
         with pytest.raises(sqlite3.IntegrityError, match="create intent is immutable"):
             connection.execute(
                 "UPDATE workspace_create_intents SET target_path = ? "
@@ -2050,6 +2080,26 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
                     "c" * 64,
                 ),
             )
+
+
+def test_resource_definition_recursively_freezes_configuration() -> None:
+    resource = ResourceDefinition(
+        name="worktree",
+        kind="worktree",
+        adapter_id="fangorn.git-worktree",
+        adapter_api_major=1,
+        configuration={"nested": {"values": [1]}},
+        external_reference=None,
+        locator=str(Path.cwd() / "worktree"),
+        ownership_token="a" * 64,
+    )
+    nested = cast(Any, resource.configuration["nested"])
+
+    with pytest.raises(TypeError):
+        nested["changed"] = True
+    assert nested["values"] == (1,)
+    with pytest.raises(AttributeError):
+        nested["values"].append(2)
 
 
 @pytest.mark.parametrize(

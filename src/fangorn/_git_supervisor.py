@@ -190,24 +190,28 @@ def _drain(child: subprocess.Popen[bytes], process_group: int) -> None:
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGTERM)
     deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        if not _wait_for_group_state(process_group):
-            child.wait()
-            return
-        time.sleep(0.1)
+    if not _wait_for_group_state(process_group, deadline=deadline):
+        child.wait()
+        return
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGKILL)
-    while _wait_for_group_state(process_group):
-        time.sleep(0.1)
-    child.wait()
+    deadline = time.monotonic() + 2
+    _wait_for_group_state(process_group, deadline=deadline)
+    with suppress(subprocess.TimeoutExpired):
+        child.wait(timeout=max(0, deadline - time.monotonic()))
 
 
-def _wait_for_group_state(process_group: int) -> bool:
-    while True:
+def _wait_for_group_state(process_group: int, *, deadline: float | None = None) -> bool:
+    if deadline is None:
+        deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
         try:
-            return _process_group_running(process_group)
+            if not _process_group_running(process_group):
+                return False
         except (OSError, subprocess.SubprocessError):
-            time.sleep(0.1)
+            pass
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    return True
 
 
 def _child_running(child: subprocess.Popen[bytes]) -> bool:

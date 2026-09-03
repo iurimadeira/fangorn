@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import click
@@ -238,7 +239,7 @@ def _aggregate_schema(workspace: WorkspaceAggregate) -> dict[str, object]:
                 "bytes_base64": base64.b64encode(definition.configuration).decode(
                     "ascii"
                 ),
-                "value": definition.configuration_value,
+                "value": _thaw(definition.configuration_value),
                 "digest": definition.configuration_digest,
             },
             "resources": [
@@ -247,7 +248,7 @@ def _aggregate_schema(workspace: WorkspaceAggregate) -> dict[str, object]:
                     "kind": resource.kind,
                     "adapter_id": resource.adapter_id,
                     "adapter_api_major": resource.adapter_api_major,
-                    "configuration": resource.configuration,
+                    "configuration": _thaw(resource.configuration),
                     "external_reference": resource.external_reference,
                     "locator": resource.locator,
                     "ownership_token": resource.ownership_token,
@@ -267,6 +268,14 @@ def _aggregate_schema(workspace: WorkspaceAggregate) -> dict[str, object]:
         "path": workspace.path,
         "branch": workspace.branch,
     }
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
 
 
 def _operation_schema(operation: Operation) -> dict[str, object]:

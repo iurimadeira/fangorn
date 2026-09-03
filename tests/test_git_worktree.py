@@ -453,7 +453,9 @@ def test_supervisor_does_not_reap_before_group_cleanup(
             raise AssertionError("cleanup must not reap through poll")
 
     child = Child()
-    monkeypatch.setattr(git_supervisor, "_wait_for_group_state", lambda _pid: False)
+    monkeypatch.setattr(
+        git_supervisor, "_wait_for_group_state", lambda *_args, **_kwargs: False
+    )
     monkeypatch.setattr(os, "killpg", lambda *_args: None)
 
     git_supervisor._drain(child, 123)  # type: ignore[arg-type]
@@ -677,6 +679,33 @@ def test_group_cleanup_retries_failed_observation(
     assert git_supervisor._wait_for_group_state(77) is False
 
 
+def test_supervisor_group_cleanup_forces_kill_after_probe_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def wait(self, timeout: float) -> int:
+            self.waits.append(timeout)
+            return -signal.SIGKILL
+
+    states = iter((True, True))
+    signals: list[int] = []
+    monkeypatch.setattr(
+        git_supervisor,
+        "_wait_for_group_state",
+        lambda *_args, **_kwargs: next(states),
+    )
+    monkeypatch.setattr(os, "killpg", lambda _pid, sent: signals.append(sent))
+
+    child = Child()
+    git_supervisor._drain(child, 77)  # type: ignore[arg-type]
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert len(child.waits) == 1
+
+
 def test_parent_group_probe_rejects_malformed_ps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -719,6 +748,25 @@ def test_parent_group_cleanup_stops_at_deadline(
         git_worktree_adapter._cancel_process_group(77, deadline=time.monotonic())
 
     assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_parent_group_cleanup_waits_through_running_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter((True, True, False))
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_process_group_running",
+        lambda *_args, **_kwargs: next(observations),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert (
+        git_worktree_adapter._wait_for_process_group_state(
+            77, deadline=time.monotonic() + 1
+        )
+        is False
+    )
 
 
 def test_supervised_git_rejects_ignored_sigchld_before_effects(
@@ -1207,6 +1255,97 @@ def test_abandoned_clone_cleanup_recovers_missing_owner_metadata(
     git_worktree_adapter._cleanup_abandoned_clones(parent, lambda _owner: "dead")
 
     assert not abandoned.exists()
+
+
+@pytest.mark.parametrize("metadata", ["{", "[]", '{"pid":"1001"}'])
+def test_abandoned_clone_cleanup_preserves_invalid_owner_metadata(
+    tmp_path: Path, metadata: str
+) -> None:
+    parent = tmp_path / "cache"
+    parent.mkdir()
+    dead = ProcessIdentity("dead", "boot", 1001, "start")
+    candidate = Path(
+        tempfile.mkdtemp(
+            prefix=git_worktree_adapter._clone_owner_prefix(dead), dir=parent
+        )
+    )
+    (candidate / "owner.json").write_text(metadata, encoding="utf-8")
+
+    git_worktree_adapter._cleanup_abandoned_clones(parent, lambda _owner: "dead")
+
+    assert candidate.exists()
+
+
+def test_abandoned_clone_cleanup_preserves_owner_mismatch(tmp_path: Path) -> None:
+    parent = tmp_path / "cache"
+    parent.mkdir()
+    named_owner = ProcessIdentity("named", "boot", 1001, "start")
+    recorded_owner = ProcessIdentity("recorded", "boot", 1002, "start")
+    candidate = Path(
+        tempfile.mkdtemp(
+            prefix=git_worktree_adapter._clone_owner_prefix(named_owner), dir=parent
+        )
+    )
+    git_worktree_adapter._write_clone_owner(candidate, recorded_owner)
+
+    git_worktree_adapter._cleanup_abandoned_clones(parent, lambda _owner: "dead")
+
+    assert candidate.exists()
+
+
+def test_abandoned_clone_cleanup_preserves_unreadable_owner_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "cache"
+    parent.mkdir()
+    dead = ProcessIdentity("dead", "boot", 1001, "start")
+    candidate = Path(
+        tempfile.mkdtemp(
+            prefix=git_worktree_adapter._clone_owner_prefix(dead), dir=parent
+        )
+    )
+    metadata = candidate / "owner.json"
+    metadata.write_text("{}", encoding="utf-8")
+    original = Path.read_text
+
+    def unreadable(path: Path, *args: object, **kwargs: object) -> str:
+        if path == metadata:
+            raise PermissionError
+        return original(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    git_worktree_adapter._cleanup_abandoned_clones(parent, lambda _owner: "dead")
+
+    assert candidate.exists()
+
+
+def test_clone_owner_publication_is_file_replace_directory_ordered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = ProcessIdentity("owner", "boot", 1001, "start")
+    events: list[str] = []
+    original_fsync = os.fsync
+    original_replace = os.replace
+
+    def record_fsync(descriptor: int) -> None:
+        events.append(
+            "directory-fsync"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file-fsync"
+        )
+        original_fsync(descriptor)
+
+    def record_replace(source: Path, target: Path) -> None:
+        events.append("replace")
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
+
+    git_worktree_adapter._write_clone_owner(tmp_path, owner)
+
+    assert events == ["file-fsync", "replace", "directory-fsync"]
 
 
 def test_clone_cache_cleans_invocation_when_owner_metadata_write_fails(

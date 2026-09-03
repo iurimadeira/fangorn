@@ -303,24 +303,41 @@ def _cleanup_abandoned_clones(
             if resolved.parent != resolved_parent:
                 continue
             metadata = resolved / "owner.json"
-            metadata_stat = metadata.stat(follow_symlinks=False)
-            if (
-                not stat.S_ISREG(metadata_stat.st_mode)
-                or metadata_stat.st_size > 4096
-                or metadata.is_symlink()
-            ):
-                continue
-            value = json.loads(metadata.read_text(encoding="utf-8"))
-            owner = ProcessIdentity(
-                process_instance_id=str(value["process_instance_id"]),
-                boot_identity=str(value["boot_identity"]),
-                pid=int(value["pid"]),
-                process_start_identity=str(value["process_start_identity"]),
-            )
+            try:
+                metadata_stat = metadata.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                if owner_from_name is None:
+                    continue
+                owner = owner_from_name
+            else:
+                if (
+                    not stat.S_ISREG(metadata_stat.st_mode)
+                    or metadata_stat.st_size > 4096
+                    or metadata.is_symlink()
+                ):
+                    continue
+                value = json.loads(metadata.read_text(encoding="utf-8"))
+                if not isinstance(value, dict):
+                    continue
+                process_instance_id = value.get("process_instance_id")
+                boot_identity = value.get("boot_identity")
+                pid = value.get("pid")
+                process_start_identity = value.get("process_start_identity")
+                if (
+                    not isinstance(process_instance_id, str)
+                    or not isinstance(boot_identity, str)
+                    or type(pid) is not int
+                    or not isinstance(process_start_identity, str)
+                ):
+                    continue
+                owner = ProcessIdentity(
+                    process_instance_id=process_instance_id,
+                    boot_identity=boot_identity,
+                    pid=pid,
+                    process_start_identity=process_start_identity,
+                )
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
-            if owner_from_name is None:
-                continue
-            owner = owner_from_name
+            continue
         if owner_from_name is not None and owner != owner_from_name:
             continue
         if owner_status(owner) == "dead":
@@ -1286,11 +1303,13 @@ def _cancel_process_group(process_group: int, *, deadline: float | None = None) 
 def _wait_for_process_group_state(process_group: int, *, deadline: float) -> bool:
     while time.monotonic() < deadline:
         try:
-            return _process_group_running(
+            if not _process_group_running(
                 process_group, timeout=max(0.01, min(1, deadline - time.monotonic()))
-            )
+            ):
+                return False
         except (OSError, subprocess.SubprocessError):
-            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            pass
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     raise GitError("Cannot confirm Git process-group termination")
 
 

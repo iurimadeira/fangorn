@@ -10,10 +10,12 @@ import stat
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
+from types import MappingProxyType
 from typing import Literal, cast
 from uuid import uuid4
 
@@ -99,10 +101,13 @@ class ResourceDefinition:
     kind: Literal["worktree", "service", "terminal"]
     adapter_id: str
     adapter_api_major: int
-    configuration: dict[str, object]
+    configuration: Mapping[str, object]
     external_reference: str | None
     locator: str
     ownership_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "configuration", _freeze_mapping(self.configuration))
 
 
 @dataclass(frozen=True)
@@ -118,9 +123,14 @@ class WorkspaceDefinition:
     repository_id: str
     created_from_sha: str
     configuration: bytes
-    configuration_value: dict[str, object]
+    configuration_value: Mapping[str, object]
     configuration_digest: str
     resources: tuple[ResourceDefinition, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "configuration_value", _freeze_mapping(self.configuration_value)
+        )
 
 
 @dataclass(frozen=True)
@@ -868,6 +878,18 @@ def _configuration_value(content: bytes | None) -> dict[str, object]:
     return value
 
 
+def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
+
+
+def _freeze_value(value: object) -> object:
+    if isinstance(value, dict):
+        return _freeze_mapping(value)
+    if isinstance(value, list):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
 def _current_process_identity() -> ProcessIdentity:
     return ProcessIdentity(
         process_instance_id=str(uuid4()),
@@ -891,8 +913,9 @@ def _boot_identity() -> str:
             check=False,
             capture_output=True,
             text=True,
+            timeout=2,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise WorkspaceError("Cannot establish host boot identity") from error
     match = re.search(r"sec\s*=\s*(\d+).*usec\s*=\s*(\d+)", result.stdout)
     if result.returncode == 0 and match:
@@ -908,13 +931,17 @@ def _process_start_identity(pid: int) -> str:
     except (OSError, IndexError):
         environment = os.environ.copy()
         environment.update({"LANG": "C", "LC_ALL": "C", "TZ": "UTC"})
-        result = subprocess.run(  # noqa: S603
-            ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        try:
+            result = subprocess.run(  # noqa: S603
+                ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise WorkspaceError("Cannot establish process start identity") from error
         if result.returncode != 0 or not result.stdout.strip():
             raise WorkspaceError("Cannot establish process start identity") from None
         return result.stdout.strip()
