@@ -373,6 +373,32 @@ def test_clone_cache_reuses_only_matching_bare_repository(tmp_path: Path) -> Non
         materialize_cache(source, invalid_cache)
 
 
+def test_clone_cache_permissions_do_not_depend_on_follow_symlinks_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_repository = tmp_path / "source"
+    repository(source_repository)
+    cache = tmp_path / "cache" / "repository.git"
+    real_chmod = os.chmod
+
+    def chmod_without_follow_symlinks(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if not follow_symlinks:
+            raise NotImplementedError
+        real_chmod(path, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "chmod", chmod_without_follow_symlinks)
+
+    materialize_cache(normalize_repository_source(source_repository.as_uri()), cache)
+
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o700
+
+
 def test_interrupted_refresh_is_replayed_without_completion_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2537,6 +2563,83 @@ def test_worktree_creation_rejects_executable_filters(tmp_path: Path) -> None:
     assert not (tmp_path / "target").exists()
 
 
+def test_matching_staged_worktree_rejects_executable_worktree_configuration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    git(source, "config", "extensions.worktreeConfig", "true")
+    target = tmp_path / "target"
+    token = "4" * 64
+    staging = target.parent / f".fangorn-{token}"
+    receipt = target.parent / f".fangorn-{token}.intent"
+    invoked = tmp_path / "filter-invoked"
+    git(source, "worktree", "add", "-b", "topic", str(staging), commit)
+    observation = observe_worktree(staging)
+    establish_worktree_generation(observation.git_dir, token)
+    receipt.write_text(token, encoding="ascii")
+    git(
+        staging,
+        "config",
+        "--worktree",
+        "filter.evil.smudge",
+        f"touch {invoked}",
+    )
+
+    with pytest.raises(GitError, match="executable checkout configuration"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
+
+    assert staging.exists()
+    assert not target.exists()
+    assert not invoked.exists()
+
+
+def test_matching_final_worktree_rejects_tampered_executable_configuration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    git(source, "config", "extensions.worktreeConfig", "true")
+    target = tmp_path / "target"
+    token = "3" * 64
+    invoked = tmp_path / "filter-invoked"
+    create_worktree(
+        source,
+        target=target,
+        branch="topic",
+        commit=commit,
+        ownership_token=token,
+        reconcile=False,
+    )
+    git(
+        target,
+        "config",
+        "--worktree",
+        "filter.evil.smudge",
+        f"touch {invoked}",
+    )
+
+    with pytest.raises(GitError, match="executable checkout configuration"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
+
+    assert target.exists()
+    assert not invoked.exists()
+
+
 def test_checkout_configuration_rejects_core_worktree(tmp_path: Path) -> None:
     source = tmp_path / "repository"
     repository(source)
@@ -2796,12 +2899,12 @@ def test_darwin_private_acl_rejects_read_and_search(
     assert permissions_adapter.descriptor_has_private_acl(10)
 
 
-def test_cache_namespace_rejects_writable_acl(
+def test_cache_namespace_rejects_non_private_acl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
         git_worktree_adapter,
-        "_darwin_acl_allows_write",
+        "_darwin_acl_allows_private_access",
         lambda _descriptor: True,
     )
 
@@ -2811,7 +2914,7 @@ def test_cache_namespace_rejects_writable_acl(
         )
 
 
-def test_staging_rejects_writable_acl_after_fchmod(
+def test_staging_rejects_non_private_acl_after_fchmod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     staging = tmp_path / "staging"
@@ -2819,7 +2922,7 @@ def test_staging_rejects_writable_acl_after_fchmod(
     parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     monkeypatch.setattr(
         git_worktree_adapter,
-        "_darwin_acl_allows_write",
+        "_darwin_acl_allows_private_access",
         lambda _descriptor: True,
     )
     try:
@@ -2827,6 +2930,46 @@ def test_staging_rejects_writable_acl_after_fchmod(
             git_worktree_adapter._secure_staging_directory(parent, staging.name)
     finally:
         os.close(parent)
+
+
+def test_reconciliation_rejects_non_private_target_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    target = tmp_path / "target"
+    token = "2" * 64
+    create_worktree(
+        source,
+        target=target,
+        branch="topic",
+        commit=commit,
+        ownership_token=token,
+        reconcile=False,
+    )
+    target_identity = (target.stat().st_dev, target.stat().st_ino)
+
+    def target_has_non_private_acl(descriptor: int) -> bool:
+        metadata = os.fstat(descriptor)
+        return (metadata.st_dev, metadata.st_ino) == target_identity
+
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_darwin_acl_allows_private_access",
+        target_has_non_private_acl,
+    )
+
+    with pytest.raises(GitError, match="Workspace target path is unsafe"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
+
+    assert target.exists()
 
 
 def test_worktree_creation_rejects_symlinked_repository_configuration(

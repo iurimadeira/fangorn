@@ -25,6 +25,9 @@ from types import FrameType
 from typing import TYPE_CHECKING, BinaryIO, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
+from fangorn._permissions import (
+    descriptor_has_private_acl as _darwin_acl_allows_private_access,
+)
 from fangorn._permissions import descriptor_has_writable_acl
 from fangorn.git import (
     REPOSITORY_LOCAL_ENVIRONMENT,
@@ -341,8 +344,7 @@ def _materialize_remote_cache(
         )
         if result.returncode != 0:
             raise GitError(_git_error(result))
-        os.chmod(clone, 0o700, follow_symlinks=False)
-        _require_owned_cache_path(clone)
+        _secure_private_cache_path(clone)
         _verify_bare_repository(clone, source.normalized, liveness_fd=liveness_fd)
         _refresh_bare_repository(
             clone,
@@ -468,13 +470,9 @@ def _open_cache_directory(parent: int, name: str, flags: int) -> int:
 
 
 def _require_private_cache_directory(metadata: os.stat_result, descriptor: int) -> None:
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
-        or _darwin_acl_allows_write(descriptor)
-    ):
-        raise GitError("Repository cache namespace is unsafe")
+    _require_private_directory(
+        metadata, descriptor, "Repository cache namespace is unsafe"
+    )
 
 
 def _require_owned_cache_directory(metadata: os.stat_result, descriptor: int) -> None:
@@ -493,6 +491,26 @@ def _require_owned_cache_path(path: Path) -> None:
     )
     try:
         _require_owned_cache_directory(os.fstat(descriptor), descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _secure_private_cache_path(path: Path) -> None:
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except OSError as error:
+        raise GitError("Repository cache entry is unsafe") from error
+    try:
+        os.fchmod(descriptor, 0o700)
+        _require_private_directory(
+            os.fstat(descriptor), descriptor, "Repository cache entry is unsafe"
+        )
+    except GitError:
+        raise
+    except OSError as error:
+        raise GitError("Repository cache entry is unsafe") from error
     finally:
         os.close(descriptor)
 
@@ -818,6 +836,14 @@ def create_worktree(
                 raise GitError("Existing target is not owned by this Workspace create")
             if observation.head != commit or observation.branch != branch:
                 raise GitError("Existing target does not match the interrupted create")
+            with _trusted_worktree_checkout_configuration(
+                parent.descriptor,
+                target.name,
+                observation,
+                label="target",
+                liveness_fd=liveness_fd,
+            ):
+                pass
             result = observe_worktree(
                 target,
                 create_repository_generation=True,
@@ -943,6 +969,7 @@ def create_worktree(
             expected_repository_common_dir,
             expected_repository_generation,
         )
+        checkout: tuple[str, ...] | None = None
         if observation.head != commit or observation.branch != branch:
             branch_exists = _run_git_process(
                 repository,
@@ -957,31 +984,27 @@ def create_worktree(
                 if branch_exists.returncode == 0
                 else ("checkout", "-b", branch, commit)
             )
-            _require_target_parent(parent)
-            staging_descriptor = os.open(
-                staging.name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=parent.descriptor,
+        _require_target_parent(parent)
+        with _trusted_worktree_checkout_configuration(
+            parent.descriptor,
+            staging.name,
+            observation,
+            label="staging",
+            liveness_fd=liveness_fd,
+        ) as staging_descriptor:
+            selected = (
+                _run_git_process(
+                    Path("."),
+                    *checkout,
+                    work_tree=Path("."),
+                    liveness_fd=liveness_fd,
+                    extra_fds=(staging_descriptor,),
+                    working_directory_fd=staging_descriptor,
+                )
+                if checkout is not None
+                else None
             )
-            try:
-                with _trusted_checkout_configuration(
-                    observation.repository_common_dir, observation.git_dir
-                ):
-                    _reject_executable_checkout_configuration(
-                        Path("."),
-                        worktree_descriptor=staging_descriptor,
-                        liveness_fd=liveness_fd,
-                    )
-                    selected = _run_git_process(
-                        Path("."),
-                        *checkout,
-                        work_tree=Path("."),
-                        liveness_fd=liveness_fd,
-                        extra_fds=(staging_descriptor,),
-                        working_directory_fd=staging_descriptor,
-                    )
-            finally:
-                os.close(staging_descriptor)
+        if selected is not None:
             if selected.returncode != 0:
                 raise GitError(_git_error(selected))
             _require_target_parent(parent)
@@ -1081,16 +1104,54 @@ def _secure_staging_directory(parent: int, name: str) -> None:
                 raise GitError("Workspace staging path is unsafe")
             os.fchmod(descriptor, 0o700)
             os.fsync(descriptor)
-            if stat.S_IMODE(
-                os.fstat(descriptor).st_mode
-            ) != 0o700 or _darwin_acl_allows_write(descriptor):
-                raise GitError("Workspace staging path is unsafe")
+            _require_private_directory(
+                os.fstat(descriptor),
+                descriptor,
+                "Workspace staging path is unsafe",
+            )
         finally:
             os.close(descriptor)
     except GitError:
         raise
     except OSError as error:
         raise GitError("Workspace staging path is unsafe") from error
+
+
+@contextmanager
+def _trusted_worktree_checkout_configuration(
+    parent: int,
+    name: str,
+    observation: WorktreeObservation,
+    *,
+    label: str,
+    liveness_fd: int | None,
+) -> Iterator[int]:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+    except OSError as error:
+        raise GitError(f"Workspace {label} path is unsafe") from error
+    try:
+        try:
+            _require_private_directory(
+                os.fstat(descriptor), descriptor, f"Workspace {label} path is unsafe"
+            )
+        except OSError as error:
+            raise GitError(f"Workspace {label} path is unsafe") from error
+        with _trusted_checkout_configuration(
+            observation.repository_common_dir, observation.git_dir
+        ):
+            _reject_executable_checkout_configuration(
+                Path("."),
+                worktree_descriptor=descriptor,
+                liveness_fd=liveness_fd,
+            )
+            yield descriptor
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -1365,6 +1426,18 @@ def _require_safe_directory(metadata: os.stat_result, descriptor: int) -> None:
         metadata.st_mode & stat.S_ISVTX
     ):
         raise GitError("Workspace target parent is unsafe")
+
+
+def _require_private_directory(
+    metadata: os.stat_result, descriptor: int, message: str
+) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or _darwin_acl_allows_private_access(descriptor)
+    ):
+        raise GitError(message)
 
 
 def _require_target_parent(parent: _TargetParent) -> None:
