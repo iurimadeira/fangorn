@@ -23,7 +23,12 @@ import fangorn.workspaces as workspaces_module
 from fangorn.git import GitQuiescenceError, observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
 from fangorn.git_worktree import inspect_owned_worktree as real_inspect_owned_worktree
-from fangorn.registry import ProcessIdentity, Registry, RegistryError
+from fangorn.registry import (
+    CreateIntentRecord,
+    ProcessIdentity,
+    Registry,
+    RegistryError,
+)
 from fangorn.workspaces import (
     CreateWorkspace,
     ResourceDefinition,
@@ -893,6 +898,117 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     )
 
 
+def test_lease_owner_probe_does_not_block_unrelated_registry_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "registry.sqlite3"
+    registry = Registry(database)
+    intent, _ = registry.begin_create_intent(
+        request_key="contested",
+        request_id=None,
+        request_json="{}",
+        target_path=str(tmp_path / "contested-target"),
+        workspace_id="contested-workspace",
+        operation_id="contested-operation",
+        prepare_cache=True,
+    )
+    old_owner = ProcessIdentity("old", "boot", 1001, "start-old")
+    old_epoch = registry.acquire_lease(
+        scope_kind="repository",
+        scope_key="contested-source",
+        operation_id=intent.operation_id,
+        owner=old_owner,
+        owner_status=lambda _owner: "live",
+    )
+    unrelated: list[CreateIntentRecord] = []
+
+    def prove_dead(_owner: ProcessIdentity) -> str:
+        unrelated.append(
+            Registry(database).begin_create_intent(
+                request_key="unrelated",
+                request_id=None,
+                request_json="{}",
+                target_path=str(tmp_path / "unrelated-target"),
+                workspace_id="unrelated-workspace",
+                operation_id="unrelated-operation",
+                prepare_cache=False,
+            )[0]
+        )
+        return "dead"
+
+    new_epoch = registry.acquire_lease(
+        scope_kind="repository",
+        scope_key="contested-source",
+        operation_id=intent.operation_id,
+        owner=ProcessIdentity("new", "boot", 1002, "start-new"),
+        owner_status=prove_dead,
+    )
+
+    assert new_epoch == old_epoch + 1
+    assert unrelated[0].operation_id == "unrelated-operation"
+
+
+def test_lease_takeover_rechecks_the_exact_owner_after_probe(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "registry.sqlite3"
+    registry = Registry(database)
+    intent, _ = registry.begin_create_intent(
+        request_key="lease-race",
+        request_id=None,
+        request_json="{}",
+        target_path=str(tmp_path / "target"),
+        workspace_id="workspace",
+        operation_id="operation",
+        prepare_cache=True,
+    )
+    old_owner = ProcessIdentity("old", "boot", 1001, "start-old")
+    old_epoch = registry.acquire_lease(
+        scope_kind="repository",
+        scope_key="source",
+        operation_id=intent.operation_id,
+        owner=old_owner,
+        owner_status=lambda _owner: "live",
+    )
+    replacement = ProcessIdentity("replacement", "boot", 1002, "start-new")
+    replacement_epoch: list[int] = []
+
+    def replace_during_probe(owner: ProcessIdentity) -> str:
+        if owner == old_owner:
+            other = Registry(database)
+            other.release_lease(
+                scope_kind="repository",
+                scope_key="source",
+                operation_id=intent.operation_id,
+                lease_epoch=old_epoch,
+            )
+            replacement_epoch.append(
+                other.acquire_lease(
+                    scope_kind="repository",
+                    scope_key="source",
+                    operation_id=intent.operation_id,
+                    owner=replacement,
+                    owner_status=lambda _owner: "live",
+                )
+            )
+            return "dead"
+        return "live"
+
+    with pytest.raises(RegistryError, match="Repository mutation changed during probe"):
+        registry.acquire_lease(
+            scope_kind="repository",
+            scope_key="source",
+            operation_id=intent.operation_id,
+            owner=ProcessIdentity("contender", "boot", 1003, "start-contender"),
+            owner_status=replace_during_probe,
+        )
+
+    registry.release_lease(
+        scope_kind="repository",
+        scope_key="source",
+        operation_id=intent.operation_id,
+        lease_epoch=replacement_epoch[0],
+    )
+
+
 def test_cache_entry_and_step_completion_roll_back_together(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
@@ -1109,7 +1225,9 @@ def test_completion_rejects_observation_from_another_repository(
             "repository_id": "repository-expected",
             "created_from_sha": other_observation.head,
             "configuration": "",
-            "configuration_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "configuration_digest": (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
             "resources": [
                 {
                     "locator": str(other_observation.path),

@@ -1107,6 +1107,24 @@ class Registry:
     ) -> int:
         with self._connection() as connection:
             self._migrate(connection)
+            row = connection.execute(
+                "SELECT * FROM mutation_leases WHERE scope_kind = ? AND scope_key = ?",
+                (scope_kind, scope_key),
+            ).fetchone()
+            inspected = _lease_from_row(row) if row is not None else None
+
+        owner_state: str | None = None
+        if (
+            inspected is not None
+            and inspected.active
+            and not (
+                inspected.owner == owner and inspected.operation_id == operation_id
+            )
+        ):
+            owner_state = owner_status(inspected.owner)
+
+        with self._connection() as connection:
+            self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 if scope_kind == "workspace":
@@ -1124,10 +1142,15 @@ class Registry:
                     "WHERE scope_kind = ? AND scope_key = ?",
                     (scope_kind, scope_key),
                 ).fetchone()
+                current = _lease_from_row(row) if row is not None else None
+                if current != inspected:
+                    raise RegistryError(
+                        f"{scope_kind.capitalize()} mutation changed during probe"
+                    )
                 aggregate_version = self._aggregate_version(
                     connection, scope_kind=scope_kind, scope_key=scope_key
                 )
-                if row is None:
+                if current is None:
                     epoch = 1
                     connection.execute(
                         """
@@ -1150,13 +1173,11 @@ class Registry:
                         ),
                     )
                 else:
-                    previous = _lease_from_row(row)
-                    same_owner = previous.owner == owner
-                    if previous.active and not (
-                        same_owner and previous.operation_id == operation_id
+                    same_owner = current.owner == owner
+                    if current.active and not (
+                        same_owner and current.operation_id == operation_id
                     ):
-                        status = owner_status(previous.owner)
-                        if status != "dead":
+                        if owner_state != "dead":
                             raise RegistryError(
                                 f"{scope_kind.capitalize()} mutation is busy"
                             )
@@ -1165,12 +1186,12 @@ class Registry:
                             UPDATE operation_steps SET status = 'unknown'
                             WHERE operation_id = ? AND status = 'running'
                             """,
-                            (previous.operation_id,),
+                            (current.operation_id,),
                         )
-                    if previous.active and same_owner:
-                        epoch = previous.epoch
+                    if current.active and same_owner:
+                        epoch = current.epoch
                     else:
-                        epoch = previous.epoch + 1
+                        epoch = current.epoch + 1
                         connection.execute(
                             """
                             UPDATE mutation_leases
