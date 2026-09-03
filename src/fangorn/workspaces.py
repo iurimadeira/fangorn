@@ -466,6 +466,7 @@ class Workspaces:
                     scope_key=intent.workspace_id,
                     lease_epoch=lease_epoch,
                     enter_state=step.enter_state,
+                    reconcile_completed=step.action == "create",
                 )
                 if step.action == "create":
                     observation = create_worktree(
@@ -489,7 +490,7 @@ class Workspaces:
                         expected_repository_generation=expected_repository_generation,
                         liveness_fd=self._invocation_descriptor(owner),
                     )
-                if previous != "completed":
+                if step.action == "create" or previous != "completed":
                     self._registry.finish_operation_step(
                         intent.operation_id,
                         position=position,

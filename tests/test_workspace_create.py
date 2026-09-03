@@ -753,6 +753,7 @@ def test_clone_retry_reuses_completed_cache_while_origin_is_offline(
 ) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
+    database = tmp_path / "state" / "registry.sqlite3"
     workspaces = facade(tmp_path)
     request = CreateWorkspace(
         repository=repository.as_uri(),
@@ -771,12 +772,26 @@ def test_clone_retry_reuses_completed_cache_while_origin_is_offline(
     monkeypatch.setattr("fangorn.workspaces.create_worktree", interrupt_after_effect)
     with pytest.raises(SimulatedInterruption):
         workspaces.create(request)
+    with sqlite3.connect(database) as connection:
+        completed_cache_step = connection.execute(
+            "SELECT status, result_json FROM operation_steps WHERE position = 0"
+        ).fetchone()
+    assert completed_cache_step is not None
+    assert completed_cache_step[0] == "completed"
+    assert completed_cache_step[1] is not None
     repository.rename(tmp_path / "origin-offline")
     monkeypatch.setattr("fangorn.workspaces.create_worktree", real_create_worktree)
 
     recovered = workspaces.create(request)
 
     assert recovered.workspace.state == "ready"
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT status, result_json FROM operation_steps WHERE position = 0"
+            ).fetchone()
+            == completed_cache_step
+        )
 
 
 def test_clone_retry_reconciles_uncommitted_cache_effect_while_origin_is_offline(
@@ -926,6 +941,23 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
         )
         == "unknown"
     )
+    registry.finish_operation_step(
+        intent.operation_id,
+        position=0,
+        scope_kind="repository",
+        scope_key="source",
+        lease_epoch=new_epoch,
+        result={"path": "/recovered"},
+    )
+    with pytest.raises(RegistryError, match="step is unavailable"):
+        registry.finish_operation_step(
+            intent.operation_id,
+            position=0,
+            scope_kind="repository",
+            scope_key="source",
+            lease_epoch=new_epoch,
+            result={"path": "/duplicate"},
+        )
 
 
 def test_lease_owner_probe_does_not_block_unrelated_registry_writes(
@@ -1959,10 +1991,16 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
 def test_retry_recreates_absent_worktree_after_completed_create_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(workspaces_module, "_boot_identity", lambda: "current-boot")
     repository = tmp_path / "repository"
     create_repository(repository)
     target = tmp_path / "worktrees" / "receipt-committed"
-    workspaces = facade(tmp_path)
+    workspaces = Workspaces(
+        Registry(tmp_path / "state" / "registry.sqlite3"),
+        data_home=tmp_path / "data",
+        cache_home=tmp_path / "cache",
+        process_identity=ProcessIdentity("old", "old-boot", 2**30, "old-start"),
+    )
     request = CreateWorkspace(
         repository=str(repository),
         branch="receipt-committed",
@@ -1992,14 +2030,46 @@ def test_retry_recreates_absent_worktree_after_completed_create_receipt(
 
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
         assert connection.execute(
-            "SELECT status FROM operation_steps WHERE position = 0"
-        ).fetchone() == ("completed",)
+            "SELECT status, result_json FROM operation_steps WHERE position = 0"
+        ).fetchone() == ("completed", '{"observation":"ready"}')
     assert not target.exists()
 
-    retried = workspaces.create(request)
+    def fail_quiescence_after_recreate(*args: object, **kwargs: object) -> object:
+        with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT status, result_json FROM operation_steps WHERE position = 0"
+            ).fetchone() == ("running", None)
+        real_create_worktree(*args, **kwargs)  # type: ignore[arg-type]
+        raise GitQuiescenceError("Cannot confirm Git process-group termination")
+
+    monkeypatch.setattr(
+        "fangorn.workspaces.create_worktree", fail_quiescence_after_recreate
+    )
+    with pytest.raises(WorkspaceError, match="Cannot confirm Git process-group"):
+        workspaces.create(request)
+
+    assert target.exists()
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        interrupted_epoch = connection.execute(
+            "SELECT epoch FROM mutation_leases WHERE scope_kind = 'workspace'"
+        ).fetchone()[0]
+        assert connection.execute(
+            "SELECT status, result_json FROM operation_steps WHERE position = 0"
+        ).fetchone() == ("running", None)
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", real_create_worktree)
+    retried = facade(tmp_path).create(request)
 
     assert retried.workspace.state == "ready"
     assert retried.workspace.path == str(target.resolve())
+    assert retried.operation.status == "completed"
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT status, result_json FROM operation_steps WHERE position = 0"
+        ).fetchone() == ("completed", '{"observation":"ready"}')
+        assert connection.execute(
+            "SELECT epoch, active FROM mutation_leases WHERE scope_kind = 'workspace'"
+        ).fetchone() == (interrupted_epoch + 1, 0)
 
 
 def test_cleanup_persistence_failure_is_reported_with_effect_failure(

@@ -1255,6 +1255,7 @@ class Registry:
         scope_key: str,
         lease_epoch: int,
         enter_state: str | None = None,
+        reconcile_completed: bool = False,
     ) -> str:
         if enter_state is not None and (
             scope_kind != "workspace" or enter_state != "starting"
@@ -1279,9 +1280,10 @@ class Registry:
                 if row is None:
                     raise RegistryError("Workspace operation step is unavailable")
                 status = str(row["status"])
-                if status != "completed":
+                if status != "completed" or reconcile_completed:
                     connection.execute(
-                        "UPDATE operation_steps SET status = 'running' "
+                        "UPDATE operation_steps "
+                        "SET status = 'running', result_json = NULL "
                         "WHERE operation_id = ? AND position = ?",
                         (operation_id, position),
                     )
@@ -1328,7 +1330,7 @@ class Registry:
                     """
                     UPDATE operation_steps
                     SET status = 'completed', result_json = ?
-                    WHERE operation_id = ? AND position = ?
+                    WHERE operation_id = ? AND position = ? AND status = 'running'
                     """,
                     (
                         json.dumps(result, sort_keys=True, separators=(",", ":")),

@@ -60,15 +60,33 @@ immutable ownership token. Branch and HEAD can change after creation as normal
 operational Git facts. `--no-start` provisions the Worktree and returns
 `stopped`. Use `--base REF` to resolve another commit once, `--request-id KEY`
 for caller idempotency, and `--config PATH` to snapshot an explicit
-`fangorn.toml`. Configuration is capped at 1 MiB whether read from that path or
-from the resolved commit. Every component of an explicit configuration path
-must be a real, non-symlink filesystem entry.
+`fangorn.toml`.
+
+Without `--path`, Fangorn chooses a deterministic target below
+`$XDG_DATA_HOME/fangorn/worktrees/<repository>/` (falling back to
+`$HOME/.local/share`) from the source, branch, base, and request ID. Target
+paths are canonicalized before state is written. Existing parent components
+must be real directories owned by root or the current user; non-sticky group-
+or world-writable parents, dangling symlinks, and symlink loops are rejected.
+An existing target is accepted only when retry evidence proves it is the
+Worktree Resource owned by the same create operation.
+
+F2 configuration accepts only `schema_version = 1` and an optional empty
+`[services]` table because Service Resources are not available yet. Without
+`--config`, Fangorn reads `fangorn.toml` from the resolved commit; when no file
+exists, the value defaults to `schema_version = 1`. Configuration is capped at
+1 MiB, and its exact bytes, parsed value, and digest are snapshotted for retries.
+Every component of an explicit configuration path must be a real, non-symlink
+filesystem entry.
 
 Equivalent retries return the same Workspace ID, resolved `created_from_sha`,
 target path, and completed operation. Reusing a request ID or target path with
 different immutable fields fails before Git effects. Clone URLs use a shared
-cache under `$XDG_CACHE_HOME/fangorn/repositories`; its acquisition and every
-Workspace mutation use recoverable fenced leases.
+cache under `$XDG_CACHE_HOME/fangorn/repositories/<registry-namespace>/`
+(falling back to `$HOME/.cache`). The namespace is the SHA-256 identity of the
+resolved Registry path, and each normalized source has its own SHA-256-named
+bare repository. Cache namespace directories are private to the current user.
+Cache acquisition and every Workspace mutation use recoverable fenced leases.
 
 Supervised Git effects have a one-hour deadline and retain at most 8 MiB per
 output stream. Hitting either limit fails creation with retryable journal
@@ -81,12 +99,18 @@ remains, an operator may remove its marker from
 `$XDG_STATE_HOME/fangorn/invocations/` (default
 `~/.local/state/fangorn/invocations/`) to permit retry.
 
-Machine output uses schema 2:
+Machine create output uses schema 2:
 
 ```sh
 fangorn --json workspace create --repo ./my-repository \
   --branch feature --headless
 ```
+
+The top-level shape is `schema_version`, `created`, `workspace`, and
+`operation`. `workspace` separates immutable `definition` (including the
+configuration snapshot and Resource definitions) from `resource_states`, then
+reports aggregate `state`, `version`, `path`, and `branch`. `operation` reports
+its `id`, `kind`, and `status`.
 
 ## Inspect compatibility records
 
