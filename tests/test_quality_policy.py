@@ -7,6 +7,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_readme_documents_public_facade_without_legacy_adopt_flow() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "fangorn.workspaces.Workspaces" in readme
+    assert "fangorn adopt" not in readme
+
+
 def test_local_quality_configuration_matches_the_public_contract() -> None:
     with (PROJECT_ROOT / "pyproject.toml").open("rb") as file:
         pyproject = tomllib.load(file)

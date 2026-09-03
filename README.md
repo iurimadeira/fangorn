@@ -3,9 +3,8 @@
 Worktree-native workspace families for humans and agents.
 
 Fangorn records each Workspace as one immutable binding to one real Git
-worktree. This first release can adopt existing worktrees, inspect their
-current Git facts, and enumerate registered Workspaces without moving or
-changing any checkout.
+worktree. This compatibility release can inspect current Git facts and
+enumerate registered Workspaces without moving or changing any checkout.
 
 ## Requirements
 
@@ -31,32 +30,35 @@ pipx install fangorn-cli
 
 ## Use
 
-Adopt the worktree containing the current directory:
-
-```sh
-fangorn adopt
-```
-
-Inspect it later or list all adopted Workspaces:
+Inspect the Workspace containing the current directory or list registered
+Workspaces:
 
 ```sh
 fangorn info
 fangorn list
 ```
 
-Pass another worktree path to `adopt` or `info`. Adoption is idempotent: an
-equivalent retry returns the existing Workspace instead of creating another
-identity.
+Pass another worktree path to `info`. Inspection and listing are strictly
+read-only: they do not initialize or migrate state, update timestamps, establish
+identity markers, or modify Git metadata.
 
-During adoption, Fangorn atomically creates two distinct private random
-generation markers: one in the repository's canonical Git common directory and
-one in the worktree's canonical Git administrative directory. It stores both
-generations in the registry and refuses missing, malformed, or changed markers
-later. Fangorn does not modify worktree files, branches, the index, or
-repository content.
+Python callers use the same application facade as the CLI:
 
-Human-readable output is the default. `adopt` and `info` accept `--json`;
-`list` accepts `--json` or `--ndjson`. Every machine record includes
+```python
+from pathlib import Path
+
+from fangorn.workspaces import Workspaces
+
+workspaces = Workspaces.from_environment()
+workspace = workspaces.inspect(Path("."))
+registered = workspaces.list()
+```
+
+`fangorn.workspaces.Workspaces` owns Workspace lifecycle behavior; Click only
+parses arguments and renders results.
+
+Human-readable output is the default. `info` accepts `--json`; `list` accepts
+`--json` or `--ndjson`. Every machine record includes
 `schema_version: 1`, and errors go to stderr with a nonzero exit status.
 
 State is stored in `$XDG_STATE_HOME/fangorn/registry.sqlite3`, or in

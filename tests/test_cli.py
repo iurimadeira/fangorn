@@ -21,16 +21,71 @@ from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from click.testing import CliRunner
 from git_helpers import git, initialize_repository
 
 import fangorn
+import fangorn.cli as cli_adapter
 import fangorn.git as git_adapter
 import fangorn.registry as registry_adapter
+import fangorn.workspaces as workspaces_adapter
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
 from fangorn.registry import Registry, RegistryError
+from fangorn.workspaces import (
+    AdoptionResult,
+    Binding,
+    CurrentGitFacts,
+    Workspace,
+    WorkspaceError,
+    Workspaces,
+)
 
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
+
+GOLDEN_WORKSPACE = Workspace(
+    binding=Binding(
+        id="workspace-1",
+        repository_id="repository-1",
+        repository_common_dir="/git/common",
+        git_common_dir_generation="a" * 64,
+        git_dir="/git/common/worktrees/workspace-1",
+        git_dir_generation="b" * 64,
+        adopted_head="1" * 40,
+        created_at="2026-01-02T03:04:05.000006Z",
+    ),
+    current_git_facts=CurrentGitFacts(
+        path="/worktrees/workspace-1",
+        branch="topic",
+        head="2" * 40,
+        observed_at="2026-02-03T04:05:06.000007Z",
+    ),
+)
+GOLDEN_SCHEMA_1_WORKSPACE: dict[str, object] = {
+    "id": "workspace-1",
+    "repository_id": "repository-1",
+    "repository_common_dir": "/git/common",
+    "git_common_dir_generation": "a" * 64,
+    "git_dir": "/git/common/worktrees/workspace-1",
+    "git_dir_generation": "b" * 64,
+    "path": "/worktrees/workspace-1",
+    "branch": "topic",
+    "head": "2" * 40,
+    "adopted_head": "1" * 40,
+    "created_at": "2026-01-02T03:04:05.000006Z",
+    "last_observed_at": "2026-02-03T04:05:06.000007Z",
+}
+
+
+class GoldenWorkspaces:
+    def adopt(self, _path: Path) -> AdoptionResult:
+        return AdoptionResult(workspace=GOLDEN_WORKSPACE, created=True)
+
+    def inspect(self, _path: Path) -> Workspace:
+        return GOLDEN_WORKSPACE
+
+    def list(self) -> list[Workspace]:
+        return [GOLDEN_WORKSPACE]
 
 
 def fangorn_executable() -> Path:
@@ -73,7 +128,224 @@ def create_repository(path: Path) -> str:
     return git(path, "rev-parse", "HEAD")
 
 
-def test_help_exposes_bootstrap_commands() -> None:
+def snapshot_tree(path: Path) -> dict[str, tuple[int, int, bytes | None]]:
+    return {
+        str(entry.relative_to(path)): (
+            entry.lstat().st_mode,
+            entry.lstat().st_mtime_ns,
+            entry.read_bytes() if stat.S_ISREG(entry.lstat().st_mode) else None,
+        )
+        for entry in sorted(path.rglob("*"))
+    }
+
+
+def registry_rows(database: Path) -> tuple[list[tuple[Any, ...]], ...]:
+    connection = sqlite3.connect(database)
+    try:
+        return (
+            connection.execute(
+                "SELECT * FROM schema_migrations ORDER BY version"
+            ).fetchall(),
+            connection.execute("SELECT * FROM repositories ORDER BY id").fetchall(),
+            connection.execute("SELECT * FROM workspaces ORDER BY id").fetchall(),
+            connection.execute(
+                "SELECT * FROM observation_clock ORDER BY singleton"
+            ).fetchall(),
+        )
+    finally:
+        connection.close()
+
+
+def schema_1_workspace(workspace: Workspace) -> dict[str, object]:
+    binding = workspace.binding
+    facts = workspace.current_git_facts
+    return {
+        "id": binding.id,
+        "repository_id": binding.repository_id,
+        "repository_common_dir": binding.repository_common_dir,
+        "git_common_dir_generation": binding.git_common_dir_generation,
+        "git_dir": binding.git_dir,
+        "git_dir_generation": binding.git_dir_generation,
+        "path": facts.path,
+        "branch": facts.branch,
+        "head": facts.head,
+        "adopted_head": binding.adopted_head,
+        "created_at": binding.created_at,
+        "last_observed_at": facts.observed_at,
+    }
+
+
+def test_cli_machine_output_matches_exact_schema_1_golden_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade = GoldenWorkspaces()
+    monkeypatch.setattr(
+        Workspaces,
+        "from_environment",
+        staticmethod(lambda: facade),
+    )
+    runner = CliRunner()
+
+    adopted = runner.invoke(cli_adapter.main, ["adopt", "--json", "/requested"])
+    inspected = runner.invoke(cli_adapter.main, ["info", "--json", "/requested"])
+    listed = runner.invoke(cli_adapter.main, ["list", "--json"])
+    streamed = runner.invoke(cli_adapter.main, ["list", "--ndjson"])
+
+    expected_adopt = {
+        "schema_version": 1,
+        "created": True,
+        "workspace": GOLDEN_SCHEMA_1_WORKSPACE,
+    }
+    expected_info = {
+        "schema_version": 1,
+        "workspace": GOLDEN_SCHEMA_1_WORKSPACE,
+    }
+    expected_list = {
+        "schema_version": 1,
+        "workspaces": [GOLDEN_SCHEMA_1_WORKSPACE],
+    }
+    for result in (adopted, inspected, listed, streamed):
+        assert result.exit_code == 0, result.output
+        assert result.stderr == ""
+    assert (
+        adopted.stdout
+        == json.dumps(expected_adopt, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    assert (
+        inspected.stdout
+        == json.dumps(expected_info, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    assert (
+        listed.stdout
+        == json.dumps(expected_list, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    assert [json.loads(line) for line in streamed.stdout.splitlines()] == [
+        expected_info
+    ]
+
+
+def test_cli_and_public_facade_machine_results_match_for_shipped_successes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setattr(
+        git_adapter, "_timestamp", lambda: "2026-03-04T05:06:07.000008Z"
+    )
+    workspaces = Workspaces.from_environment()
+    workspaces.adopt(repository)
+    runner = CliRunner()
+
+    python_adopt = workspaces.adopt(repository)
+    cli_adopt = runner.invoke(cli_adapter.main, ["adopt", "--json", str(repository)])
+    python_info = workspaces.inspect(repository)
+    cli_info = runner.invoke(cli_adapter.main, ["info", "--json", str(repository)])
+    python_list = workspaces.list()
+    cli_list = runner.invoke(cli_adapter.main, ["list", "--json"])
+
+    for result in (cli_adopt, cli_info, cli_list):
+        assert result.exit_code == 0, result.output
+        assert result.stderr == ""
+    cli_adopt_payload = cast(dict[str, object], json.loads(cli_adopt.stdout))
+    assert cli_adopt_payload == {
+        "schema_version": 1,
+        "created": python_adopt.created,
+        "workspace": schema_1_workspace(python_adopt.workspace),
+    }
+    assert json.loads(cli_info.stdout) == {
+        "schema_version": 1,
+        "workspace": schema_1_workspace(python_info),
+    }
+    assert json.loads(cli_list.stdout) == {
+        "schema_version": 1,
+        "workspaces": [schema_1_workspace(workspace) for workspace in python_list],
+    }
+
+
+def test_cli_and_public_facade_errors_match_for_shipped_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invalid_path = tmp_path / "not-a-directory"
+    invalid_path.write_text("file\n", encoding="utf-8")
+    adopt_state = tmp_path / "adopt-state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(adopt_state))
+    with pytest.raises(WorkspaceError) as adopt_failure:
+        Workspaces.from_environment().adopt(invalid_path)
+
+    cli_adopt = run_fangorn(adopt_state, "adopt", "--json", str(invalid_path))
+
+    assert cli_adopt.returncode != 0
+    assert cli_adopt.stdout == ""
+    assert cli_adopt.stderr == f"Error: {adopt_failure.value}\n"
+
+    list_state = tmp_path / "list-state"
+    list_state.mkdir()
+    (list_state / "fangorn").write_text("not a directory\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_STATE_HOME", str(list_state))
+    with pytest.raises(WorkspaceError) as list_failure:
+        Workspaces.from_environment().list()
+
+    cli_list = run_fangorn(list_state, "list", "--json")
+
+    assert cli_list.returncode != 0
+    assert cli_list.stdout == ""
+    assert cli_list.stderr == f"Error: {list_failure.value}\n"
+
+
+def test_populated_list_is_read_only_through_facade_and_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    workspaces = Workspaces.from_environment()
+    adopted = workspaces.adopt(repository).workspace
+    database = state_home / "fangorn" / "registry.sqlite3"
+    git_before = snapshot_tree(repository / ".git")
+    state_before = snapshot_tree(state_home)
+    rows_before = registry_rows(database)
+
+    def reject_git_observation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("list must not observe Git")
+
+    monkeypatch.setattr(workspaces_adapter, "observe_worktree", reject_git_observation)
+    direct = workspaces.list()
+
+    wrapper_directory = tmp_path / "bin"
+    wrapper_directory.mkdir()
+    git_called = tmp_path / "git-called"
+    wrapper = wrapper_directory / "git"
+    wrapper.write_text(
+        '#!/bin/sh\nprintf called > "$FANGORN_TEST_GIT_CALLED"\nexit 97\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    listed = run_fangorn(
+        state_home,
+        "list",
+        "--json",
+        environment_overrides={
+            "PATH": f"{wrapper_directory}{os.pathsep}{os.environ['PATH']}",
+            "FANGORN_TEST_GIT_CALLED": str(git_called),
+        },
+    )
+
+    assert direct == [adopted]
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout) == {
+        "schema_version": 1,
+        "workspaces": [schema_1_workspace(adopted)],
+    }
+    assert not git_called.exists()
+    assert registry_rows(database) == rows_before
+    assert snapshot_tree(state_home) == state_before
+    assert snapshot_tree(repository / ".git") == git_before
+
+
+def test_help_exposes_reads_but_keeps_legacy_adopt_hidden() -> None:
     result = subprocess.run(  # noqa: S603 -- test controls executable and argv
         [fangorn_executable(), "--help"],
         check=False,
@@ -83,9 +355,74 @@ def test_help_exposes_bootstrap_commands() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Worktree-native workspace families" in result.stdout
-    assert "adopt" in result.stdout
+    assert "adopt" not in result.stdout
     assert "info" in result.stdout
     assert "list" in result.stdout
+
+    legacy = subprocess.run(  # noqa: S603 -- test controls executable and argv
+        [fangorn_executable(), "adopt", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert legacy.returncode == 0, legacy.stderr
+    assert "Adopt an existing Git worktree" in legacy.stdout
+
+
+def test_cli_reads_do_not_initialize_missing_state(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+
+    listed = run_fangorn(state_home, "list", "--json")
+    inspected = run_fangorn(state_home, "info", "--json", str(repository))
+
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout) == {"schema_version": 1, "workspaces": []}
+    assert inspected.returncode != 0
+    assert "Worktree is not adopted" in inspected.stderr
+    assert not state_home.exists()
+    assert not (repository / ".git" / GENERATION_MARKER_NAME).exists()
+    assert not (repository / ".git" / REPOSITORY_GENERATION_MARKER_NAME).exists()
+
+
+def test_cli_list_matches_public_python_facade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    workspaces = Workspaces.from_environment()
+    workspaces.adopt(repository)
+
+    expected = {
+        "schema_version": 1,
+        "workspaces": [
+            schema_1_workspace(workspace) for workspace in workspaces.list()
+        ],
+    }
+    listed = run_fangorn(state_home, "list", "--json")
+
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout) == expected
+
+
+def test_cli_info_failure_matches_public_python_facade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    with pytest.raises(WorkspaceError) as raised:
+        Workspaces.from_environment().inspect(repository)
+    inspected = run_fangorn(state_home, "info", "--json", str(repository))
+
+    assert inspected.returncode != 0
+    assert inspected.stdout == ""
+    assert inspected.stderr == f"Error: {raised.value}\n"
 
 
 def test_package_version_comes_from_distribution_metadata(
@@ -1471,6 +1808,21 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     adopted_payload = cast(dict[str, object], json.loads(adopted.stdout))
     adopted_workspace = cast(dict[str, object], adopted_payload["workspace"])
     workspace_id = adopted_workspace["id"]
+    database = state_home / "fangorn" / "registry.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        stored_before = connection.execute(
+            """
+            SELECT path, branch, head, last_observed_at, last_observation_token
+            FROM workspaces WHERE id = ?
+            """,
+            (workspace_id,),
+        ).fetchone()
+        clock_before = connection.execute(
+            "SELECT current_token FROM observation_clock WHERE singleton = 1"
+        ).fetchone()
+    finally:
+        connection.close()
     nested_path = repository / "nested" / "directory"
     nested_path.mkdir(parents=True)
     git(repository, "branch", "-m", "topic")
@@ -1490,6 +1842,26 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     assert human.stdout.startswith(f"Workspace {workspace_id}\n")
     assert f"Path: {repository.resolve()}\n" in human.stdout
     assert "Branch: topic\n" in human.stdout
+    connection = sqlite3.connect(database)
+    try:
+        assert (
+            connection.execute(
+                """
+            SELECT path, branch, head, last_observed_at, last_observation_token
+            FROM workspaces WHERE id = ?
+            """,
+                (workspace_id,),
+            ).fetchone()
+            == stored_before
+        )
+        assert (
+            connection.execute(
+                "SELECT current_token FROM observation_clock WHERE singleton = 1"
+            ).fetchone()
+            == clock_before
+        )
+    finally:
+        connection.close()
 
     other_repository = tmp_path / "other"
     create_repository(other_repository)
@@ -2135,7 +2507,9 @@ def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
     assert "schema_migrations" not in tables
 
 
-def test_registry_contention_fails_after_a_bounded_wait(tmp_path: Path) -> None:
+def test_read_only_list_proceeds_during_a_registry_write_transaction(
+    tmp_path: Path,
+) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
     state_home = tmp_path / "state"
@@ -2152,28 +2526,29 @@ def test_registry_contention_fails_after_a_bounded_wait(tmp_path: Path) -> None:
         connection.rollback()
         connection.close()
 
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "Registry remained busy for 2 seconds" in result.stderr
-    assert 1.5 <= elapsed < 6
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["schema_version"] == 1
+    assert elapsed < 1.5
 
 
-def test_registry_repairs_private_state_and_database_permissions(
+def test_read_only_list_does_not_repair_state_or_database_permissions(
     tmp_path: Path,
 ) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
     state_home = tmp_path / "state"
     state_directory = state_home / "fangorn"
-    state_directory.mkdir(parents=True, mode=0o777)
-    state_directory.chmod(0o777)
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
     database = state_directory / "registry.sqlite3"
-    database.touch(mode=0o666)
+    state_directory.chmod(0o777)
     database.chmod(0o666)
 
     result = run_fangorn(state_home, "list", "--json")
 
     assert result.returncode == 0, result.stderr
-    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o700
-    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o777
+    assert stat.S_IMODE(database.stat().st_mode) == 0o666
 
 
 def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> None:
