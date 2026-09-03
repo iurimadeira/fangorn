@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -216,24 +217,13 @@ def materialize_cache(
         _fsync_directory(cache_path.parent, "Repository cache publication")
         return cache_path
     require_supported_git(cache_path.parent, liveness_fd=liveness_fd)
-    prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
+    prefix = _clone_owner_prefix(owner) if owner is not None else "clone-"
     invocation = Path(tempfile.mkdtemp(prefix=prefix, dir=cache_path.parent))
     clone = invocation / "repository.git"
     primary_error: BaseException | None = None
     try:
         if owner is not None:
-            (invocation / "owner.json").write_text(
-                json.dumps(
-                    {
-                        "boot_identity": owner.boot_identity,
-                        "pid": owner.pid,
-                        "process_instance_id": owner.process_instance_id,
-                        "process_start_identity": owner.process_start_identity,
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
+            _write_clone_owner(invocation, owner)
         result = _run_git_process(
             cache_path.parent,
             "clone",
@@ -305,6 +295,7 @@ def _cleanup_abandoned_clones(
     for candidate in parent.iterdir():
         if not candidate.name.startswith("clone-"):
             continue
+        owner_from_name = _clone_owner_from_name(candidate.name)
         try:
             if candidate.is_symlink() or not candidate.is_dir():
                 continue
@@ -327,10 +318,88 @@ def _cleanup_abandoned_clones(
                 process_start_identity=str(value["process_start_identity"]),
             )
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            if owner_from_name is None:
+                continue
+            owner = owner_from_name
+        if owner_from_name is not None and owner != owner_from_name:
             continue
         if owner_status(owner) == "dead":
             with suppress(FileNotFoundError):
                 shutil.rmtree(resolved)
+
+
+def _clone_owner_prefix(owner: ProcessIdentity) -> str:
+    payload = json.dumps(
+        [
+            owner.process_instance_id,
+            owner.boot_identity,
+            owner.pid,
+            owner.process_start_identity,
+        ],
+        separators=(",", ":"),
+    ).encode()
+    encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+    return f"clone-{encoded}."
+
+
+def _clone_owner_from_name(name: str) -> ProcessIdentity | None:
+    from fangorn.registry import ProcessIdentity
+
+    encoded, separator, _suffix = name.removeprefix("clone-").partition(".")
+    if not separator:
+        return None
+    try:
+        payload = base64.b64decode(
+            encoded + "=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+        values = json.loads(payload)
+        if not isinstance(values, list) or len(values) != 4:
+            return None
+        process_instance_id, boot_identity, pid, process_start_identity = values
+        if (
+            not all(
+                isinstance(value, str)
+                for value in (
+                    process_instance_id,
+                    boot_identity,
+                    process_start_identity,
+                )
+            )
+            or type(pid) is not int
+        ):
+            return None
+        return ProcessIdentity(
+            process_instance_id, boot_identity, pid, process_start_identity
+        )
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_clone_owner(invocation: Path, owner: ProcessIdentity) -> None:
+    payload = json.dumps(
+        {
+            "boot_identity": owner.boot_identity,
+            "pid": owner.pid,
+            "process_instance_id": owner.process_instance_id,
+            "process_start_identity": owner.process_start_identity,
+        },
+        sort_keys=True,
+    ).encode()
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".owner.", dir=invocation)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, invocation / "owner.json")
+        _fsync_directory(invocation, "Clone owner publication")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _refresh_bare_repository(
@@ -1053,7 +1122,9 @@ def _run_supervised_git(
                         completion = _read_supervisor_completion(
                             completion_read,
                             deadline=(
-                                deadline if finish_on_parent_exit else time.monotonic()
+                                deadline
+                                if finish_on_parent_exit
+                                else min(deadline, time.monotonic() + 5)
                             ),
                         )
                         if completion is None and process_group is not None:
@@ -1194,29 +1265,36 @@ def _read_capture(stream: BinaryIO, limit: int) -> bytes:
     return (data[: max(0, limit - len(marker))] + marker)[:limit]
 
 
-def _cancel_process_group(process_group: int) -> None:
+def _cancel_process_group(process_group: int, *, deadline: float | None = None) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + 5
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGTERM)
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        if not _wait_for_process_group_state(process_group):
+    try:
+        if not _wait_for_process_group_state(
+            process_group, deadline=min(deadline, time.monotonic() + 2)
+        ):
             return
-        time.sleep(0.01)
+    except GitError:
+        pass
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGKILL)
-    while _wait_for_process_group_state(process_group):
-        time.sleep(0.1)
+    if _wait_for_process_group_state(process_group, deadline=deadline):
+        raise GitError("Cannot confirm Git process-group termination")
 
 
-def _wait_for_process_group_state(process_group: int) -> bool:
-    while True:
+def _wait_for_process_group_state(process_group: int, *, deadline: float) -> bool:
+    while time.monotonic() < deadline:
         try:
-            return _process_group_running(process_group)
+            return _process_group_running(
+                process_group, timeout=max(0.01, min(1, deadline - time.monotonic()))
+            )
         except (OSError, subprocess.SubprocessError):
-            time.sleep(0.1)
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    raise GitError("Cannot confirm Git process-group termination")
 
 
-def _process_group_running(process_group: int) -> bool:
+def _process_group_running(process_group: int, *, timeout: float = 1) -> bool:
     proc = Path("/proc")
     if proc.is_dir():
         parsed = False
@@ -1247,6 +1325,7 @@ def _process_group_running(process_group: int) -> bool:
         env={"LANG": "C", "PATH": "/usr/bin:/bin"},
         start_new_session=True,
         text=True,
+        timeout=timeout,
     )
     running = False
     for line in result.stdout.splitlines():

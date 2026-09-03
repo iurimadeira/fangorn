@@ -7,6 +7,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import suppress
@@ -692,6 +693,34 @@ def test_parent_group_probe_rejects_malformed_ps(
         git_worktree_adapter._process_group_running(77)
 
 
+def test_parent_group_probe_bounds_portable_ps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(["ps"], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert git_worktree_adapter._process_group_running(77, timeout=0.25) is False
+    assert captured["timeout"] == 0.25
+
+
+def test_parent_group_cleanup_stops_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals: list[int] = []
+    monkeypatch.setattr(os, "killpg", lambda _pid, sent: signals.append(sent))
+
+    with pytest.raises(GitError, match="Cannot confirm Git process-group termination"):
+        git_worktree_adapter._cancel_process_group(77, deadline=time.monotonic())
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
 def test_supervised_git_rejects_ignored_sigchld_before_effects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1163,26 +1192,34 @@ def test_abandoned_clone_cleanup_accepts_concurrent_removal(
     assert not abandoned.exists()
 
 
+def test_abandoned_clone_cleanup_recovers_missing_owner_metadata(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "cache"
+    parent.mkdir()
+    dead = ProcessIdentity("dead", "boot", 1001, "start")
+    abandoned = Path(
+        tempfile.mkdtemp(
+            prefix=git_worktree_adapter._clone_owner_prefix(dead), dir=parent
+        )
+    )
+
+    git_worktree_adapter._cleanup_abandoned_clones(parent, lambda _owner: "dead")
+
+    assert not abandoned.exists()
+
+
 def test_clone_cache_cleans_invocation_when_owner_metadata_write_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_repository = tmp_path / "source"
     repository(source_repository)
     cache = tmp_path / "cache" / "repository.git"
-    original = Path.write_text
 
-    def fail_owner(
-        path: Path,
-        data: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        if path.name == "owner.json":
-            raise OSError("metadata unavailable")
-        return original(path, data, encoding=encoding, errors=errors, newline=newline)
+    def fail_owner(_path: Path, _owner: ProcessIdentity) -> None:
+        raise OSError("metadata unavailable")
 
-    monkeypatch.setattr(Path, "write_text", fail_owner)
+    monkeypatch.setattr(git_worktree_adapter, "_write_clone_owner", fail_owner)
     with pytest.raises(OSError, match="metadata unavailable"):
         materialize_cache(
             normalize_repository_source(source_repository.as_uri()),

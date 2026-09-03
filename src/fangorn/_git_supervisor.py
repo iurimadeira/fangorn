@@ -252,6 +252,7 @@ def _process_group_running(process_group: int) -> bool:
         env={"LANG": "C", "PATH": "/usr/bin:/bin"},
         start_new_session=True,
         text=True,
+        timeout=1,
     )
     running = False
     for line in result.stdout.splitlines():
