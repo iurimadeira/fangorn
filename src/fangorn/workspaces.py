@@ -565,12 +565,13 @@ class Workspaces:
         self, workspace_id: str, *, created: bool = False
     ) -> CreateWorkspaceResult:
         aggregate, operation = self._load_completed(workspace_id)
-        inspect_owned_worktree(
+        observation = inspect_owned_worktree(
             Path(aggregate.path),
             expected_commit=None,
             expected_branch=None,
             ownership_token=aggregate.definition.resources[0].ownership_token,
         )
+        self._registry.inspect_worktree(observation)
         return CreateWorkspaceResult(aggregate, operation, created=created)
 
     def _invocation_process_identity(self) -> ProcessIdentity:

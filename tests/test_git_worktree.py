@@ -13,7 +13,6 @@ from typing import cast
 import pytest
 from git_helpers import git, initialize_repository
 
-import fangorn._git_supervisor as git_supervisor
 import fangorn.git_worktree as git_worktree_adapter
 from fangorn.git import GitError, establish_worktree_generation
 from fangorn.git_worktree import (
@@ -204,16 +203,15 @@ def test_interrupted_refresh_is_replayed_without_completion_receipt(
 
 
 @pytest.mark.parametrize(
-    ("finish_on_parent_exit", "kill_target", "expected"),
+    ("finish_on_parent_exit", "hard_death", "expected"),
     [
-        (False, "owner", "terminated"),
-        (True, "owner", "completed"),
-        (False, "supervisor", "terminated"),
-        (True, "supervisor", "completed"),
+        (False, False, "terminated"),
+        (True, False, "completed"),
+        (False, True, "completed"),
     ],
 )
-def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
-    tmp_path: Path, finish_on_parent_exit: bool, kill_target: str, expected: str
+def test_interrupted_owner_waits_for_git_tree_before_releasing_lease(
+    tmp_path: Path, finish_on_parent_exit: bool, hard_death: bool, expected: str
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -252,7 +250,6 @@ epoch = registry.acquire_lease(scope_kind="repository", scope_key="source",
     operation_id=intent.operation_id, owner=owner, owner_status=w._owner_status)
 print(json.dumps(asdict(owner)), flush=True)
 try:
-    os.chdir(sys.argv[3])
     _run_git_process(Path.cwd(), "fetch", liveness_fd=w._invocation_descriptor(owner),
         finish_on_parent_exit=sys.argv[2] == "finish")
 finally:
@@ -264,16 +261,9 @@ finally:
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["FANGORN_STARTED"] = str(started)
     environment["FANGORN_STOPPED"] = str(stopped)
-    environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit else "0"
-    environment["FANGORN_DESCENDANT"] = "1" if not finish_on_parent_exit else "0"
-    hostile = tmp_path / "hostile"
-    hostile_package = hostile / "fangorn"
-    hostile_package.mkdir(parents=True)
-    hostile_marker = tmp_path / "hostile-imported"
-    (hostile_package / "__init__.py").write_text("", encoding="utf-8")
-    (hostile_package / "_git_supervisor.py").write_text(
-        f"from pathlib import Path\nPath({str(hostile_marker)!r}).write_text('bad')\n",
-        encoding="utf-8",
+    environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit or hard_death else "0"
+    environment["FANGORN_DESCENDANT"] = (
+        "1" if not finish_on_parent_exit and not hard_death else "0"
     )
     child = subprocess.Popen(  # noqa: S603 -- fixed interpreter and test script
         [
@@ -282,7 +272,6 @@ finally:
             script,
             str(database),
             "finish" if finish_on_parent_exit else "cancel",
-            str(hostile),
         ],
         stdout=subprocess.PIPE,
         text=True,
@@ -295,18 +284,7 @@ finally:
         time.sleep(0.01)
     assert started.exists()
 
-    if kill_target == "owner":
-        child.send_signal(signal.SIGINT)
-    else:
-        children = Path(f"/proc/{child.pid}/task/{child.pid}/children")
-        deadline = time.monotonic() + 5
-        supervisor_pid = ""
-        while not supervisor_pid and time.monotonic() < deadline:
-            supervisor_pid = children.read_text(encoding="ascii").strip()
-            if not supervisor_pid:
-                time.sleep(0.01)
-        assert supervisor_pid
-        os.kill(int(supervisor_pid), signal.SIGKILL)
+    child.send_signal(signal.SIGKILL if hard_death else signal.SIGINT)
     registry = Registry(database)
     checker = Workspaces(registry)
     with pytest.raises(RegistryError, match="mutation is busy"):
@@ -318,10 +296,19 @@ finally:
             owner_status=checker._owner_status,
         )
     child.wait(timeout=5)
-
+    deadline = time.monotonic() + 5
+    while not stopped.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert stopped.read_text(encoding="utf-8") == expected
-    assert not hostile_marker.exists()
     assert checker._owner_status(owner) == "dead"
+    if hard_death:
+        registry.acquire_lease(
+            scope_kind="repository",
+            scope_key="source",
+            operation_id="operation",
+            owner=ProcessIdentity("new", "boot", os.getpid(), "start"),
+            owner_status=checker._owner_status,
+        )
 
 
 def test_process_group_probe_falls_back_when_proc_is_unavailable(
@@ -329,9 +316,40 @@ def test_process_group_probe_falls_back_when_proc_is_unavailable(
 ) -> None:
     monkeypatch.setattr(Path, "is_dir", lambda _path: False)
 
-    for module in (git_supervisor, git_worktree_adapter):
-        assert module._process_group_running(os.getpgrp()) is True
-        assert module._process_group_running(2**30) is False
+    assert git_worktree_adapter._process_group_running(os.getpgrp()) is True
+    assert git_worktree_adapter._process_group_running(2**30) is False
+
+
+def test_successful_git_drains_term_ignoring_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    group = tmp_path / "group"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'printf "%s" "$$" > "$FANGORN_GROUP"\n'
+        "(trap '' TERM; while :; do sleep 0.05; done) >/dev/null 2>&1 &\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FANGORN_GROUP", str(group))
+    liveness, writer = os.pipe()
+    try:
+        result = git_worktree_adapter._run_git_process(
+            tmp_path, "fetch", liveness_fd=liveness
+        )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+    assert result.returncode == 0
+    assert not git_worktree_adapter._process_group_running(
+        int(group.read_text(encoding="ascii"))
+    )
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:

@@ -167,6 +167,29 @@ def test_equivalent_retry_reuses_resolved_values_and_completed_operation(
     assert retried.operation.status == "completed"
 
 
+@pytest.mark.parametrize("replacement", [None, "f" * 64])
+def test_completed_retry_rejects_repository_generation_drift(
+    tmp_path: Path, replacement: str | None
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "worktrees" / "topic"
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(repository=str(repository), branch="topic", path=target)
+    workspaces.create(request)
+    observation = observe_worktree(target)
+    marker = observation.repository_common_dir / "fangorn-repository-generation"
+    if replacement is None:
+        marker.unlink()
+        message = "repository generation marker is missing"
+    else:
+        marker.write_text(f"{replacement}\n", encoding="ascii")
+        message = "repository generation marker changed"
+
+    with pytest.raises(WorkspaceError, match=message):
+        workspaces.create(request)
+
+
 def test_reused_request_id_with_divergent_definition_conflicts_before_effects(
     tmp_path: Path,
 ) -> None:
