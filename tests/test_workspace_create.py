@@ -348,6 +348,41 @@ def test_create_from_clone_url_uses_journaled_shared_cache(tmp_path: Path) -> No
         ]
 
 
+@pytest.mark.parametrize("unsafe", ["permissive", "symlink"])
+def test_clone_rejects_unsafe_cache_namespace_before_worktree_effect(
+    tmp_path: Path, unsafe: str
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    cache_home = tmp_path / "cache"
+    cache_home.mkdir()
+    namespace = cache_home / "fangorn"
+    if unsafe == "permissive":
+        namespace.mkdir()
+        namespace.chmod(0o777)
+    else:
+        redirected = tmp_path / "redirected-cache"
+        redirected.mkdir()
+        namespace.symlink_to(redirected, target_is_directory=True)
+    target = tmp_path / "worktrees" / f"cache-{unsafe}"
+
+    with pytest.raises(WorkspaceError, match="Repository cache namespace is unsafe"):
+        Workspaces(
+            Registry(tmp_path / "state" / "registry.sqlite3"),
+            data_home=tmp_path / "data",
+            cache_home=cache_home,
+        ).create(
+            CreateWorkspace(
+                repository=repository.as_uri(),
+                branch=f"cache-{unsafe}",
+                path=target,
+                headless=True,
+            )
+        )
+
+    assert not target.exists()
+
+
 def test_clone_cache_is_namespaced_by_registry_identity(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -388,7 +423,7 @@ def test_clone_cache_replacement_is_rejected_before_worktree_effect(
     git(tmp_path, "clone", "--bare", repository.as_uri(), str(cache))
     target = tmp_path / "worktrees" / "second"
 
-    with pytest.raises(WorkspaceError, match="cache generation marker is missing"):
+    with pytest.raises(WorkspaceError, match="Repository cache entry is unsafe"):
         workspaces.create(
             CreateWorkspace(
                 repository=repository.as_uri(), branch="second", path=target

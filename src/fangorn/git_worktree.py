@@ -60,6 +60,14 @@ class _TargetParent:
     inode: int
 
 
+@dataclass(frozen=True)
+class _CacheParent:
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
+
+
 def normalize_repository_source(value: str) -> RepositorySource:
     parsed = urlsplit(value)
     if parsed.scheme:
@@ -195,15 +203,51 @@ def materialize_cache(
     refresh_default_head: bool = True,
     liveness_fd: int | None = None,
     preparation_id: str | None = None,
+    namespace_root: Path | None = None,
 ) -> Path:
     if source.clone_url is None:
         if source.path is None:
             raise GitError("Local repository path is unavailable")
         return source.path
-    _mkdir_durable(cache_path.parent)
+    cache_parent = _prepare_cache_parent(
+        namespace_root or cache_path.parent, cache_path.parent
+    )
+    try:
+        return _materialize_remote_cache(
+            source,
+            cache_path,
+            cache_parent=cache_parent,
+            owner=owner,
+            owner_status=owner_status,
+            refresh=refresh,
+            refresh_default_head=refresh_default_head,
+            liveness_fd=liveness_fd,
+            preparation_id=preparation_id,
+        )
+    finally:
+        os.close(cache_parent.descriptor)
+
+
+def _materialize_remote_cache(
+    source: RepositorySource,
+    cache_path: Path,
+    *,
+    cache_parent: _CacheParent,
+    owner: ProcessIdentity | None,
+    owner_status: Callable[[ProcessIdentity], str] | None,
+    refresh: bool,
+    refresh_default_head: bool,
+    liveness_fd: int | None,
+    preparation_id: str | None,
+) -> Path:
+    clone_url = source.clone_url
+    if clone_url is None:
+        raise GitError("Repository clone URL is unavailable")
+    _require_cache_parent(cache_parent)
     if owner is not None and owner_status is not None:
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
-    if cache_path.exists():
+    _require_cache_parent(cache_parent)
+    if _cache_entry_exists(cache_parent, cache_path.name):
         _verify_bare_repository(cache_path, source.normalized, liveness_fd=liveness_fd)
         if repository_generation(cache_path, create=False) is None:
             raise GitError("Repository cache generation marker is missing")
@@ -220,8 +264,10 @@ def materialize_cache(
                 _write_preparation_receipt(
                     cache_path, preparation_id, refresh_default_head
                 )
-        _fsync_directory(cache_path.parent, "Repository cache publication")
+        _require_cache_parent(cache_parent)
+        _fsync_descriptor(cache_parent.descriptor, "Repository cache publication")
         return cache_path
+    _require_cache_parent(cache_parent)
     require_supported_git(cache_path.parent, liveness_fd=liveness_fd)
     prefix = _clone_owner_prefix(owner) if owner is not None else "clone-"
     invocation = Path(tempfile.mkdtemp(prefix=prefix, dir=cache_path.parent))
@@ -230,17 +276,20 @@ def materialize_cache(
     try:
         if owner is not None:
             _write_clone_owner(invocation, owner)
+        _require_cache_parent(cache_parent)
         result = _run_git_process(
             cache_path.parent,
             "clone",
             "--bare",
             "--",
-            source.clone_url,
+            clone_url,
             str(clone),
             liveness_fd=liveness_fd,
         )
         if result.returncode != 0:
             raise GitError(_git_error(result))
+        os.chmod(clone, 0o700, follow_symlinks=False)
+        _require_owned_cache_directory(clone.stat(follow_symlinks=False))
         _verify_bare_repository(clone, source.normalized, liveness_fd=liveness_fd)
         _refresh_bare_repository(
             clone,
@@ -251,9 +300,14 @@ def materialize_cache(
             raise GitError("Repository cache generation marker is unavailable")
         if preparation_id is not None:
             _write_preparation_receipt(clone, preparation_id, refresh_default_head)
+        _require_cache_parent(cache_parent)
         try:
             os.replace(clone, cache_path)
         except FileExistsError as collision:
+            if not _cache_entry_exists(cache_parent, cache_path.name):
+                raise GitError(
+                    "Repository cache entry collision is unsafe"
+                ) from collision
             _verify_bare_repository(
                 cache_path, source.normalized, liveness_fd=liveness_fd
             )
@@ -270,7 +324,9 @@ def materialize_cache(
                 _write_preparation_receipt(
                     cache_path, preparation_id, refresh_default_head
                 )
-        _fsync_directory(cache_path.parent, "Repository cache publication")
+        _require_cache_parent(cache_parent)
+        _cache_entry_exists(cache_parent, cache_path.name)
+        _fsync_descriptor(cache_parent.descriptor, "Repository cache publication")
         return cache_path
     except BaseException as error:
         primary_error = error
@@ -282,6 +338,7 @@ def materialize_cache(
             and invocation.name.startswith("clone-")
         ):
             try:
+                _require_cache_parent(cache_parent)
                 shutil.rmtree(invocation)
             except FileNotFoundError:
                 pass
@@ -292,6 +349,107 @@ def materialize_cache(
                         f"{cleanup_error}"
                     ) from primary_error
                 raise GitError("Failed to clean clone staging") from cleanup_error
+
+
+def _prepare_cache_parent(namespace_root: Path, parent: Path) -> _CacheParent:
+    if (
+        not namespace_root.is_absolute()
+        or not parent.is_absolute()
+        or ".." in namespace_root.parts
+        or ".." in parent.parts
+    ):
+        raise GitError("Repository cache namespace is unsafe")
+    try:
+        relative = parent.relative_to(namespace_root)
+    except ValueError as error:
+        raise GitError("Repository cache namespace is unsafe") from error
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(namespace_root.anchor, flags)
+    current = Path(namespace_root.anchor)
+    try:
+        _require_safe_directory(os.fstat(descriptor))
+        for part in namespace_root.parts[1:]:
+            child = _open_cache_directory(descriptor, part, flags)
+            current /= part
+            try:
+                if current == namespace_root:
+                    _require_private_cache_directory(os.fstat(child))
+                else:
+                    _require_safe_directory(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        for part in relative.parts:
+            child = _open_cache_directory(descriptor, part, flags)
+            try:
+                _require_private_cache_directory(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        metadata = os.fstat(descriptor)
+        result = _CacheParent(parent, descriptor, metadata.st_dev, metadata.st_ino)
+        descriptor = -1
+        return result
+    except (OSError, GitError) as error:
+        raise GitError("Repository cache namespace is unsafe") from error
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _open_cache_directory(parent: int, name: str, flags: int) -> int:
+    try:
+        return os.open(name, flags, dir_fd=parent)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+        except FileExistsError:
+            pass
+        return os.open(name, flags, dir_fd=parent)
+
+
+def _require_private_cache_directory(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise GitError("Repository cache namespace is unsafe")
+
+
+def _require_owned_cache_directory(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise GitError("Repository cache entry is unsafe")
+
+
+def _require_cache_parent(parent: _CacheParent) -> None:
+    try:
+        metadata = parent.path.stat(follow_symlinks=False)
+        _require_private_cache_directory(metadata)
+    except (OSError, GitError) as error:
+        raise GitError("Repository cache namespace changed during operation") from error
+    if metadata.st_dev != parent.device or metadata.st_ino != parent.inode:
+        raise GitError("Repository cache namespace changed during operation")
+
+
+def _cache_entry_exists(parent: _CacheParent, name: str) -> bool:
+    _require_cache_parent(parent)
+    try:
+        metadata = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    _require_owned_cache_directory(metadata)
+    return True
 
 
 def _cleanup_abandoned_clones(

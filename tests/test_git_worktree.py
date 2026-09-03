@@ -179,7 +179,7 @@ def test_clone_cache_reuses_only_matching_bare_repository(tmp_path: Path) -> Non
         materialize_cache(source, cache)
 
     invalid_cache = tmp_path / "cache" / "not-bare.git"
-    invalid_cache.mkdir()
+    invalid_cache.mkdir(mode=0o700)
     with pytest.raises(GitError, match="not a bare repository"):
         materialize_cache(source, invalid_cache)
 
@@ -1745,6 +1745,29 @@ def test_target_parent_helpers_fail_closed(
         os.close(descriptor)
 
 
+def test_cache_parent_guard_rejects_replacement(tmp_path: Path) -> None:
+    namespace = tmp_path / "cache"
+    parent = namespace / "repositories"
+    guard = git_worktree_adapter._prepare_cache_parent(namespace, parent)
+    moved = tmp_path / "moved-cache"
+    parent.rename(moved)
+    parent.mkdir(mode=0o700)
+    try:
+        with pytest.raises(GitError, match="namespace changed"):
+            git_worktree_adapter._require_cache_parent(guard)
+    finally:
+        os.close(guard.descriptor)
+
+
+def test_cache_parent_guard_rejects_lexical_escape(tmp_path: Path) -> None:
+    namespace = tmp_path / "cache"
+
+    with pytest.raises(GitError, match="namespace is unsafe"):
+        git_worktree_adapter._prepare_cache_parent(
+            namespace, namespace / ".." / "outside"
+        )
+
+
 def test_cache_staging_cleanup_failure_is_visible(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1931,8 +1954,9 @@ def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> N
     source_repository = tmp_path / "source"
     repository(source_repository)
     cache = tmp_path / "cache" / "repository.git"
+    cache.parent.mkdir(mode=0o700)
     abandoned = cache.parent / "clone-dead-private"
-    abandoned.mkdir(parents=True)
+    abandoned.mkdir()
     dead = ProcessIdentity("dead", "boot", 1001, "start")
     (abandoned / "owner.json").write_text(
         json.dumps(
@@ -2149,7 +2173,7 @@ def test_git_adapter_forces_stable_diagnostics_locale(
         return subprocess.CompletedProcess([], 0, b"a" * 40, b"")
 
     monkeypatch.setattr(git_worktree_adapter, "_run_supervised_git", run)
-    resolve_commit(tmp_path, None)
+    git_worktree_adapter._run_git_process(tmp_path, "--version")
 
     assert captured["LC_ALL"] == "C"
     assert captured["LANG"] == "C"

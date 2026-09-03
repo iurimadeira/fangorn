@@ -574,6 +574,7 @@ class Workspaces:
                 refresh_default_head=refresh_default_head,
                 liveness_fd=self._invocation_descriptor(owner),
                 preparation_id=operation_id,
+                namespace_root=cache_home / "fangorn",
             )
             generation = repository_generation(repository, create=entry is None)
             if generation is None:
