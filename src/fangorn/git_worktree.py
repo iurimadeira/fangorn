@@ -890,12 +890,10 @@ def _run_supervised_git(
                 os.close(status_write)
                 status_write = -1
                 try:
-                    child_pid = _supervisor_pid(os.read(status_read, 32))
-                    process.wait()
+                    child_pid = _read_supervisor_pid(status_read)
                     if child_pid is None:
                         raise GitError("Git supervisor failed before child startup")
-                    if _process_group_running(child_pid):
-                        _cancel_process_group(child_pid)
+                    process.wait()
                 except BaseException:
                     with suppress(OSError):
                         os.write(
@@ -954,6 +952,16 @@ def _supervisor_pid(value: bytes) -> int | None:
         return None
     pid = int(value[:-1])
     return pid if pid <= 2_147_483_647 else None
+
+
+def _read_supervisor_pid(descriptor: int) -> int | None:
+    value = bytearray()
+    while len(value) < 12 and b"\n" not in value:
+        chunk = os.read(descriptor, 12 - len(value))
+        if not chunk:
+            break
+        value.extend(chunk)
+    return _supervisor_pid(bytes(value))
 
 
 def _cancel_process_group(process_group: int) -> None:

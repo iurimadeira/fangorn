@@ -32,7 +32,7 @@ def main() -> int:
         pass
     finally:
         os.close(status)
-    while child.poll() is None:
+    while _child_running(child):
         readable, _, _ = select.select((control,), (), (), 0.01)
         if not readable:
             continue
@@ -52,13 +52,12 @@ def main() -> int:
 
 def _finish(child: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + 2
-    while child.poll() is None and time.monotonic() < deadline:
+    while _child_running(child) and time.monotonic() < deadline:
         time.sleep(0.01)
     _drain(child)
 
 
 def _drain(child: subprocess.Popen[bytes]) -> None:
-    child.poll()
     if not _process_group_running(child.pid):
         child.wait()
         return
@@ -66,7 +65,6 @@ def _drain(child: subprocess.Popen[bytes]) -> None:
         os.killpg(child.pid, signal.SIGTERM)
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        child.poll()
         if not _process_group_running(child.pid):
             child.wait()
             return
@@ -74,6 +72,17 @@ def _drain(child: subprocess.Popen[bytes]) -> None:
     with suppress(ProcessLookupError):
         os.killpg(child.pid, signal.SIGKILL)
     child.wait()
+
+
+def _child_running(child: subprocess.Popen[bytes]) -> bool:
+    return (
+        os.waitid(
+            os.P_PID,
+            child.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        is None
+    )
 
 
 def _process_group_running(process_group: int) -> bool:

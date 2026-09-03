@@ -359,9 +359,43 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     )
     monkeypatch.setattr(os, "close", lambda _descriptor: None)
     monkeypatch.setattr(git_supervisor, "_drain", drained.append)
+    monkeypatch.setattr(git_supervisor, "_child_running", lambda _child: False)
 
     assert git_supervisor.main() == 0
     assert drained == [child]
+
+
+def test_supervisor_does_not_reap_before_group_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        pid = 123
+        waited = False
+
+        def wait(self) -> int:
+            self.waited = True
+            return 0
+
+        @staticmethod
+        def poll() -> int:
+            raise AssertionError("cleanup must not reap through poll")
+
+    child = Child()
+    monkeypatch.setattr(git_supervisor, "_process_group_running", lambda _pid: False)
+
+    git_supervisor._drain(child)  # type: ignore[arg-type]
+
+    assert child.waited is True
+
+
+def test_supervisor_observes_child_without_reaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    monkeypatch.setattr(os, "waitid", lambda *args: object())
+
+    assert git_supervisor._child_running(child) is False
 
 
 def test_supervised_git_rejects_missing_child_handshake(
@@ -396,6 +430,24 @@ def test_supervisor_pid_rejects_noncanonical_frames(value: bytes) -> None:
 
 def test_supervisor_pid_accepts_canonical_positive_pid() -> None:
     assert git_worktree_adapter._supervisor_pid(b"123\n") == 123
+
+
+def test_supervisor_pid_reader_completes_short_pipe_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = iter((b"12", b"3\n"))
+    monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+
+    assert git_worktree_adapter._read_supervisor_pid(10) == 123
+
+
+def test_supervisor_pid_reader_rejects_eof_before_newline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = iter((b"123", b""))
+    monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+
+    assert git_worktree_adapter._read_supervisor_pid(10) is None
 
 
 def test_successful_git_drains_term_ignoring_descendants(
