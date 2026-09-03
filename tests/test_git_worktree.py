@@ -2160,6 +2160,7 @@ def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -
     )
 
     assert created.git_dir_generation == token
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
     assert (
         create_worktree(
             source,
@@ -2257,6 +2258,15 @@ def test_worktree_creation_rejects_executable_filters(tmp_path: Path) -> None:
 
     assert not invoked.exists()
     assert not (tmp_path / "target").exists()
+
+
+def test_checkout_configuration_rejects_core_worktree(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    repository(source)
+    git(source, "config", "core.worktree", str(tmp_path / "outside"))
+
+    with pytest.raises(GitError, match="unsafe checkout configuration"):
+        git_worktree_adapter._reject_executable_checkout_configuration(source)
 
 
 @pytest.mark.parametrize("entry", ["directory", "config"])

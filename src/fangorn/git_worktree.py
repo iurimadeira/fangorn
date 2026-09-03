@@ -739,6 +739,7 @@ def create_worktree(
         if staging_kind is not None:
             if staging_kind == "symlink":
                 raise GitError("Workspace staging path is unsafe")
+            _secure_staging_directory(parent.descriptor, staging.name)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
             if observation.git_dir_generation not in {None, ownership_token}:
                 raise GitError("Staged Worktree belongs to another Workspace create")
@@ -805,6 +806,7 @@ def create_worktree(
             if added.returncode != 0:
                 raise GitError(_git_error(added))
             _require_target_parent(parent)
+            _secure_staging_directory(parent.descriptor, staging.name)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
         establish_worktree_generation(observation.git_dir, ownership_token)
         observation = observe_worktree(staging, liveness_fd=liveness_fd)
@@ -840,6 +842,7 @@ def create_worktree(
                     selected = _run_git_process(
                         Path("."),
                         *checkout,
+                        work_tree=Path("."),
                         liveness_fd=liveness_fd,
                         extra_fds=(staging_descriptor,),
                         working_directory_fd=staging_descriptor,
@@ -907,6 +910,8 @@ def _reject_executable_checkout_configuration(
         raise GitError(_git_error(configured))
     for name in configured.stdout.decode("utf-8", errors="replace").splitlines():
         lowered = name.lower()
+        if lowered == "core.worktree":
+            raise GitError("Repository has unsafe checkout configuration")
         if lowered == "include.path" or (
             lowered.startswith("includeif.") and lowered.endswith(".path")
         ):
@@ -916,6 +921,29 @@ def _reject_executable_checkout_configuration(
             and lowered.rsplit(".", 1)[-1] in {"clean", "smudge", "process"}
         ):
             raise GitError("Repository has executable checkout configuration")
+
+
+def _secure_staging_directory(parent: int, name: str) -> None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                raise GitError("Workspace staging path is unsafe")
+            os.fchmod(descriptor, 0o700)
+            os.fsync(descriptor)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+                raise GitError("Workspace staging path is unsafe")
+        finally:
+            os.close(descriptor)
+    except GitError:
+        raise
+    except OSError as error:
+        raise GitError("Workspace staging path is unsafe") from error
 
 
 @contextmanager
@@ -1288,6 +1316,7 @@ def _run_git_process(
     path: Path,
     *arguments: str,
     git_dir: bool = False,
+    work_tree: Path | None = None,
     liveness_fd: int | None = None,
     finish_on_parent_exit: bool = False,
     extra_fds: tuple[int, ...] = (),
@@ -1300,6 +1329,8 @@ def _run_git_process(
         command.append(f"--git-dir={path}")
     else:
         command.extend(("-C", str(path)))
+    if work_tree is not None:
+        command.append(f"--work-tree={work_tree}")
     if disable_hooks:
         command.extend(("-c", "core.hooksPath=/dev/null"))
     command.extend(arguments)
