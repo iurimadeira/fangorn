@@ -65,7 +65,10 @@ def normalize_repository_source(value: str) -> RepositorySource:
 
 def resolve_commit(repository: Path, ref: str | None) -> str:
     selected = ref or "HEAD"
-    value = _run_git(repository, "rev-parse", "--verify", f"{selected}^{{commit}}")
+    try:
+        value = _run_git(repository, "rev-parse", "--verify", f"{selected}^{{commit}}")
+    except GitError as error:
+        raise GitError(f"Cannot resolve Git base {selected}: {error}") from error
     if not re.fullmatch(r"[0-9a-f]{40,64}", value):
         raise GitError(f"Git returned an invalid commit for {selected}")
     return value

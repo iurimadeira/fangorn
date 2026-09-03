@@ -457,3 +457,57 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
             "WHERE workspace_id = ?",
             (created.definition.id,),
         ).fetchone() == ("uncreated",)
+
+
+@pytest.mark.parametrize(
+    ("create_request", "message"),
+    [
+        (
+            CreateWorkspace(repository="unused", branch="topic", headless=False),
+            "Only headless",
+        ),
+        (CreateWorkspace(repository="", branch="topic"), "requires a repository"),
+        (CreateWorkspace(repository="unused", branch="-bad"), "branch is invalid"),
+    ],
+)
+def test_create_rejects_unsupported_definition_before_state(
+    tmp_path: Path, create_request: CreateWorkspace, message: str
+) -> None:
+    workspaces = facade(tmp_path)
+
+    with pytest.raises(WorkspaceError, match=message):
+        workspaces.create(create_request)
+
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize(
+    ("configuration", "message"),
+    [
+        ("schema_version = 2\n", "schema_version = 1"),
+        (
+            "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
+            "Service Resources are not available",
+        ),
+    ],
+)
+def test_create_rejects_configuration_outside_f2_scope(
+    tmp_path: Path, configuration: str, message: str
+) -> None:
+    source = tmp_path / "repository"
+    create_repository(source)
+    config = tmp_path / "fangorn.toml"
+    config.write_text(configuration, encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match=message):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(source),
+                branch="topic",
+                path=tmp_path / "target",
+                config=config,
+                headless=True,
+            )
+        )
+
+    assert not (tmp_path / "target").exists()
