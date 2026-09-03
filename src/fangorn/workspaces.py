@@ -778,7 +778,13 @@ class Workspaces:
         return held[0]
 
     def _owner_status(self, owner: ProcessIdentity) -> str:
-        status = _process_owner_status(owner)
+        try:
+            boot_identity = _boot_identity()
+        except WorkspaceError:
+            return "inconclusive"
+        if owner.boot_identity != boot_identity:
+            return "dead"
+        status = _process_owner_status(owner, boot_identity=boot_identity)
         if status != "dead":
             return status
         marker = self._invocation_root / owner.process_instance_id
@@ -1037,11 +1043,14 @@ def _process_start_identity(pid: int) -> str:
         return result.stdout.strip()
 
 
-def _process_owner_status(owner: ProcessIdentity) -> str:
-    try:
-        boot_identity = _boot_identity()
-    except WorkspaceError:
-        return "inconclusive"
+def _process_owner_status(
+    owner: ProcessIdentity, *, boot_identity: str | None = None
+) -> str:
+    if boot_identity is None:
+        try:
+            boot_identity = _boot_identity()
+        except WorkspaceError:
+            return "inconclusive"
     if owner.boot_identity != boot_identity:
         return "dead"
     try:

@@ -1160,16 +1160,30 @@ print(json.dumps(asdict(w._invocation_process_identity())))
 
 
 def test_unknown_quiescence_marker_keeps_dead_owner_inconclusive(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(workspaces_module, "_boot_identity", lambda: "same-boot")
     workspaces = facade(tmp_path)
-    owner = ProcessIdentity("unknown-quiescence", "other-boot", 2**30, "start")
+    owner = ProcessIdentity("unknown-quiescence", "same-boot", 2**30, "start")
     workspaces._invocation_root.mkdir(parents=True)
     marker = workspaces._invocation_root / owner.process_instance_id
     marker.write_bytes(b"quiescence-unknown\n")
 
     assert workspaces._owner_status(owner) == "inconclusive"
     assert marker.exists()
+
+
+def test_boot_mismatch_overrides_unknown_quiescence_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspaces_module, "_boot_identity", lambda: "current-boot")
+    workspaces = facade(tmp_path)
+    owner = ProcessIdentity("previous-boot", "old-boot", 2**30, "start")
+    workspaces._invocation_root.mkdir(parents=True)
+    marker = workspaces._invocation_root / owner.process_instance_id
+    marker.write_bytes(b"quiescence-unknown\n")
+
+    assert workspaces._owner_status(owner) == "dead"
 
 
 def test_invocation_cleaner_unlinks_the_inherited_marker(
