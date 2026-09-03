@@ -23,7 +23,6 @@ def test_local_quality_configuration_matches_the_public_contract() -> None:
     ruff_lint = pyproject["tool"]["ruff"]["lint"]
     mypy = pyproject["tool"]["mypy"]
     coverage_run = pyproject["tool"]["coverage"]["run"]
-    coverage_report = pyproject["tool"]["coverage"]["report"]
 
     assert "coverage>=7.10,<8" in dev_dependencies
     assert "--strict-config" in pytest_options["addopts"]
@@ -40,11 +39,6 @@ def test_local_quality_configuration_matches_the_public_contract() -> None:
         "relative_files": True,
         "source": ["src", "scripts"],
     }
-    assert coverage_report["omit"] == [
-        "src/fangorn/_git_anchor.py",
-        "src/fangorn/_git_guardian.py",
-        "src/fangorn/_git_supervisor.py",
-    ]
 
 
 def test_ci_exposes_one_stable_aggregate_result() -> None:

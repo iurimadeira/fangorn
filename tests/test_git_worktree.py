@@ -852,6 +852,64 @@ def test_supervisor_capture_finish_stops_at_deadline() -> None:
         os.close(writer)
 
 
+@pytest.mark.parametrize(
+    ("payload", "limit", "expected"),
+    [(b"ok", 2, "ok"), (b"toolong", 2, "exceeded")],
+)
+def test_supervisor_capture_finish_drains_available_output(
+    payload: bytes, limit: int, expected: str
+) -> None:
+    reader, writer = os.pipe()
+    os.write(writer, payload)
+    os.close(writer)
+    with tempfile.TemporaryFile() as destination:
+        captures = {reader: [destination.fileno(), 0]}
+        assert (
+            git_supervisor._finish_captures(captures, limit, time.monotonic() + 1)
+            == expected
+        )
+        assert captures == {}
+
+
+def test_supervisor_finish_waits_for_child_before_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = object()
+    running = iter((True, False))
+    drained: list[object] = []
+    monkeypatch.setattr(git_supervisor, "_child_running", lambda _child: next(running))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    def drain(value: object, _group: int) -> bool:
+        drained.append(value)
+        return True
+
+    monkeypatch.setattr(git_supervisor, "_drain", drain)
+
+    assert git_supervisor._finish(child, 77) is True  # type: ignore[arg-type]
+    assert drained == [child]
+
+
+def test_supervisor_drain_returns_after_first_absent_group_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        waited = False
+
+        def wait(self) -> int:
+            self.waited = True
+            return 0
+
+    child = Child()
+    monkeypatch.setattr(os, "killpg", lambda *_args: None)
+    monkeypatch.setattr(
+        git_supervisor, "_wait_for_group_state", lambda *_args, **_kwargs: False
+    )
+
+    assert git_supervisor._drain(child, 77) is True  # type: ignore[arg-type]
+    assert child.waited is True
+
+
 def test_anchor_survives_group_termination_before_arming(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -920,6 +978,171 @@ def test_anchor_inherits_blocked_term_until_handler_is_ready() -> None:
             os.close(descriptor)
         with suppress(subprocess.TimeoutExpired):
             anchor.wait(timeout=2)
+
+
+def test_anchor_main_terminates_group_when_control_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control_read, control_write = os.pipe()
+    liveness_read, liveness_write = os.pipe()
+    signals: list[tuple[int, int]] = []
+    os.write(control_write, b"a")
+    os.close(control_write)
+    monkeypatch.setattr(
+        sys, "argv", ["anchor", str(control_read), str(liveness_read), "1"]
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    monkeypatch.setattr(os, "killpg", lambda group, sent: signals.append((group, sent)))
+    try:
+        assert git_anchor.main() == 1
+    finally:
+        os.close(control_read)
+        os.close(liveness_read)
+        os.close(liveness_write)
+
+    assert signals == [(os.getpgrp(), signal.SIGKILL)]
+
+
+def test_guardian_main_retries_probe_errors_with_bounded_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    liveness_read, liveness_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    states = iter((OSError("probe failed"), True, False))
+    sleeps: list[float] = []
+
+    def running(_process_group: int) -> bool:
+        state = next(states)
+        if isinstance(state, BaseException):
+            raise state
+        return state
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["guardian", "123", str(liveness_read), str(ready_write)],
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    monkeypatch.setattr(git_guardian, "_process_group_running", running)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    try:
+        assert git_guardian.main() == 0
+        assert os.read(ready_read, 2) == b"r\n"
+    finally:
+        for descriptor in (
+            liveness_read,
+            liveness_write,
+            ready_read,
+            ready_write,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+
+    assert sleeps == [0.01, 0.02]
+
+
+def test_guardian_executable_releases_after_group_stops() -> None:
+    target = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], process_group=0
+    )
+    liveness_read, liveness_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    guardian = subprocess.Popen(  # noqa: S603 -- fixed helper argv
+        [
+            sys.executable,
+            "-I",
+            str(Path(git_guardian.__file__)),
+            str(target.pid),
+            str(liveness_read),
+            str(ready_write),
+        ],
+        pass_fds=(liveness_read, ready_write),
+        process_group=0,
+    )
+    os.close(ready_write)
+    try:
+        assert os.read(ready_read, 2) == b"r\n"
+        os.killpg(target.pid, signal.SIGKILL)
+        target.wait(timeout=2)
+        assert guardian.wait(timeout=2) == 0
+    finally:
+        for descriptor in (liveness_read, liveness_write, ready_read):
+            with suppress(OSError):
+                os.close(descriptor)
+        for process in (target, guardian):
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+
+
+def test_supervisor_executable_reports_completed_effect() -> None:
+    anchor = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], process_group=0
+    )
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    completion_read, completion_write = os.pipe()
+    liveness_read, liveness_write = os.pipe()
+    anchor_read, anchor_write = os.pipe()
+    supervisor = subprocess.Popen(  # noqa: S603 -- fixed helper argv
+        [
+            sys.executable,
+            "-I",
+            str(Path(git_supervisor.__file__)),
+            str(control_read),
+            str(status_write),
+            str(completion_write),
+            str(liveness_read),
+            str(anchor_write),
+            str(anchor.pid),
+            "",
+            "-1",
+            "cancel",
+            "10",
+            str(8 * 1024 * 1024),
+            "/bin/true",
+        ],
+        pass_fds=(
+            control_read,
+            status_write,
+            completion_write,
+            liveness_read,
+            anchor_write,
+        ),
+        process_group=0,
+    )
+    for descriptor in (control_read, status_write, completion_write):
+        os.close(descriptor)
+    try:
+        assert git_worktree_adapter._read_supervisor_pid(
+            status_read, deadline=time.monotonic() + 2
+        )
+        assert (
+            git_worktree_adapter._read_supervisor_completion(
+                completion_read, deadline=time.monotonic() + 5
+            )
+            == 0
+        )
+        assert supervisor.wait(timeout=2) == 0
+        anchor.wait(timeout=2)
+    finally:
+        for descriptor in (
+            control_write,
+            status_read,
+            completion_read,
+            liveness_read,
+            liveness_write,
+            anchor_read,
+            anchor_write,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+        for process in (anchor, supervisor):
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
         if anchor.poll() is None:
             os.killpg(anchor.pid, signal.SIGKILL)
             anchor.wait(timeout=2)
@@ -997,12 +1220,16 @@ def test_internal_git_helpers_do_not_inherit_coverage_instrumentation(
         return real_popen(*args, **kwargs)
 
     monkeypatch.setenv("COVERAGE_PROCESS_CONFIG", "instrument")
+    monkeypatch.setenv("COVERAGE_PROCESS_START", "instrument")
     monkeypatch.setattr(subprocess, "Popen", start)
     result = git_worktree_adapter._run_git_process(tmp_path, "--version")
 
     assert result.returncode == 0
     assert len(environments) == 3
-    assert all("COVERAGE_PROCESS_CONFIG" not in value for value in environments)
+    assert all(
+        not {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"} & value.keys()
+        for value in environments
+    )
 
 
 def test_parent_group_probe_rejects_malformed_ps(
@@ -1541,6 +1768,23 @@ def test_quiescence_guardian_treats_zombie_only_group_as_stopped() -> None:
         assert git_guardian._process_group_running(process.pid) is False
     finally:
         process.wait(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [("77 S\n", True), ("78 Z\n", False)],
+)
+def test_guardian_process_probe_has_portable_fallback(
+    output: str, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, output, ""),
+    )
+
+    assert git_guardian._process_group_running(77) is expected
 
 
 def test_receipt_staging_cleanup_failure_is_visible(

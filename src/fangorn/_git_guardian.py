@@ -21,13 +21,15 @@ def main() -> int:
     os.fstat(liveness)
     os.write(ready, b"r\n")
     os.close(ready)
+    delay = 0.01
     while True:
         try:
             if not _process_group_running(process_group):
                 return 0
         except (OSError, subprocess.SubprocessError):
             pass
-        time.sleep(0.01)
+        time.sleep(delay)
+        delay = min(0.25, delay * 2)
 
 
 def _process_group_running(process_group: int) -> bool:

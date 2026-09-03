@@ -72,12 +72,3 @@ parallel = true
 patch = ["subprocess"]
 relative_files = true
 source = ["src", "scripts"]
-
-[tool.coverage.report]
-# These isolated executables must not inherit coverage: instrumentation changes
-# process lifetime and made later concurrency tests depend on suite order.
-omit = [
-  "src/fangorn/_git_anchor.py",
-  "src/fangorn/_git_guardian.py",
-  "src/fangorn/_git_supervisor.py",
-]

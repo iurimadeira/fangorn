@@ -1041,6 +1041,7 @@ def _run_supervised_git(
         raise GitError("Cannot supervise Git while SIGCHLD is ignored")
     helper_environment = dict(environment)
     helper_environment.pop("COVERAGE_PROCESS_CONFIG", None)
+    helper_environment.pop("COVERAGE_PROCESS_START", None)
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
     completion_read, completion_write = os.pipe()
@@ -1334,7 +1335,7 @@ def _retain_quiescence_guardian(process_group: int, *, liveness_fd: int) -> None
             env={
                 name: value
                 for name, value in os.environ.items()
-                if name != "COVERAGE_PROCESS_CONFIG"
+                if name not in {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"}
             },
             pass_fds=(liveness_fd, ready_write),
             process_group=0,

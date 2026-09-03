@@ -62,8 +62,10 @@ cache under `$XDG_CACHE_HOME/fangorn/repositories`; its acquisition and every
 Workspace mutation use recoverable fenced leases.
 
 Supervised Git effects have a one-hour deadline and retain at most 8 MiB per
-output stream. Hitting either limit fails creation with retryable journal evidence
-after the Git process group is fully stopped.
+output stream. Hitting either limit fails creation with retryable journal
+evidence. Fangorn releases the lease after proving the Git process group stopped;
+if proof remains inconclusive, a detached guardian retains the lease until no
+live process remains.
 
 Machine output uses schema 2:
 
