@@ -575,7 +575,6 @@ def create_worktree(
                     "Workspace staging path already exists without ownership receipt"
                 )
             _create_staging_receipt(receipt, ownership_token, parent.descriptor)
-        _reject_executable_checkout_configuration(repository, liveness_fd=liveness_fd)
         _require_target_parent(parent)
         if staging_kind is not None:
             if staging_kind == "symlink":
@@ -620,6 +619,7 @@ def create_worktree(
                 ),
                 "worktree",
                 "add",
+                "--no-checkout",
                 "--detach",
                 staging.name,
                 commit,
@@ -632,6 +632,17 @@ def create_worktree(
                 raise GitError(_git_error(added))
             _require_target_parent(parent)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
+        staging_descriptor = os.open(
+            staging.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent.descriptor,
+        )
+        try:
+            _reject_executable_checkout_configuration(
+                staging_descriptor, liveness_fd=liveness_fd
+            )
+        finally:
+            os.close(staging_descriptor)
         establish_worktree_generation(observation.git_dir, ownership_token)
         observation = observe_worktree(staging, liveness_fd=liveness_fd)
         if observation.head != commit or observation.branch != branch:
@@ -706,16 +717,17 @@ def create_worktree(
 
 
 def _reject_executable_checkout_configuration(
-    repository: Path, *, liveness_fd: int | None = None
+    worktree_descriptor: int, *, liveness_fd: int | None = None
 ) -> None:
     configured = _run_git_process(
-        repository,
+        Path("."),
         "config",
         "--includes",
-        "--local",
         "--name-only",
         "--list",
         liveness_fd=liveness_fd,
+        extra_fds=(worktree_descriptor,),
+        working_directory_fd=worktree_descriptor,
     )
     if configured.returncode != 0:
         raise GitError(_git_error(configured))

@@ -2172,6 +2172,42 @@ def test_worktree_creation_rejects_executable_filters(tmp_path: Path) -> None:
     assert not (tmp_path / "target").exists()
 
 
+def test_worktree_creation_rejects_gitdir_conditional_filters_before_checkout(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "repository"
+    repository(source)
+    invoked = tmp_path / "conditional-filter-invoked"
+    included = tmp_path / "worktree.gitconfig"
+    included.write_text(
+        f'[filter "evil"]\n\tsmudge = touch {invoked}\n', encoding="utf-8"
+    )
+    (source / ".gitattributes").write_text("*.payload filter=evil\n", encoding="utf-8")
+    (source / "content.payload").write_text("content\n", encoding="utf-8")
+    git(source, "add", ".gitattributes", "content.payload")
+    git(source, "commit", "-m", "add conditionally filtered content")
+    commit = git(source, "rev-parse", "HEAD")
+    git(
+        source,
+        "config",
+        f"includeIf.gitdir:{source / '.git' / 'worktrees'}/**.path",
+        str(included),
+    )
+
+    with pytest.raises(GitError, match="executable checkout configuration"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="c" * 64,
+            reconcile=False,
+        )
+
+    assert not invoked.exists()
+    assert not (tmp_path / "target").exists()
+
+
 def test_worktree_adapter_rejects_markerless_matching_staging(tmp_path: Path) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
