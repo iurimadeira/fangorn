@@ -282,6 +282,34 @@ def test_clone_cache_is_namespaced_by_registry_identity(tmp_path: Path) -> None:
     assert caches[0].parent != caches[1].parent
 
 
+def test_clone_cache_replacement_is_rejected_before_worktree_effect(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="first",
+            path=tmp_path / "worktrees" / "first",
+        )
+    )
+    cache = next((tmp_path / "cache" / "fangorn" / "repositories").glob("*/*.git"))
+    cache.rename(cache.with_suffix(".replaced"))
+    git(tmp_path, "clone", "--bare", repository.as_uri(), str(cache))
+    target = tmp_path / "worktrees" / "second"
+
+    with pytest.raises(WorkspaceError, match="cache generation marker is missing"):
+        workspaces.create(
+            CreateWorkspace(
+                repository=repository.as_uri(), branch="second", path=target
+            )
+        )
+
+    assert not target.exists()
+
+
 def test_clone_url_resolves_tag_base(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     tagged_sha = create_repository(repository)
@@ -386,6 +414,68 @@ def test_clone_create_does_not_resolve_deleted_remote_branch_from_local_cache(
         )
 
 
+@pytest.mark.parametrize("base", ["origin/main", "refs/heads/main"])
+def test_clone_create_resolves_remote_branch_spellings_without_remote_head(
+    tmp_path: Path, base: str
+) -> None:
+    repository = tmp_path / "repository"
+    expected = create_repository(repository)
+    git(repository, "symbolic-ref", "HEAD", "refs/heads/missing")
+
+    result = facade(tmp_path).create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch=base.replace("/", "-"),
+            base=base,
+            path=tmp_path / "worktrees" / base.replace("/", "-"),
+        )
+    )
+
+    assert result.workspace.definition.created_from_sha == expected
+
+
+def test_clone_create_refreshes_moved_and_deleted_tags(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    first_sha = create_repository(repository)
+    git(repository, "tag", "release")
+    workspaces = facade(tmp_path)
+    first = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="first-tag",
+            base="release",
+            path=tmp_path / "worktrees" / "first-tag",
+        )
+    )
+    (repository / "moved-tag.txt").write_text("moved\n", encoding="utf-8")
+    git(repository, "add", "moved-tag.txt")
+    git(repository, "commit", "-m", "move tag")
+    moved_sha = git(repository, "rev-parse", "HEAD")
+    git(repository, "tag", "-f", "release")
+
+    moved = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="moved-tag",
+            base="release",
+            path=tmp_path / "worktrees" / "moved-tag",
+        )
+    )
+    git(repository, "tag", "-d", "release")
+
+    assert first.workspace.definition.created_from_sha == first_sha
+    assert moved.workspace.definition.created_from_sha == moved_sha
+    with pytest.raises(WorkspaceError, match="Cannot resolve Git base"):
+        workspaces.create(
+            CreateWorkspace(
+                repository=repository.as_uri(),
+                branch="deleted-tag",
+                base="release",
+                path=tmp_path / "worktrees" / "deleted-tag",
+            )
+        )
+
+
 def test_new_clone_create_tracks_changed_remote_default_branch(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -471,6 +561,41 @@ def test_clone_retry_reuses_completed_cache_while_origin_is_offline(
     assert recovered.workspace.state == "ready"
 
 
+def test_clone_retry_reconciles_uncommitted_cache_effect_while_origin_is_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    workspaces = Workspaces(
+        registry, data_home=tmp_path / "data", cache_home=tmp_path / "cache"
+    )
+    request = CreateWorkspace(
+        repository=repository.as_uri(),
+        branch="cache-boundary",
+        path=tmp_path / "worktrees" / "cache-boundary",
+        request_id="cache-boundary",
+    )
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    original = registry.finish_cache_preparation
+
+    def interrupt_cache_commit(*_args: object, **_kwargs: object) -> None:
+        raise SimulatedInterruption("before atomic cache receipt")
+
+    monkeypatch.setattr(registry, "finish_cache_preparation", interrupt_cache_commit)
+    with pytest.raises(SimulatedInterruption):
+        workspaces.create(request)
+    repository.rename(tmp_path / "origin-offline")
+    monkeypatch.setattr(registry, "finish_cache_preparation", original)
+
+    recovered = workspaces.create(request)
+
+    assert recovered.workspace.state == "ready"
+
+
 def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
@@ -508,6 +633,14 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     )
 
     assert new_epoch == old_epoch + 1
+    with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.finish_cache_preparation(
+            "source",
+            path="/stale-cache",
+            repository_generation="a" * 64,
+            operation_id=intent.operation_id,
+            lease_epoch=old_epoch,
+        )
     with pytest.raises(RegistryError, match="Stale operation result"):
         registry.save_cache_entry(
             "source",

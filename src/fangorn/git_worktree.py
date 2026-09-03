@@ -93,6 +93,8 @@ def _remote_ref_candidates(ref: str | None) -> tuple[str, ...]:
         return ("refs/remotes/origin/HEAD",)
     if ref.startswith("refs/heads/"):
         return (f"refs/remotes/origin/{ref.removeprefix('refs/heads/')}",)
+    if ref.startswith("origin/"):
+        return (f"refs/remotes/origin/{ref.removeprefix('origin/')}",)
     if ref.startswith("refs/") or re.fullmatch(r"[0-9a-f]{40,64}", ref):
         return (ref,)
     return (f"refs/remotes/origin/{ref}", f"refs/tags/{ref}")
@@ -135,18 +137,25 @@ def materialize_cache(
     owner: ProcessIdentity | None = None,
     owner_status: Callable[[ProcessIdentity], str] | None = None,
     refresh: bool = True,
+    refresh_default_head: bool = True,
+    liveness_fd: int | None = None,
 ) -> Path:
     if source.clone_url is None:
         if source.path is None:
             raise GitError("Local repository path is unavailable")
         return source.path
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(cache_path.parent)
     if owner is not None and owner_status is not None:
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
         _verify_bare_repository(cache_path, source.normalized)
         if refresh:
-            _refresh_bare_repository(cache_path)
+            _refresh_bare_repository(
+                cache_path,
+                update_default=refresh_default_head,
+                liveness_fd=liveness_fd,
+            )
+        _fsync_directory(cache_path.parent, "Repository cache publication")
         return cache_path
     require_supported_git(cache_path.parent)
     prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
@@ -174,6 +183,7 @@ def materialize_cache(
             source.clone_url,
             str(clone),
             use_c=True,
+            liveness_fd=liveness_fd,
         )
         if result.returncode != 0:
             raise GitError(_git_error(result))
@@ -183,7 +193,11 @@ def materialize_cache(
         except FileExistsError:
             _verify_bare_repository(cache_path, source.normalized)
         _fsync_directory(cache_path.parent, "Repository cache publication")
-        _refresh_bare_repository(cache_path)
+        _refresh_bare_repository(
+            cache_path,
+            update_default=refresh_default_head,
+            liveness_fd=liveness_fd,
+        )
         return cache_path
     finally:
         if invocation.parent == cache_path.parent and invocation.name.startswith(
@@ -228,20 +242,32 @@ def _cleanup_abandoned_clones(
             shutil.rmtree(resolved)
 
 
-def _refresh_bare_repository(path: Path) -> None:
+def _refresh_bare_repository(
+    path: Path, *, update_default: bool, liveness_fd: int | None
+) -> None:
     fetched = _run_git_process(
         path,
         "fetch",
         "--prune",
-        "--tags",
+        "--prune-tags",
         "origin",
         "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+        liveness_fd=liveness_fd,
     )
     if fetched.returncode != 0:
         raise GitError(_git_error(fetched))
-    head = _run_git_process(path, "remote", "set-head", "origin", "--auto")
-    if head.returncode != 0:
-        raise GitError(_git_error(head))
+    if update_default:
+        head = _run_git_process(
+            path,
+            "remote",
+            "set-head",
+            "origin",
+            "--auto",
+            liveness_fd=liveness_fd,
+        )
+        if head.returncode != 0:
+            raise GitError(_git_error(head))
 
 
 def create_worktree(
@@ -252,6 +278,7 @@ def create_worktree(
     commit: str,
     ownership_token: str,
     reconcile: bool,
+    liveness_fd: int | None = None,
 ) -> WorktreeObservation:
     staging = target.parent / f".fangorn-{ownership_token}"
     receipt = target.parent / f".fangorn-{ownership_token}.intent"
@@ -271,7 +298,7 @@ def create_worktree(
         _remove_staging_receipt(receipt, ownership_token)
         return result
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(target.parent)
     if reconcile:
         if receipt.exists():
             _require_staging_receipt(receipt, ownership_token)
@@ -291,25 +318,67 @@ def create_worktree(
         observation = observe_worktree(staging)
         if observation.git_dir_generation not in {None, ownership_token}:
             raise GitError("Staged Worktree belongs to another Workspace create")
-        if observation.head != commit or observation.branch != branch:
+        if observation.head != commit or observation.branch not in {None, branch}:
             raise GitError("Staged Worktree does not match the interrupted create")
     else:
+        branch_exists = _run_git_process(
+            repository,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            liveness_fd=liveness_fd,
+        )
+        if branch_exists.returncode == 0:
+            raise GitError("Workspace branch already exists")
+        if branch_exists.returncode != 1:
+            raise GitError(_git_error(branch_exists))
         added = _run_git_process(
             repository,
             "worktree",
             "add",
-            "-b",
-            branch,
+            "--detach",
             str(staging),
             commit,
+            liveness_fd=liveness_fd,
         )
         if added.returncode != 0:
             raise GitError(_git_error(added))
         observation = observe_worktree(staging)
     establish_worktree_generation(observation.git_dir, ownership_token)
-    moved = _run_git_process(repository, "worktree", "move", str(staging), str(target))
+    observation = observe_worktree(staging)
+    if observation.head != commit or observation.branch != branch:
+        branch_exists = _run_git_process(
+            repository,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            liveness_fd=liveness_fd,
+        )
+        checkout = (
+            ("checkout", branch)
+            if branch_exists.returncode == 0
+            else ("checkout", "-b", branch, commit)
+        )
+        selected = _run_git_process(staging, *checkout, liveness_fd=liveness_fd)
+        if selected.returncode != 0:
+            raise GitError(_git_error(selected))
+        observation = observe_worktree(staging)
+        if observation.head != commit or observation.branch != branch:
+            raise GitError("Staged Worktree does not match the interrupted create")
+    _fsync_directory(target.parent, "Workspace staging publication")
+    moved = _run_git_process(
+        repository,
+        "worktree",
+        "move",
+        str(staging),
+        str(target),
+        liveness_fd=liveness_fd,
+    )
     if moved.returncode != 0:
         raise GitError(_git_error(moved))
+    _fsync_directory(target.parent, "Workspace target publication")
     result = observe_worktree(
         target,
         create_repository_generation=True,
@@ -398,6 +467,17 @@ def _fsync_directory(path: Path, label: str) -> None:
         raise GitError(f"{label} directory is not durable") from error
 
 
+def _mkdir_durable(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for directory in reversed(missing):
+        _fsync_directory(directory.parent, "Created directory")
+
+
 def inspect_owned_worktree(
     target: Path,
     *,
@@ -454,7 +534,10 @@ def _run_git(path: Path, *arguments: str) -> str:
 
 
 def _run_git_process(
-    path: Path, *arguments: str, use_c: bool = False
+    path: Path,
+    *arguments: str,
+    use_c: bool = False,
+    liveness_fd: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = ["git"]
     if use_c:
@@ -478,6 +561,7 @@ def _run_git_process(
             check=False,
             capture_output=True,
             env=environment,
+            pass_fds=(liveness_fd,) if liveness_fd is not None else (),
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error

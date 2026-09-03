@@ -1408,6 +1408,63 @@ class Registry:
                 connection.rollback()
                 raise _registry_error(error) from error
 
+    def finish_cache_preparation(
+        self,
+        normalized_source: str,
+        *,
+        path: str,
+        repository_generation: str,
+        operation_id: str,
+        lease_epoch: int,
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind="repository",
+                    scope_key=normalized_source,
+                    lease_epoch=lease_epoch,
+                )
+                now = _timestamp()
+                connection.execute(
+                    """
+                    INSERT INTO repository_cache_entries (
+                        normalized_source, path, status,
+                        repository_generation, updated_at
+                    ) VALUES (?, ?, 'ready', ?, ?)
+                    ON CONFLICT(normalized_source) DO UPDATE SET
+                        path = excluded.path,
+                        status = excluded.status,
+                        repository_generation = excluded.repository_generation,
+                        updated_at = excluded.updated_at
+                    """,
+                    (normalized_source, path, repository_generation, now),
+                )
+                changed = connection.execute(
+                    """
+                    UPDATE operation_steps
+                    SET status = 'completed', result_json = ?
+                    WHERE operation_id = ? AND position = 0
+                    """,
+                    (
+                        json.dumps(
+                            {"path": path}, sort_keys=True, separators=(",", ":")
+                        ),
+                        operation_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise RegistryError("Workspace operation step is unavailable")
+                connection.commit()
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
     def cache_entry(self, normalized_source: str) -> tuple[str, str | None] | None:
         with self._connection() as connection:
             self._migrate(connection)

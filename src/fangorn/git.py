@@ -85,6 +85,16 @@ def establish_worktree_generation(directory: Path, ownership_token: str) -> str:
     )
 
 
+def repository_generation(directory: Path, *, create: bool) -> str | None:
+    """Read or establish the immutable identity of a Repository cache entry."""
+    return _generation(
+        directory,
+        marker_name=REPOSITORY_GENERATION_MARKER_NAME,
+        identity="repository",
+        create=create,
+    )
+
+
 def _run_git(
     path: Path,
     *arguments: str,

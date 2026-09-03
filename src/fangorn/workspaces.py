@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from fangorn._lifecycle import Observation, finish_create, plan_create
 from fangorn._lifecycle import Resource as LifecycleResource
-from fangorn.git import GitError, observe_worktree
+from fangorn.git import GitError, observe_worktree, repository_generation
 from fangorn.git_worktree import (
     RepositorySource,
     create_worktree,
@@ -252,7 +252,12 @@ class Workspaces:
             except CreateAlreadyCompleted:
                 return self._completed_create(intent.workspace_id, created=created)
 
-            repository = self._prepare_repository(source, intent, owner)
+            repository = self._prepare_repository(
+                source,
+                intent,
+                owner,
+                refresh_default_head=request.base is None,
+            )
             if intent.resolved_json is None:
                 commit = intent.resolved_sha
                 if commit is None:
@@ -332,6 +337,7 @@ class Workspaces:
                             commit=commit,
                             ownership_token=ownership_token,
                             reconcile=previous in {"running", "unknown"},
+                            liveness_fd=self._invocation_descriptor(owner),
                         )
                     else:
                         observation = inspect_owned_worktree(
@@ -427,6 +433,8 @@ class Workspaces:
         source: RepositorySource,
         intent: CreateIntentRecord,
         owner: ProcessIdentity,
+        *,
+        refresh_default_head: bool,
     ) -> Path:
         if source.clone_url is None:
             if source.path is None:
@@ -466,23 +474,22 @@ class Workspaces:
                 selected,
                 owner=owner,
                 owner_status=self._owner_status,
-                refresh=previous != "completed" or entry is None,
+                refresh=previous == "pending",
+                refresh_default_head=refresh_default_head,
+                liveness_fd=self._invocation_descriptor(owner),
             )
+            generation = repository_generation(repository, create=entry is None)
+            if generation is None:
+                raise WorkspaceError("Repository cache generation marker is missing")
+            if entry is not None and entry[1] != generation:
+                raise WorkspaceError("Repository cache identity changed")
             if previous != "completed" or entry is None:
-                self._registry.save_cache_entry(
+                self._registry.finish_cache_preparation(
                     source.normalized,
                     path=str(repository),
-                    repository_generation=entry[1] if entry is not None else None,
+                    repository_generation=generation,
                     operation_id=operation_id,
                     lease_epoch=epoch,
-                )
-                self._registry.finish_operation_step(
-                    operation_id,
-                    position=0,
-                    scope_kind="repository",
-                    scope_key=source.normalized,
-                    lease_epoch=epoch,
-                    result={"path": str(repository)},
                 )
             return repository
         finally:
@@ -605,6 +612,14 @@ class Workspaces:
             os.close(descriptor)
         with suppress(OSError):
             marker.unlink()
+
+    @staticmethod
+    def _invocation_descriptor(owner: ProcessIdentity) -> int:
+        with _ACTIVE_INVOCATIONS_LOCK:
+            held = _ACTIVE_INVOCATIONS.get(owner.process_instance_id)
+        if held is None:
+            raise WorkspaceError("Workspace invocation marker is unavailable")
+        return held[0]
 
     def _owner_status(self, owner: ProcessIdentity) -> str:
         status = _process_owner_status(owner)
