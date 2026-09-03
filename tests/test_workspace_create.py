@@ -2027,7 +2027,7 @@ def test_invalid_git_branch_does_not_poison_target(tmp_path: Path) -> None:
     assert created.workspace.state == "ready"
 
 
-def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational(
+def test_schema_2_definition_and_resource_provisioning_are_consistent(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
@@ -2059,16 +2059,27 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
                 "UPDATE workspaces SET created_from_sha = ? WHERE id = ?",
                 ("0" * 40, created.definition.id),
             )
-        connection.execute(
-            "UPDATE workspace_resources SET provisioning_status = 'uncreated' "
-            "WHERE workspace_id = ?",
-            (created.definition.id,),
-        )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="resource provisioning cannot regress"
+        ):
+            connection.execute(
+                "UPDATE workspace_resources SET provisioning_status = 'uncreated' "
+                "WHERE workspace_id = ?",
+                (created.definition.id,),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="resource provisioning status is invalid"
+        ):
+            connection.execute(
+                "UPDATE workspace_resources SET provisioning_status = 'corrupt' "
+                "WHERE workspace_id = ?",
+                (created.definition.id,),
+            )
         assert connection.execute(
             "SELECT provisioning_status FROM workspace_resources "
             "WHERE workspace_id = ?",
             (created.definition.id,),
-        ).fetchone() == ("uncreated",)
+        ).fetchone() == ("created",)
         with pytest.raises(sqlite3.IntegrityError, match="membership is immutable"):
             connection.execute(
                 "INSERT INTO workspace_resources VALUES "

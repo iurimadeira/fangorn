@@ -314,6 +314,34 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             END
             """,
             """
+            CREATE TRIGGER workspace_resource_provisioning_valid_insert
+            BEFORE INSERT ON workspace_resources
+            FOR EACH ROW
+            WHEN NEW.provisioning_status NOT IN ('uncreated', 'created')
+            BEGIN
+                SELECT RAISE(ABORT, 'resource provisioning status is invalid');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_resource_provisioning_valid_update
+            BEFORE UPDATE OF provisioning_status ON workspace_resources
+            FOR EACH ROW
+            WHEN NEW.provisioning_status NOT IN ('uncreated', 'created')
+            BEGIN
+                SELECT RAISE(ABORT, 'resource provisioning status is invalid');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_resource_provisioning_monotonic
+            BEFORE UPDATE OF provisioning_status ON workspace_resources
+            FOR EACH ROW
+            WHEN OLD.provisioning_status = 'created'
+                AND NEW.provisioning_status = 'uncreated'
+            BEGIN
+                SELECT RAISE(ABORT, 'resource provisioning cannot regress');
+            END
+            """,
+            """
             CREATE TRIGGER workspace_resource_membership_immutable
             BEFORE DELETE ON workspace_resources
             FOR EACH ROW
