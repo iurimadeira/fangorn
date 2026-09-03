@@ -8,6 +8,9 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+PROBE_FAILURE_LIMIT = 20
+QUIESCENCE_UNKNOWN = b"quiescence-unknown\n"
+
 
 def main() -> int:
     process_group = int(sys.argv[1])
@@ -22,14 +25,33 @@ def main() -> int:
     os.write(ready, b"r\n")
     os.close(ready)
     delay = 0.01
+    failures = 0
     while True:
         try:
             if not _process_group_running(process_group):
                 return 0
+            failures = 0
         except (OSError, subprocess.SubprocessError):
-            pass
+            failures += 1
+            if failures >= PROBE_FAILURE_LIMIT and _persist_unknown(liveness):
+                return 1
         time.sleep(delay)
         delay = min(0.25, delay * 2)
+
+
+def _persist_unknown(descriptor: int) -> bool:
+    try:
+        os.ftruncate(descriptor, 0)
+        written = 0
+        while written < len(QUIESCENCE_UNKNOWN):
+            count = os.pwrite(descriptor, QUIESCENCE_UNKNOWN[written:], written)
+            if count <= 0:
+                raise OSError("short write")
+            written += count
+        os.fsync(descriptor)
+    except OSError:
+        return False
+    return True
 
 
 def _process_group_running(process_group: int) -> bool:

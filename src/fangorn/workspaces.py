@@ -795,6 +795,11 @@ class Workspaces:
                 or opened.st_ino != current.st_ino
             ):
                 return "inconclusive"
+            try:
+                if os.pread(descriptor, 1, 0):
+                    return "inconclusive"
+            except OSError:
+                return "inconclusive"
             marker.unlink()
             return "dead"
         finally:

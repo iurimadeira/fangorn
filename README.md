@@ -65,7 +65,12 @@ Supervised Git effects have a one-hour deadline and retain at most 8 MiB per
 output stream. Hitting either limit fails creation with retryable journal
 evidence. Fangorn releases the lease after proving the Git process group stopped;
 if proof remains inconclusive, a detached guardian retains the lease until no
-live process remains.
+live process remains. Repeated process-probe failures persist a non-empty
+`quiescence-unknown` marker and let detached helpers exit without weakening the
+fence. After independently confirming that no Git process from that invocation
+remains, an operator may remove its marker from
+`$XDG_STATE_HOME/fangorn/invocations/` (default
+`~/.local/state/fangorn/invocations/`) to permit retry.
 
 Machine output uses schema 2:
 

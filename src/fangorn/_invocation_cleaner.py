@@ -29,7 +29,12 @@ def main() -> int:
             and opened.st_dev == current.st_dev
             and opened.st_ino == current.st_ino
         ):
-            marker.unlink()
+            try:
+                fenced = bool(os.pread(descriptor, 1, 0))
+            except OSError:
+                fenced = True
+            if not fenced:
+                marker.unlink()
     except FileNotFoundError:
         pass
     finally:

@@ -21,6 +21,7 @@ import fangorn._invocation_cleaner as invocation_cleaner
 import fangorn.workspaces as workspaces_module
 from fangorn.git import GitQuiescenceError, observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
+from fangorn.git_worktree import inspect_owned_worktree as real_inspect_owned_worktree
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
 from fangorn.workspaces import (
     CreateWorkspace,
@@ -1123,6 +1124,19 @@ print(json.dumps(asdict(w._invocation_process_identity())))
     assert not marker.exists()
 
 
+def test_unknown_quiescence_marker_keeps_dead_owner_inconclusive(
+    tmp_path: Path,
+) -> None:
+    workspaces = facade(tmp_path)
+    owner = ProcessIdentity("unknown-quiescence", "other-boot", 2**30, "start")
+    workspaces._invocation_root.mkdir(parents=True)
+    marker = workspaces._invocation_root / owner.process_instance_id
+    marker.write_bytes(b"quiescence-unknown\n")
+
+    assert workspaces._owner_status(owner) == "inconclusive"
+    assert marker.exists()
+
+
 def test_invocation_cleaner_unlinks_the_inherited_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1146,6 +1160,31 @@ def test_invocation_cleaner_unlinks_the_inherited_marker(
                 os.close(candidate)
 
     assert not marker.exists()
+
+
+def test_invocation_cleaner_preserves_unknown_quiescence_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "invocation"
+    marker.write_bytes(b"quiescence-unknown\n")
+    descriptor = os.open(marker, os.O_RDWR)
+    ready_read, ready_write = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cleaner", str(descriptor), str(marker), str(ready_write)],
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    try:
+        assert invocation_cleaner.main() == 0
+        assert os.read(ready_read, 2) == b"r\n"
+    finally:
+        for inherited in (descriptor, ready_read, ready_write):
+            with suppress(OSError):
+                os.close(inherited)
+
+    assert marker.read_bytes() == b"quiescence-unknown\n"
 
 
 def test_invocation_marker_cleanup_failure_is_visible(
@@ -1554,7 +1593,6 @@ def test_retry_recreates_absent_worktree_after_completed_create_receipt(
         request_id="receipt-committed-1",
         headless=True,
     )
-    real_inspect = workspaces_module.inspect_owned_worktree
     interrupted = False
 
     class SimulatedInterruption(BaseException):
@@ -1567,7 +1605,7 @@ def test_retry_recreates_absent_worktree_after_completed_create_receipt(
             interrupted = True
             git(repository, "worktree", "remove", "--force", str(target))
             raise SimulatedInterruption("interrupted after create receipt")
-        return real_inspect(*args, **kwargs)  # type: ignore[arg-type]
+        return real_inspect_owned_worktree(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
         "fangorn.workspaces.inspect_owned_worktree", remove_after_create_receipt

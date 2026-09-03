@@ -1043,6 +1043,41 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
     assert sleeps == [0.01, 0.02]
 
 
+def test_guardian_persists_unknown_quiescence_after_probe_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "invocation"
+    marker.touch()
+    liveness = os.open(marker, os.O_RDWR)
+    ready_read, ready_write = os.pipe()
+    probes = 0
+
+    def unavailable(_process_group: int) -> bool:
+        nonlocal probes
+        probes += 1
+        raise OSError("probe unavailable")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["guardian", "123", str(liveness), str(ready_write)],
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    monkeypatch.setattr(git_guardian, "_process_group_running", unavailable)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    try:
+        assert git_guardian.main() == 1
+        assert os.read(ready_read, 2) == b"r\n"
+    finally:
+        for descriptor in (liveness, ready_read, ready_write):
+            with suppress(OSError):
+                os.close(descriptor)
+
+    assert probes == git_guardian.PROBE_FAILURE_LIMIT
+    assert marker.read_bytes() == git_guardian.QUIESCENCE_UNKNOWN
+
+
 def test_guardian_executable_releases_after_group_stops() -> None:
     target = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"], process_group=0
