@@ -235,6 +235,63 @@ def test_explicit_configuration_read_stays_bound_to_opened_ancestor(
     assert swapped
 
 
+def test_explicit_configuration_normalizes_ancestor_symlink_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    explicit = parent / "fangorn.toml"
+    explicit.write_bytes(b"schema_version = 1\n")
+    real_open = os.open
+
+    def fail_ancestor(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == parent.name:
+            raise OSError(errno.ELOOP, "synthetic macOS symlink refusal")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fail_ancestor)
+
+    with pytest.raises(GitError, match="Configuration is unavailable"):
+        read_configuration(source, commit, explicit)
+
+
+def test_explicit_configuration_supports_parent_segments(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    explicit = tmp_path / "fangorn.toml"
+    explicit.write_bytes(b"schema_version = 1\n")
+
+    assert (
+        read_configuration(source, commit, directory / ".." / explicit.name)
+        == b"schema_version = 1\n"
+    )
+
+
+def test_explicit_configuration_supports_search_only_ancestors(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    parent = tmp_path / "search-only"
+    parent.mkdir()
+    explicit = parent / "fangorn.toml"
+    explicit.write_bytes(b"schema_version = 1\n")
+    parent.chmod(stat.S_IXUSR)
+
+    try:
+        assert read_configuration(source, commit, explicit) == b"schema_version = 1\n"
+    finally:
+        parent.chmod(stat.S_IRWXU)
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 def test_configuration_reads_are_bounded(tmp_path: Path, explicit: bool) -> None:
     source = tmp_path / "repository"

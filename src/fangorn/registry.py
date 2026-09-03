@@ -2324,7 +2324,7 @@ def _require_private_registry_directory(descriptor: int, path: Path) -> None:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or metadata.st_mode & 0o077
         or _darwin_acl_allows_write(descriptor)
     ):
         raise RegistryError(f"Registry state directory unavailable: {path}")
@@ -2388,7 +2388,7 @@ def _require_private_registry_database(descriptor: int, path: Path) -> None:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or metadata.st_mode & 0o077
         or _darwin_acl_allows_write(descriptor)
     ):
         raise RegistryError(f"Registry database unavailable: {path}")

@@ -2574,9 +2574,12 @@ def test_read_only_list_proceeds_during_a_registry_write_transaction(
     assert elapsed < 1.5
 
 
-@pytest.mark.parametrize("unsafe", ["state", "database"])
+@pytest.mark.parametrize(
+    ("unsafe", "mode"),
+    (("state", 0o777), ("state", 0o755), ("database", 0o666), ("database", 0o644)),
+)
 def test_read_only_list_rejects_unsafe_permissions_without_repair(
-    tmp_path: Path, unsafe: str
+    tmp_path: Path, unsafe: str, mode: int
 ) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -2586,7 +2589,7 @@ def test_read_only_list_rejects_unsafe_permissions_without_repair(
     assert adopted.returncode == 0, adopted.stderr
     database = state_directory / "registry.sqlite3"
     target = state_directory if unsafe == "state" else database
-    target.chmod(0o777 if unsafe == "state" else 0o666)
+    target.chmod(mode)
 
     result = run_fangorn(state_home, "list", "--json")
 
@@ -2597,14 +2600,15 @@ def test_read_only_list_rejects_unsafe_permissions_without_repair(
         else "Registry database unavailable"
     )
     assert expected in result.stderr
-    assert stat.S_IMODE(target.stat().st_mode) == (
-        0o777 if unsafe == "state" else 0o666
-    )
+    assert stat.S_IMODE(target.stat().st_mode) == mode
 
 
-@pytest.mark.parametrize("unsafe", ["state", "database"])
+@pytest.mark.parametrize(
+    ("unsafe", "mode"),
+    (("state", 0o777), ("state", 0o755), ("database", 0o666), ("database", 0o644)),
+)
 def test_registry_write_rejects_preexisting_unsafe_permissions(
-    tmp_path: Path, unsafe: str
+    tmp_path: Path, unsafe: str, mode: int
 ) -> None:
     state_directory = tmp_path / "state"
     database = state_directory / "registry.sqlite3"
@@ -2612,7 +2616,7 @@ def test_registry_write_rejects_preexisting_unsafe_permissions(
     with registry._connection():
         pass
     target = state_directory if unsafe == "state" else database
-    target.chmod(0o777 if unsafe == "state" else 0o666)
+    target.chmod(mode)
 
     with (
         pytest.raises(RegistryError, match=r"Registry .* unavailable"),
@@ -2620,9 +2624,7 @@ def test_registry_write_rejects_preexisting_unsafe_permissions(
     ):
         pass
 
-    assert stat.S_IMODE(target.stat().st_mode) == (
-        0o777 if unsafe == "state" else 0o666
-    )
+    assert stat.S_IMODE(target.stat().st_mode) == mode
 
 
 def test_registry_rejects_nonsticky_writable_ancestor(tmp_path: Path) -> None:

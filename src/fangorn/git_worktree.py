@@ -199,13 +199,21 @@ def read_configuration(
 
 
 def _open_configuration_file(path: Path) -> int:
-    if not path.is_absolute() or ".." in path.parts:
+    if not path.is_absolute():
         raise GitError("Configuration is unavailable")
-    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags = (
+        getattr(os, "O_PATH", getattr(os, "O_EVTONLY", os.O_RDONLY))
+        | os.O_CLOEXEC
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+    )
     descriptor = os.open(path.anchor, directory_flags)
     try:
         for part in path.parts[1:-1]:
-            child = os.open(part, directory_flags, dir_fd=descriptor)
+            try:
+                child = os.open(part, directory_flags, dir_fd=descriptor)
+            except OSError as error:
+                raise GitError(f"Configuration is unavailable: {path}") from error
             os.close(descriptor)
             descriptor = child
         result = os.open(
