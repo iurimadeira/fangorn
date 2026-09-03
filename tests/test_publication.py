@@ -462,6 +462,7 @@ def test_publication_gate_rejects_optional_proposal_readiness(tmp_path: Path) ->
 def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
     workflow = (PROJECT_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
+    assert workflow.count('XDG_STATE_HOME="$(mktemp -d)"') == 2
     assert "uv run --isolated --no-project --with dist/*.whl fangorn --help" in workflow
     assert (
         "uv run --isolated --no-project --with dist/*.whl fangorn --version" in workflow

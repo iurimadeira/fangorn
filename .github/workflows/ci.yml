@@ -53,7 +53,7 @@ jobs:
           repository="$(mktemp -d)"
           git init --initial-branch=main "$repository"
           git -c user.name=Fangorn -c user.email=fangorn@example.invalid -C "$repository" commit --allow-empty -m initial
-          XDG_DATA_HOME="$(mktemp -d)" uv run --isolated --no-project --with dist/*.whl fangorn workspace create --repo "$repository" --branch wheel-smoke --path "$repository-worktree" --headless --json
+          XDG_DATA_HOME="$(mktemp -d)" XDG_STATE_HOME="$(mktemp -d)" uv run --isolated --no-project --with dist/*.whl fangorn workspace create --repo "$repository" --branch wheel-smoke --path "$repository-worktree" --headless --json
       - name: Smoke-test installed source distribution
         run: |
           uv run --isolated --no-project --with dist/*.tar.gz fangorn --help
@@ -61,7 +61,7 @@ jobs:
           repository="$(mktemp -d)"
           git init --initial-branch=main "$repository"
           git -c user.name=Fangorn -c user.email=fangorn@example.invalid -C "$repository" commit --allow-empty -m initial
-          XDG_DATA_HOME="$(mktemp -d)" uv run --isolated --no-project --with dist/*.tar.gz fangorn workspace create --repo "$repository" --branch sdist-smoke --path "$repository-worktree" --headless --json
+          XDG_DATA_HOME="$(mktemp -d)" XDG_STATE_HOME="$(mktemp -d)" uv run --isolated --no-project --with dist/*.tar.gz fangorn workspace create --repo "$repository" --branch sdist-smoke --path "$repository-worktree" --headless --json
 
   compatibility:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
