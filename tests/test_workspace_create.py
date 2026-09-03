@@ -421,6 +421,7 @@ def test_clone_cache_replacement_is_rejected_before_worktree_effect(
     cache = next((tmp_path / "cache" / "fangorn" / "repositories").glob("*/*.git"))
     cache.rename(cache.with_suffix(".replaced"))
     git(tmp_path, "clone", "--bare", repository.as_uri(), str(cache))
+    cache.chmod(0o770)
     target = tmp_path / "worktrees" / "second"
 
     with pytest.raises(WorkspaceError, match="Repository cache entry is unsafe"):
