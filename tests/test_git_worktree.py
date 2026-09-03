@@ -13,6 +13,8 @@ from typing import cast
 import pytest
 from git_helpers import git, initialize_repository
 
+import fangorn._git_supervisor as git_supervisor
+import fangorn.git_worktree as git_worktree_adapter
 from fangorn.git import GitError, establish_worktree_generation
 from fangorn.git_worktree import (
     RepositorySource,
@@ -263,9 +265,7 @@ finally:
     environment["FANGORN_STARTED"] = str(started)
     environment["FANGORN_STOPPED"] = str(stopped)
     environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit else "0"
-    environment["FANGORN_DESCENDANT"] = (
-        "1" if kill_target == "supervisor" and not finish_on_parent_exit else "0"
-    )
+    environment["FANGORN_DESCENDANT"] = "1" if not finish_on_parent_exit else "0"
     hostile = tmp_path / "hostile"
     hostile_package = hostile / "fangorn"
     hostile_package.mkdir(parents=True)
@@ -322,6 +322,16 @@ finally:
     assert stopped.read_text(encoding="utf-8") == expected
     assert not hostile_marker.exists()
     assert checker._owner_status(owner) == "dead"
+
+
+def test_process_group_probe_falls_back_when_proc_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+
+    for module in (git_supervisor, git_worktree_adapter):
+        assert module._process_group_running(os.getpgrp()) is True
+        assert module._process_group_running(2**30) is False
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:

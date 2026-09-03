@@ -805,12 +805,6 @@ def _configuration_value(content: bytes) -> dict[str, object]:
         raise WorkspaceError("fangorn.toml services must be a table")
     if services:
         raise WorkspaceError("Service Resources are not available in this release")
-    try:
-        json.dumps(value, sort_keys=True, allow_nan=False)
-    except (TypeError, ValueError) as error:
-        raise WorkspaceError(
-            "fangorn.toml contains a value unsupported by schema-2 JSON"
-        ) from error
     return value
 
 
