@@ -245,7 +245,7 @@ def _capture_snapshot(
     if not facts or facts[0] != "true":
         raise GitError(f"Path is not inside a Git worktree: {requested_path}")
     if len(facts) != 4:
-        raise GitError("Git returned malformed worktree identity")
+        raise GitError(f"Git returned malformed worktree identity for {requested_path}")
     worktree_path = _required_path(facts[1], "worktree path")
     common_dir = _required_path(facts[2], "Git common directory")
     git_dir = _required_path(facts[3], "Git administrative directory")

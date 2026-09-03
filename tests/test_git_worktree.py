@@ -24,6 +24,7 @@ import fangorn._git_guardian as git_guardian
 import fangorn._git_supervisor as git_supervisor
 import fangorn.git as git_adapter
 import fangorn.git_worktree as git_worktree_adapter
+import fangorn.workspaces as workspaces_adapter
 from fangorn.git import (
     GitError,
     GitQuiescenceError,
@@ -1777,7 +1778,9 @@ def test_quiescence_guardian_holds_invocation_until_group_is_absent(
     process = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"], process_group=0
     )
-    owner = ProcessIdentity("guardian-owner", "boot", 2**30, "start")
+    owner = ProcessIdentity(
+        "guardian-owner", workspaces_adapter._boot_identity(), 2**30, "start"
+    )
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     workspaces = Workspaces(
         registry,

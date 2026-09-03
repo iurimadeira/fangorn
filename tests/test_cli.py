@@ -1511,7 +1511,7 @@ def test_adopt_rejects_non_utf8_git_output_without_a_traceback(
     wrapper.write_text(
         """#!/bin/sh
 case "$*" in
-    *"rev-parse --show-toplevel")
+    *"--show-toplevel"*)
         printf 'repository-\\377\\n'
         exit 0
         ;;
