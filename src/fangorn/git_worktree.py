@@ -165,6 +165,8 @@ def materialize_cache(
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
         _verify_bare_repository(cache_path, source.normalized)
+        if repository_generation(cache_path, create=False) is None:
+            raise GitError("Repository cache generation marker is missing")
         prepared = preparation_id is not None and _preparation_receipt_matches(
             cache_path, preparation_id, refresh_default_head
         )
