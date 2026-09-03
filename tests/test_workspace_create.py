@@ -1540,6 +1540,53 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
     )
 
 
+def test_retry_recreates_absent_worktree_after_completed_create_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "worktrees" / "receipt-committed"
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="receipt-committed",
+        path=target,
+        request_id="receipt-committed-1",
+        headless=True,
+    )
+    real_inspect = workspaces_module.inspect_owned_worktree
+    interrupted = False
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def remove_after_create_receipt(*args: object, **kwargs: object) -> object:
+        nonlocal interrupted
+        assert kwargs.get("liveness_fd") is not None
+        if not interrupted:
+            interrupted = True
+            git(repository, "worktree", "remove", "--force", str(target))
+            raise SimulatedInterruption("interrupted after create receipt")
+        return real_inspect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "fangorn.workspaces.inspect_owned_worktree", remove_after_create_receipt
+    )
+    with pytest.raises(SimulatedInterruption, match="after create receipt"):
+        workspaces.create(request)
+
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT status FROM operation_steps WHERE position = 0"
+        ).fetchone() == ("completed",)
+    assert not target.exists()
+
+    retried = workspaces.create(request)
+
+    assert retried.workspace.state == "ready"
+    assert retried.workspace.path == str(target.resolve())
+
+
 def test_cleanup_persistence_failure_is_reported_with_effect_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1612,6 +1659,102 @@ def test_unproven_git_quiescence_keeps_leases_active(
 
     with pytest.raises(WorkspaceError, match="Workspace mutation is busy"):
         workspaces.create(request)
+
+
+def test_in_operation_inspection_keeps_cross_process_lease_fenced(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    database = tmp_path / "state" / "registry.sqlite3"
+    target = tmp_path / "worktrees" / "inspection-fence"
+    sleeper_pid = tmp_path / "sleeper.pid"
+    script = """
+import subprocess
+import sys
+from pathlib import Path
+import fangorn.workspaces as module
+from fangorn.git import GitQuiescenceError
+from fangorn.git_worktree import _retain_quiescence_guardian
+from fangorn.registry import Registry
+from fangorn.workspaces import CreateWorkspace, WorkspaceError, Workspaces
+
+real_inspect = module.inspect_owned_worktree
+failed = False
+def fail_once(*args, **kwargs):
+    global failed
+    if failed:
+        return real_inspect(*args, **kwargs)
+    failed = True
+    liveness = kwargs.get("liveness_fd")
+    if liveness is None:
+        raise AssertionError("in-operation inspection lost invocation liveness")
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, process_group=0,
+    )
+    Path(sys.argv[4]).write_text(str(sleeper.pid), encoding="ascii")
+    _retain_quiescence_guardian(sleeper.pid, liveness_fd=liveness)
+    raise GitQuiescenceError("inspection quiescence is unproven")
+
+module.inspect_owned_worktree = fail_once
+try:
+    Workspaces(
+        Registry(Path(sys.argv[1])),
+        data_home=Path(sys.argv[1]).parent / "data",
+        cache_home=Path(sys.argv[1]).parent / "cache",
+    ).create(CreateWorkspace(
+        repository=sys.argv[2], branch="inspection-fence", path=Path(sys.argv[3]),
+        request_id="inspection-fence-1", headless=True,
+    ))
+except WorkspaceError as error:
+    if "inspection quiescence is unproven" not in str(error):
+        raise
+else:
+    raise AssertionError("inspection quiescence failure was not surfaced")
+"""
+    completed = subprocess.run(  # noqa: S603 -- fixed interpreter and test script
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(database),
+            str(repository),
+            str(target),
+            str(sleeper_pid),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    process_group = int(sleeper_pid.read_text(encoding="ascii"))
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="inspection-fence",
+        path=target,
+        request_id="inspection-fence-1",
+        headless=True,
+    )
+    workspaces = facade(tmp_path)
+    try:
+        with pytest.raises(WorkspaceError, match="Workspace mutation is busy"):
+            workspaces.create(request)
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            recovered = workspaces.create(request)
+            break
+        except WorkspaceError as error:
+            assert "Workspace mutation is busy" in str(error)
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    assert recovered.workspace.state == "ready"
 
 
 def test_repository_release_failure_preserves_cache_failure(

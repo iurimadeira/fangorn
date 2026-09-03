@@ -594,10 +594,22 @@ def create_worktree(
                 f"refs/heads/{branch}",
                 liveness_fd=liveness_fd,
             )
-            if branch_exists.returncode == 0:
+            if branch_exists.returncode == 0 and not reconcile:
                 raise GitError("Workspace branch already exists")
             if branch_exists.returncode != 1:
-                raise GitError(_git_error(branch_exists))
+                if branch_exists.returncode != 0:
+                    raise GitError(_git_error(branch_exists))
+                existing_commit = _run_git(
+                    repository,
+                    "rev-parse",
+                    "--verify",
+                    f"refs/heads/{branch}^{{commit}}",
+                    liveness_fd=liveness_fd,
+                )
+                if existing_commit != commit:
+                    raise GitError(
+                        "Existing Workspace branch does not match interrupted create"
+                    )
             _require_target_parent(parent)
             added = _run_git_process(
                 _required_git_path(

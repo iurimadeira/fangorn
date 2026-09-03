@@ -405,24 +405,25 @@ class Workspaces:
                     scope_key=intent.workspace_id,
                     lease_epoch=lease_epoch,
                 )
+                if step.action == "create":
+                    observation = create_worktree(
+                        repository,
+                        target=target,
+                        branch=request.branch,
+                        commit=commit,
+                        ownership_token=ownership_token,
+                        reconcile=previous != "pending",
+                        liveness_fd=self._invocation_descriptor(owner),
+                    )
+                elif previous != "completed":
+                    observation = inspect_owned_worktree(
+                        target,
+                        expected_commit=commit,
+                        expected_branch=request.branch,
+                        ownership_token=ownership_token,
+                        liveness_fd=self._invocation_descriptor(owner),
+                    )
                 if previous != "completed":
-                    if step.action == "create":
-                        observation = create_worktree(
-                            repository,
-                            target=target,
-                            branch=request.branch,
-                            commit=commit,
-                            ownership_token=ownership_token,
-                            reconcile=previous in {"running", "unknown"},
-                            liveness_fd=self._invocation_descriptor(owner),
-                        )
-                    else:
-                        observation = inspect_owned_worktree(
-                            target,
-                            expected_commit=commit,
-                            expected_branch=request.branch,
-                            ownership_token=ownership_token,
-                        )
                     self._registry.finish_operation_step(
                         intent.operation_id,
                         position=position,
