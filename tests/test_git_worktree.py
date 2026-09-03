@@ -2135,6 +2135,10 @@ def test_git_adapter_forces_stable_diagnostics_locale(
 
     assert captured["LC_ALL"] == "C"
     assert captured["LANG"] == "C"
+    assert captured["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert captured["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert captured["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert captured["GIT_ATTR_NOSYSTEM"] == "1"
 
 
 def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -> None:
@@ -2251,6 +2255,97 @@ def test_worktree_creation_rejects_executable_filters(tmp_path: Path) -> None:
     assert not (tmp_path / "target").exists()
 
 
+@pytest.mark.parametrize("entry", ["directory", "config"])
+def test_worktree_creation_rejects_shared_repository_configuration(
+    tmp_path: Path, entry: str
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    administrative = source / ".git"
+    unsafe = administrative if entry == "directory" else administrative / "config"
+    unsafe.chmod(unsafe.stat().st_mode | stat.S_IWOTH)
+
+    with pytest.raises(GitError, match="checkout configuration is unsafe"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="a" * 64,
+            reconcile=False,
+        )
+
+    assert not (tmp_path / "target").exists()
+
+
+def test_worktree_creation_rejects_configuration_writable_by_shared_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    configured = source / ".git" / "config"
+    configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
+
+    class OtherAccount:
+        pw_uid = os.geteuid() + 1
+        pw_gid = configured.stat().st_gid
+
+    monkeypatch.setattr(git_worktree_adapter.pwd, "getpwall", lambda: [OtherAccount()])
+
+    with pytest.raises(GitError, match="checkout configuration is unsafe"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="f" * 64,
+            reconcile=False,
+        )
+
+
+def test_worktree_creation_rejects_symlinked_repository_configuration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    configured = source / ".git" / "config"
+    replacement = source / ".git" / "real-config"
+    configured.rename(replacement)
+    configured.symlink_to(replacement.name)
+
+    with pytest.raises(GitError, match="checkout configuration is unsafe"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="9" * 64,
+            reconcile=False,
+        )
+
+
+def test_worktree_creation_rejects_local_configuration_includes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    included = tmp_path / "included.gitconfig"
+    included.write_text("", encoding="utf-8")
+    git(source, "config", "include.path", str(included))
+
+    with pytest.raises(GitError, match="checkout configuration includes"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="b" * 64,
+            reconcile=False,
+        )
+
+    assert not (tmp_path / "target").exists()
+
+
 def test_worktree_creation_rejects_gitdir_conditional_filters_before_checkout(
     tmp_path: Path,
 ) -> None:
@@ -2273,7 +2368,7 @@ def test_worktree_creation_rejects_gitdir_conditional_filters_before_checkout(
         str(included),
     )
 
-    with pytest.raises(GitError, match="executable checkout configuration"):
+    with pytest.raises(GitError, match="checkout configuration includes"):
         create_worktree(
             source,
             target=tmp_path / "target",

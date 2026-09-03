@@ -22,8 +22,11 @@ Git is required for every Workspace. Headless Workspaces need no terminal
 multiplexer. tmux will be required only when the built-in Terminal Resource is
 selected in a later release. Configured services and third-party adapters will
 require their own tools. Repository-configured executable checkout filters and
-filesystem monitors are rejected; Git hooks are disabled during creation. Click
-is Fangorn's only third-party runtime dependency.
+filesystem monitors and local configuration includes are rejected; Git hooks
+are disabled during creation. Local Git administrative directories and config
+files must be owned by the current account and not writable by another account;
+a user-private primary group is accepted. Click is Fangorn's only third-party
+runtime dependency.
 
 ## Install
 

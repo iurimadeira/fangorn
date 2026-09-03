@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import errno
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import select
 import shutil
@@ -768,39 +770,42 @@ def create_worktree(
                         "Existing Workspace branch does not match interrupted create"
                     )
             _require_target_parent(parent)
-            added = _run_git_process(
-                _required_git_path(
-                    repository,
-                    "rev-parse",
-                    "--absolute-git-dir",
-                    liveness_fd=liveness_fd,
-                ),
-                "worktree",
-                "add",
-                "--no-checkout",
-                "--detach",
-                staging.name,
-                commit,
-                git_dir=True,
+            repository_git_dir = _required_git_path(
+                repository,
+                "rev-parse",
+                "--absolute-git-dir",
                 liveness_fd=liveness_fd,
-                extra_fds=(parent.descriptor,),
-                working_directory_fd=parent.descriptor,
             )
+            repository_common_dir = _required_git_path(
+                repository,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                liveness_fd=liveness_fd,
+            )
+            with _trusted_checkout_configuration(
+                repository_common_dir, repository_git_dir
+            ):
+                _reject_executable_checkout_configuration(
+                    repository, liveness_fd=liveness_fd
+                )
+                added = _run_git_process(
+                    repository_git_dir,
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    "--detach",
+                    staging.name,
+                    commit,
+                    git_dir=True,
+                    liveness_fd=liveness_fd,
+                    extra_fds=(parent.descriptor,),
+                    working_directory_fd=parent.descriptor,
+                )
             if added.returncode != 0:
                 raise GitError(_git_error(added))
             _require_target_parent(parent)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
-        staging_descriptor = os.open(
-            staging.name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=parent.descriptor,
-        )
-        try:
-            _reject_executable_checkout_configuration(
-                staging_descriptor, liveness_fd=liveness_fd
-            )
-        finally:
-            os.close(staging_descriptor)
         establish_worktree_generation(observation.git_dir, ownership_token)
         observation = observe_worktree(staging, liveness_fd=liveness_fd)
         if observation.head != commit or observation.branch != branch:
@@ -824,13 +829,21 @@ def create_worktree(
                 dir_fd=parent.descriptor,
             )
             try:
-                selected = _run_git_process(
-                    Path("."),
-                    *checkout,
-                    liveness_fd=liveness_fd,
-                    extra_fds=(staging_descriptor,),
-                    working_directory_fd=staging_descriptor,
-                )
+                with _trusted_checkout_configuration(
+                    observation.repository_common_dir, observation.git_dir
+                ):
+                    _reject_executable_checkout_configuration(
+                        Path("."),
+                        worktree_descriptor=staging_descriptor,
+                        liveness_fd=liveness_fd,
+                    )
+                    selected = _run_git_process(
+                        Path("."),
+                        *checkout,
+                        liveness_fd=liveness_fd,
+                        extra_fds=(staging_descriptor,),
+                        working_directory_fd=staging_descriptor,
+                    )
             finally:
                 os.close(staging_descriptor)
             if selected.returncode != 0:
@@ -875,27 +888,139 @@ def create_worktree(
 
 
 def _reject_executable_checkout_configuration(
-    worktree_descriptor: int, *, liveness_fd: int | None = None
+    path: Path,
+    *,
+    worktree_descriptor: int | None = None,
+    liveness_fd: int | None = None,
 ) -> None:
     configured = _run_git_process(
-        Path("."),
+        path,
         "config",
-        "--includes",
+        "--no-includes",
         "--name-only",
         "--list",
         liveness_fd=liveness_fd,
-        extra_fds=(worktree_descriptor,),
+        extra_fds=(worktree_descriptor,) if worktree_descriptor is not None else (),
         working_directory_fd=worktree_descriptor,
     )
     if configured.returncode != 0:
         raise GitError(_git_error(configured))
     for name in configured.stdout.decode("utf-8", errors="replace").splitlines():
         lowered = name.lower()
+        if lowered == "include.path" or (
+            lowered.startswith("includeif.") and lowered.endswith(".path")
+        ):
+            raise GitError("Repository checkout configuration includes external files")
         if lowered == "core.fsmonitor" or (
             lowered.startswith("filter.")
             and lowered.rsplit(".", 1)[-1] in {"clean", "smudge", "process"}
         ):
             raise GitError("Repository has executable checkout configuration")
+
+
+@contextmanager
+def _trusted_checkout_configuration(common_dir: Path, git_dir: Path) -> Iterator[None]:
+    descriptors: list[int] = []
+    try:
+        for directory, name in (
+            (common_dir, "config"),
+            (git_dir, "config.worktree"),
+        ):
+            descriptor = _open_trusted_checkout_directory(directory)
+            descriptors.append(descriptor)
+            configured = _open_trusted_checkout_file(descriptor, name)
+            if configured is not None:
+                descriptors.append(configured)
+        yield
+    finally:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _open_trusted_checkout_directory(path: Path) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise GitError("Repository checkout configuration is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
+    current = Path(path.anchor)
+    try:
+        _require_trusted_checkout_component(os.fstat(descriptor), final=False)
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            current /= part
+            try:
+                metadata = os.fstat(child)
+                if current == path:
+                    _require_trusted_checkout_component(metadata, final=True)
+                else:
+                    _require_trusted_checkout_component(metadata, final=False)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        result = descriptor
+        descriptor = -1
+        return result
+    except (OSError, GitError) as error:
+        raise GitError("Repository checkout configuration is unsafe") from error
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _open_trusted_checkout_file(directory: int, name: str) -> int | None:
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise GitError("Repository checkout configuration is unsafe") from error
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid not in {0, os.geteuid()}
+        or _writable_by_another_principal(metadata)
+    ):
+        os.close(descriptor)
+        raise GitError("Repository checkout configuration is unsafe")
+    return descriptor
+
+
+def _require_trusted_checkout_component(
+    metadata: os.stat_result, *, final: bool
+) -> None:
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in {
+        0,
+        os.geteuid(),
+    }:
+        raise GitError("Repository checkout configuration is unsafe")
+    if _writable_by_another_principal(metadata) and not (
+        not final and metadata.st_mode & stat.S_ISVTX
+    ):
+        raise GitError("Repository checkout configuration is unsafe")
+
+
+def _writable_by_another_principal(metadata: os.stat_result) -> bool:
+    if metadata.st_mode & stat.S_IWOTH:
+        return True
+    if not metadata.st_mode & stat.S_IWGRP:
+        return False
+    try:
+        group = grp.getgrgid(metadata.st_gid)
+        member_uids = {pwd.getpwnam(name).pw_uid for name in group.gr_mem}
+        member_uids.update(
+            account.pw_uid
+            for account in pwd.getpwall()
+            if account.pw_gid == metadata.st_gid
+        )
+    except (KeyError, OSError):
+        return True
+    return bool(member_uids - {os.geteuid()})
 
 
 def _create_staging_receipt(
@@ -1185,7 +1310,9 @@ def _run_git_process(
         environment.pop(name, None)
     if isolate_config:
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_SYSTEM"] = os.devnull
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        environment["GIT_ATTR_NOSYSTEM"] = "1"
     owned_liveness: tuple[int, int] | None = None
     try:
         if liveness_fd is None:
