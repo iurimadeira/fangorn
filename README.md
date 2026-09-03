@@ -21,7 +21,9 @@ commands are not shipped yet. Existing `info`, `list`, and hidden migration
 Git is required for every Workspace. Headless Workspaces need no terminal
 multiplexer. tmux will be required only when the built-in Terminal Resource is
 selected in a later release. Configured services and third-party adapters will
-require their own tools. Click is Fangorn's only third-party runtime dependency.
+require their own tools. Repository-configured executable checkout filters and
+filesystem monitors are rejected; Git hooks are disabled during creation. Click
+is Fangorn's only third-party runtime dependency.
 
 ## Install
 

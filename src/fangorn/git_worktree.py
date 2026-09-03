@@ -416,6 +416,7 @@ def create_worktree(
                 "Workspace staging path already exists without ownership receipt"
             )
         _create_staging_receipt(receipt, ownership_token)
+    _reject_executable_checkout_configuration(repository)
     if staging.exists():
         observation = observe_worktree(staging)
         if observation.git_dir_generation not in {None, ownership_token}:
@@ -489,6 +490,26 @@ def create_worktree(
     )
     _remove_staging_receipt(receipt, ownership_token)
     return result
+
+
+def _reject_executable_checkout_configuration(repository: Path) -> None:
+    configured = _run_git_process(
+        repository,
+        "config",
+        "--includes",
+        "--local",
+        "--name-only",
+        "--list",
+    )
+    if configured.returncode != 0:
+        raise GitError(_git_error(configured))
+    for name in configured.stdout.decode("utf-8", errors="replace").splitlines():
+        lowered = name.lower()
+        if lowered == "core.fsmonitor" or (
+            lowered.startswith("filter.")
+            and lowered.rsplit(".", 1)[-1] in {"clean", "smudge", "process"}
+        ):
+            raise GitError("Repository has executable checkout configuration")
 
 
 def _create_staging_receipt(path: Path, ownership_token: str) -> None:
@@ -655,6 +676,8 @@ def _run_git_process(
     environment["LANG"] = "C"
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
     control_read: int | None = None
     control_write: int | None = None
     status_read: int | None = None
@@ -751,13 +774,13 @@ def _settle_orphaned_git(process_group: int, *, finish: bool) -> None:
             os.killpg(process_group, signal.SIGTERM)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            if not _process_group_leader_running(process_group):
+            if not _process_group_running(process_group):
                 return
             time.sleep(0.01)
         with suppress(ProcessLookupError):
             os.killpg(process_group, signal.SIGKILL)
     while True:
-        if not _process_group_leader_running(process_group):
+        if not _process_group_running(process_group):
             return
         time.sleep(0.01)
 
@@ -766,16 +789,32 @@ def _read_pipe(pipe: BinaryIO, output: list[bytes]) -> None:
     output.append(pipe.read())
 
 
-def _process_group_leader_running(process_group: int) -> bool:
-    try:
-        fields = Path(f"/proc/{process_group}/stat").read_text(encoding="ascii").split()
-    except (FileNotFoundError, OSError):
-        try:
-            os.killpg(process_group, 0)
-        except ProcessLookupError:
+def _process_group_running(process_group: int) -> bool:
+    proc = Path("/proc")
+    if proc.is_dir():
+        parsed = False
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = (
+                    (entry / "stat")
+                    .read_text(encoding="ascii")
+                    .rpartition(")")[2]
+                    .split()
+                )
+                parsed = True
+                if int(fields[2]) == process_group and fields[0] != "Z":
+                    return True
+            except (IndexError, OSError, ValueError):
+                continue
+        if parsed:
             return False
-        return True
-    return len(fields) > 2 and fields[2] != "Z"
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:

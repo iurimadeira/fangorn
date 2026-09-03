@@ -199,6 +199,58 @@ def test_reused_request_id_with_divergent_definition_conflicts_before_effects(
     assert not second_target.exists()
 
 
+def test_reused_target_with_divergent_definition_conflicts_before_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    target = tmp_path / "worktrees" / "same-target"
+    workspaces.create(
+        CreateWorkspace(repository=str(repository), branch="first", path=target)
+    )
+
+    def reject_effect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("divergent retry reached Git effect")
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", reject_effect)
+    with pytest.raises(WorkspaceError, match=r"Target path.*different.*request"):
+        workspaces.create(
+            CreateWorkspace(repository=str(repository), branch="second", path=target)
+        )
+
+    assert observe_worktree(target).branch == "first"
+
+
+def test_configuration_symlink_loop_is_a_domain_error_before_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    first = tmp_path / "config"
+    first.write_text("schema_version = 1\n", encoding="utf-8")
+    target = tmp_path / "target"
+    real_resolve = Path.resolve
+
+    def loop(path: Path, *, strict: bool = False) -> Path:
+        if path == first:
+            raise RuntimeError("synthetic symlink loop")
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", loop)
+
+    with pytest.raises(
+        WorkspaceError, match="Configuration path cannot be canonicalized"
+    ):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(repository), branch="topic", path=target, config=first
+            )
+        )
+
+    assert not target.exists()
+
+
 def test_created_workspace_remains_visible_through_schema_1_reads(
     tmp_path: Path,
 ) -> None:
@@ -1867,3 +1919,41 @@ def test_cli_rejects_temporal_configuration_with_domain_error(tmp_path: Path) ->
 
     assert completed.returncode != 0
     assert "unsupported top-level key: release_date" in completed.stderr
+
+
+def test_cli_rejects_configuration_symlink_loop_without_traceback(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    first = tmp_path / "config-a"
+    second = tmp_path / "config-b"
+    first.symlink_to(second)
+    second.symlink_to(first)
+    executable = Path(sys.executable).with_name("fangorn")
+
+    completed = subprocess.run(  # noqa: S603 -- test controls installed executable
+        [
+            executable,
+            "workspace",
+            "create",
+            "--repo",
+            str(repository),
+            "--branch",
+            "loop-config",
+            "--path",
+            str(tmp_path / "target"),
+            "--config",
+            str(first),
+            "--headless",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**dict(os.environ), "XDG_STATE_HOME": str(tmp_path / "state")},
+    )
+
+    assert completed.returncode != 0
+    assert "Configuration" in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert completed.stderr.count("\n") == 1

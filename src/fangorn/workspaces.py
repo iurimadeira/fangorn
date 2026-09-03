@@ -157,8 +157,8 @@ class Workspaces:
         process_identity: ProcessIdentity | None = None,
     ) -> None:
         self._registry = registry
-        self._data_home = data_home or _xdg_home("XDG_DATA_HOME", ".local/share")
-        self._cache_home = cache_home or _xdg_home("XDG_CACHE_HOME", ".cache")
+        self._data_home = data_home
+        self._cache_home = cache_home
         self._process_identity = process_identity
         self._invocation_root = registry.path.parent / "invocations"
 
@@ -213,11 +213,17 @@ class Workspaces:
                 raise WorkspaceError("A root Workspace requires a repository source")
             validate_branch_name(request.branch)
             source = normalize_repository_source(request.repository)
-            target = _target_path(request, source, self._data_home)
+            data_home = self._data_home
+            if request.path is None and data_home is None:
+                data_home = _xdg_home("XDG_DATA_HOME", ".local/share")
+            target = _target_path(request, source, data_home)
+            config_identity = (
+                _configuration_identity(request.config) if request.config else None
+            )
             request_value = {
                 "base": request.base,
                 "branch": request.branch,
-                "config": str(request.config.resolve()) if request.config else None,
+                "config": config_identity,
                 "headless": request.headless,
                 "no_start": not request.start,
                 "parent_id": None,
@@ -442,12 +448,13 @@ class Workspaces:
                 raise WorkspaceError("Local repository path is unavailable")
             return source.path
         operation_id = intent.operation_id
+        cache_home = self._cache_home or _xdg_home("XDG_CACHE_HOME", ".cache")
         digest = hashlib.sha256(source.normalized.encode()).hexdigest()
         registry_namespace = hashlib.sha256(
             str(self._registry.path.resolve()).encode()
         ).hexdigest()
         cache_path = (
-            self._cache_home
+            cache_home
             / "fangorn"
             / "repositories"
             / registry_namespace
@@ -724,11 +731,13 @@ def _xdg_home(variable: str, fallback: str) -> Path:
 
 
 def _target_path(
-    request: CreateWorkspace, source: RepositorySource, data_home: Path
+    request: CreateWorkspace, source: RepositorySource, data_home: Path | None
 ) -> Path:
     try:
         if request.path is not None:
             return _canonical_target(request.path.expanduser())
+        if data_home is None:
+            raise WorkspaceError("Workspace data home is unavailable")
     except (OSError, RuntimeError) as error:
         raise WorkspaceError("Workspace target path cannot be canonicalized") from error
     material = json.dumps(
@@ -763,6 +772,13 @@ def _canonical_target(path: Path) -> Path:
         if current.is_symlink():
             current.resolve(strict=True)
     return absolute.resolve(strict=False)
+
+
+def _configuration_identity(path: Path) -> str:
+    try:
+        return str(path.expanduser().resolve())
+    except (OSError, RuntimeError) as error:
+        raise WorkspaceError("Configuration path cannot be canonicalized") from error
 
 
 def re_sub_path(value: str) -> str:

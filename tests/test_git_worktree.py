@@ -222,6 +222,8 @@ def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
         "#!/bin/sh\n"
         "trap 'sleep 0.5; printf terminated > \"$FANGORN_STOPPED\"; exit 0' TERM\n"
         'printf started > "$FANGORN_STARTED"\n'
+        'if [ "$FANGORN_DESCENDANT" = 1 ]; then '
+        "(trap '' TERM; while :; do sleep 0.05; done) & fi\n"
         'if [ "$FANGORN_FINISH" = 1 ]; then sleep 0.5; '
         'printf completed > "$FANGORN_STOPPED"; exit 0; fi\n'
         "while :; do sleep 0.05; done\n",
@@ -261,6 +263,9 @@ finally:
     environment["FANGORN_STARTED"] = str(started)
     environment["FANGORN_STOPPED"] = str(stopped)
     environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit else "0"
+    environment["FANGORN_DESCENDANT"] = (
+        "1" if kill_target == "supervisor" and not finish_on_parent_exit else "0"
+    )
     hostile = tmp_path / "hostile"
     hostile_package = hostile / "fangorn"
     hostile_package.mkdir(parents=True)
@@ -503,6 +508,30 @@ def test_worktree_creation_disables_repository_hooks(tmp_path: Path) -> None:
     )
 
     assert not invoked.exists()
+
+
+def test_worktree_creation_rejects_executable_filters(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    invoked = tmp_path / "filter-invoked"
+    (source / ".gitattributes").write_text("*.payload filter=evil\n", encoding="utf-8")
+    (source / "content.payload").write_text("content\n", encoding="utf-8")
+    git(source, "add", ".gitattributes", "content.payload")
+    git(source, "commit", "-m", "add filtered content")
+    git(source, "config", "filter.evil.smudge", f"touch {invoked}")
+
+    with pytest.raises(GitError, match="executable checkout configuration"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="e" * 64,
+            reconcile=False,
+        )
+
+    assert not invoked.exists()
+    assert not (tmp_path / "target").exists()
 
 
 def test_worktree_adapter_rejects_markerless_matching_staging(tmp_path: Path) -> None:

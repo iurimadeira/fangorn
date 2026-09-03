@@ -519,6 +519,50 @@ def test_cli_reports_unavailable_home_without_a_traceback(tmp_path: Path) -> Non
     assert "Traceback" not in result.stderr
 
 
+def test_legacy_list_needs_only_explicit_state_home(tmp_path: Path) -> None:
+    result = run_fangorn(
+        tmp_path / "state",
+        "list",
+        "--json",
+        environment_overrides={
+            "HOME": None,
+            "XDG_DATA_HOME": None,
+            "XDG_CACHE_HOME": None,
+        },
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"schema_version": 1, "workspaces": []}
+
+
+def test_local_explicit_create_does_not_need_data_or_cache_home(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "target"
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "workspace",
+        "create",
+        "--repo",
+        str(repository),
+        "--branch",
+        "topic",
+        "--path",
+        str(target),
+        "--headless",
+        "--json",
+        environment_overrides={
+            "HOME": None,
+            "XDG_DATA_HOME": None,
+            "XDG_CACHE_HOME": None,
+        },
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["workspace"]["state"] == "ready"
+
+
 def test_git_older_than_231_fails_preflight_before_marker_creation(
     tmp_path: Path,
 ) -> None:
