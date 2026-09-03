@@ -2628,9 +2628,7 @@ def test_create_rejects_present_empty_configuration(
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_create_rejects_non_utf8_configuration(
-    tmp_path: Path, explicit: bool
-) -> None:
+def test_create_rejects_non_utf8_configuration(tmp_path: Path, explicit: bool) -> None:
     source = tmp_path / "repository"
     create_repository(source)
     config = tmp_path / "explicit.toml" if explicit else source / "fangorn.toml"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import select
 import shutil
 import signal
@@ -2290,7 +2291,7 @@ def test_worktree_creation_rejects_configuration_writable_by_shared_group(
         pw_uid = os.geteuid() + 1
         pw_gid = configured.stat().st_gid
 
-    monkeypatch.setattr(git_worktree_adapter.pwd, "getpwall", lambda: [OtherAccount()])
+    monkeypatch.setattr(pwd, "getpwall", lambda: [OtherAccount()])
 
     with pytest.raises(GitError, match="checkout configuration is unsafe"):
         create_worktree(
