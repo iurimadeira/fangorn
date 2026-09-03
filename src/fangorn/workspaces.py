@@ -4,7 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
-import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -28,6 +28,7 @@ from fangorn.git_worktree import (
     read_configuration,
     resolve_commit,
     validate_branch_name,
+    validate_target_path,
 )
 from fangorn.registry import (
     CreateAlreadyCompleted,
@@ -217,9 +218,8 @@ class Workspaces:
             if request.path is None and data_home is None:
                 data_home = _xdg_home("XDG_DATA_HOME", ".local/share")
             target = _target_path(request, source, data_home)
-            config_identity = (
-                _configuration_identity(request.config) if request.config else None
-            )
+            config = _configuration_path(request.config) if request.config else None
+            config_identity = str(config) if config is not None else None
             request_value = {
                 "base": request.base,
                 "branch": request.branch,
@@ -278,9 +278,7 @@ class Workspaces:
                         workspace_id=intent.workspace_id,
                         lease_epoch=lease_epoch,
                     )
-                loaded_configuration = read_configuration(
-                    repository, commit, request.config
-                )
+                loaded_configuration = read_configuration(repository, commit, config)
                 configuration_value = _configuration_value(loaded_configuration)
                 configuration = loaded_configuration or b""
                 resource_token = secrets.token_hex(32)
@@ -775,12 +773,19 @@ def _canonical_target(path: Path) -> Path:
         current /= part
         if current.is_symlink():
             current.resolve(strict=True)
-    return absolute.resolve(strict=False)
+    resolved = absolute.resolve(strict=False)
+    validate_target_path(resolved)
+    return resolved
 
 
-def _configuration_identity(path: Path) -> str:
+def _configuration_path(path: Path) -> Path:
     try:
-        return str(path.expanduser().resolve())
+        expanded = path.expanduser().absolute()
+        if expanded.is_symlink():
+            raise WorkspaceError("Configuration must be a regular non-symlink file")
+        return expanded.resolve(strict=True)
+    except WorkspaceError:
+        raise
     except (OSError, RuntimeError) as error:
         raise WorkspaceError("Configuration path cannot be canonicalized") from error
 
@@ -824,17 +829,24 @@ def _current_process_identity() -> ProcessIdentity:
 def _boot_identity() -> str:
     boot_id = Path("/proc/sys/kernel/random/boot_id")
     try:
-        return boot_id.read_text(encoding="ascii").strip()
+        value = boot_id.read_text(encoding="ascii").strip()
+        if value:
+            return value
     except OSError:
+        pass
+    try:
         result = subprocess.run(
             ["/usr/sbin/sysctl", "-n", "kern.boottime"],
             check=False,
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-        return f"{platform.node()}:unknown-boot"
+    except OSError as error:
+        raise WorkspaceError("Cannot establish host boot identity") from error
+    match = re.search(r"sec\s*=\s*(\d+).*usec\s*=\s*(\d+)", result.stdout)
+    if result.returncode == 0 and match:
+        return f"darwin:{match[1]}:{match[2]}"
+    raise WorkspaceError("Cannot establish host boot identity")
 
 
 def _process_start_identity(pid: int) -> str:
@@ -843,11 +855,14 @@ def _process_start_identity(pid: int) -> str:
         fields = stat_path.read_text(encoding="ascii").rsplit(")", 1)[1].split()
         return fields[19]
     except (OSError, IndexError):
+        environment = os.environ.copy()
+        environment.update({"LANG": "C", "LC_ALL": "C", "TZ": "UTC"})
         result = subprocess.run(  # noqa: S603
             ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
             check=False,
             capture_output=True,
             text=True,
+            env=environment,
         )
         if result.returncode != 0 or not result.stdout.strip():
             raise WorkspaceError("Cannot establish process start identity") from None
@@ -855,7 +870,11 @@ def _process_start_identity(pid: int) -> str:
 
 
 def _process_owner_status(owner: ProcessIdentity) -> str:
-    if owner.boot_identity != _boot_identity():
+    try:
+        boot_identity = _boot_identity()
+    except WorkspaceError:
+        return "inconclusive"
+    if owner.boot_identity != boot_identity:
         return "dead"
     try:
         os.kill(owner.pid, 0)

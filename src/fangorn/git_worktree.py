@@ -9,14 +9,15 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Thread
-from typing import TYPE_CHECKING, BinaryIO, cast
+from types import FrameType
+from typing import TYPE_CHECKING, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from fangorn.git import (
@@ -41,6 +42,14 @@ class RepositorySource:
     path: Path | None
     clone_url: str | None
     name: str
+
+
+@dataclass(frozen=True)
+class _TargetParent:
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
 
 
 def normalize_repository_source(value: str) -> RepositorySource:
@@ -385,112 +394,127 @@ def create_worktree(
 ) -> WorktreeObservation:
     staging = target.parent / f".fangorn-{ownership_token}"
     receipt = target.parent / f".fangorn-{ownership_token}.intent"
-    if target.exists():
-        if not reconcile:
-            raise GitError(f"Workspace target path already exists: {target}")
-        observation = observe_worktree(target)
-        if observation.git_dir_generation != ownership_token:
-            raise GitError("Existing target is not owned by this Workspace create")
+    parent = _prepare_target_parent(target.parent)
+    try:
+        target_kind = _entry_kind(parent.descriptor, target.name)
+        if target_kind is not None:
+            if target_kind == "symlink" or not reconcile:
+                raise GitError(f"Workspace target path already exists: {target}")
+            observation = observe_worktree(target)
+            if observation.git_dir_generation != ownership_token:
+                raise GitError("Existing target is not owned by this Workspace create")
+            if observation.head != commit or observation.branch != branch:
+                raise GitError("Existing target does not match the interrupted create")
+            result = observe_worktree(
+                target,
+                create_repository_generation=True,
+                create_worktree_generation=False,
+            )
+            _remove_staging_receipt(receipt, ownership_token, parent.descriptor)
+            return result
+
+        receipt_kind = _entry_kind(parent.descriptor, receipt.name)
+        staging_kind = _entry_kind(parent.descriptor, staging.name)
+        if reconcile:
+            if receipt_kind is not None:
+                _require_staging_receipt(receipt, ownership_token, parent.descriptor)
+            elif staging_kind is not None:
+                raise GitError(
+                    "Workspace staging path already exists without ownership receipt"
+                )
+            else:
+                _create_staging_receipt(receipt, ownership_token, parent.descriptor)
+        else:
+            if staging_kind is not None:
+                raise GitError(
+                    "Workspace staging path already exists without ownership receipt"
+                )
+            _create_staging_receipt(receipt, ownership_token, parent.descriptor)
+        _reject_executable_checkout_configuration(repository)
+        _require_target_parent(parent)
+        if staging_kind is not None:
+            if staging_kind == "symlink":
+                raise GitError("Workspace staging path is unsafe")
+            observation = observe_worktree(staging)
+            if observation.git_dir_generation not in {None, ownership_token}:
+                raise GitError("Staged Worktree belongs to another Workspace create")
+            if observation.head != commit or observation.branch not in {None, branch}:
+                raise GitError("Staged Worktree does not match the interrupted create")
+        else:
+            branch_exists = _run_git_process(
+                repository,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+                liveness_fd=liveness_fd,
+            )
+            if branch_exists.returncode == 0:
+                raise GitError("Workspace branch already exists")
+            if branch_exists.returncode != 1:
+                raise GitError(_git_error(branch_exists))
+            _require_target_parent(parent)
+            added = _run_git_process(
+                repository,
+                "worktree",
+                "add",
+                "--detach",
+                str(staging),
+                commit,
+                liveness_fd=liveness_fd,
+            )
+            if added.returncode != 0:
+                raise GitError(_git_error(added))
+            _require_target_parent(parent)
+            observation = observe_worktree(staging)
+        establish_worktree_generation(observation.git_dir, ownership_token)
+        observation = observe_worktree(staging)
         if observation.head != commit or observation.branch != branch:
-            raise GitError("Existing target does not match the interrupted create")
+            branch_exists = _run_git_process(
+                repository,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+                liveness_fd=liveness_fd,
+            )
+            checkout = (
+                ("checkout", branch)
+                if branch_exists.returncode == 0
+                else ("checkout", "-b", branch, commit)
+            )
+            _require_target_parent(parent)
+            selected = _run_git_process(staging, *checkout, liveness_fd=liveness_fd)
+            if selected.returncode != 0:
+                raise GitError(_git_error(selected))
+            _require_target_parent(parent)
+            observation = observe_worktree(staging)
+            if observation.head != commit or observation.branch != branch:
+                raise GitError("Staged Worktree does not match the interrupted create")
+        _fsync_descriptor(parent.descriptor, "Workspace staging publication")
+        _require_target_parent(parent)
+        moved = _run_git_process(
+            repository,
+            "worktree",
+            "move",
+            str(staging),
+            str(target),
+            liveness_fd=liveness_fd,
+            finish_on_parent_exit=True,
+        )
+        if moved.returncode != 0:
+            raise GitError(_git_error(moved))
+        _require_target_parent(parent)
+        _fsync_descriptor(parent.descriptor, "Workspace target publication")
         result = observe_worktree(
             target,
             create_repository_generation=True,
             create_worktree_generation=False,
         )
-        _remove_staging_receipt(receipt, ownership_token)
+        _remove_staging_receipt(receipt, ownership_token, parent.descriptor)
         return result
-
-    _mkdir_durable(target.parent)
-    if reconcile:
-        if receipt.exists():
-            _require_staging_receipt(receipt, ownership_token)
-        elif staging.exists():
-            raise GitError(
-                "Workspace staging path already exists without ownership receipt"
-            )
-        else:
-            _create_staging_receipt(receipt, ownership_token)
-    else:
-        if staging.exists():
-            raise GitError(
-                "Workspace staging path already exists without ownership receipt"
-            )
-        _create_staging_receipt(receipt, ownership_token)
-    _reject_executable_checkout_configuration(repository)
-    if staging.exists():
-        observation = observe_worktree(staging)
-        if observation.git_dir_generation not in {None, ownership_token}:
-            raise GitError("Staged Worktree belongs to another Workspace create")
-        if observation.head != commit or observation.branch not in {None, branch}:
-            raise GitError("Staged Worktree does not match the interrupted create")
-    else:
-        branch_exists = _run_git_process(
-            repository,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            liveness_fd=liveness_fd,
-        )
-        if branch_exists.returncode == 0:
-            raise GitError("Workspace branch already exists")
-        if branch_exists.returncode != 1:
-            raise GitError(_git_error(branch_exists))
-        added = _run_git_process(
-            repository,
-            "worktree",
-            "add",
-            "--detach",
-            str(staging),
-            commit,
-            liveness_fd=liveness_fd,
-        )
-        if added.returncode != 0:
-            raise GitError(_git_error(added))
-        observation = observe_worktree(staging)
-    establish_worktree_generation(observation.git_dir, ownership_token)
-    observation = observe_worktree(staging)
-    if observation.head != commit or observation.branch != branch:
-        branch_exists = _run_git_process(
-            repository,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            liveness_fd=liveness_fd,
-        )
-        checkout = (
-            ("checkout", branch)
-            if branch_exists.returncode == 0
-            else ("checkout", "-b", branch, commit)
-        )
-        selected = _run_git_process(staging, *checkout, liveness_fd=liveness_fd)
-        if selected.returncode != 0:
-            raise GitError(_git_error(selected))
-        observation = observe_worktree(staging)
-        if observation.head != commit or observation.branch != branch:
-            raise GitError("Staged Worktree does not match the interrupted create")
-    _fsync_directory(target.parent, "Workspace staging publication")
-    moved = _run_git_process(
-        repository,
-        "worktree",
-        "move",
-        str(staging),
-        str(target),
-        liveness_fd=liveness_fd,
-        finish_on_parent_exit=True,
-    )
-    if moved.returncode != 0:
-        raise GitError(_git_error(moved))
-    _fsync_directory(target.parent, "Workspace target publication")
-    result = observe_worktree(
-        target,
-        create_repository_generation=True,
-        create_worktree_generation=False,
-    )
-    _remove_staging_receipt(receipt, ownership_token)
-    return result
+    finally:
+        os.close(parent.descriptor)
 
 
 def _reject_executable_checkout_configuration(repository: Path) -> None:
@@ -513,7 +537,9 @@ def _reject_executable_checkout_configuration(repository: Path) -> None:
             raise GitError("Repository has executable checkout configuration")
 
 
-def _create_staging_receipt(path: Path, ownership_token: str) -> None:
+def _create_staging_receipt(
+    path: Path, ownership_token: str, parent_descriptor: int
+) -> None:
     descriptor: int | None = None
     temporary: Path | None = None
     try:
@@ -529,8 +555,13 @@ def _create_staging_receipt(path: Path, ownership_token: str) -> None:
                 raise OSError("short write")
             written += count
         os.fsync(descriptor)
-        os.link(temporary, path, follow_symlinks=False)
-        _fsync_directory(path.parent, "Workspace staging ownership")
+        os.link(
+            temporary,
+            path.name,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _fsync_descriptor(parent_descriptor, "Workspace staging ownership")
     except OSError as error:
         raise GitError("Workspace staging ownership receipt is unavailable") from error
     finally:
@@ -544,12 +575,14 @@ def _create_staging_receipt(path: Path, ownership_token: str) -> None:
                 pass
 
 
-def _require_staging_receipt(path: Path, ownership_token: str) -> None:
+def _require_staging_receipt(
+    path: Path, ownership_token: str, parent_descriptor: int
+) -> None:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
         try:
             metadata = os.fstat(descriptor)
             value = os.read(descriptor, 129)
@@ -565,17 +598,106 @@ def _require_staging_receipt(path: Path, ownership_token: str) -> None:
         raise GitError("Workspace staging ownership receipt is invalid")
 
 
-def _remove_staging_receipt(path: Path, ownership_token: str) -> None:
-    if not path.exists():
+def _remove_staging_receipt(
+    path: Path, ownership_token: str, parent_descriptor: int
+) -> None:
+    if _entry_kind(parent_descriptor, path.name) is None:
         return
-    _require_staging_receipt(path, ownership_token)
+    _require_staging_receipt(path, ownership_token, parent_descriptor)
     try:
-        path.unlink()
+        os.unlink(path.name, dir_fd=parent_descriptor)
     except OSError as error:
         raise GitError(
             "Workspace staging ownership receipt cannot be removed"
         ) from error
-    _fsync_directory(path.parent, "Workspace staging ownership")
+    _fsync_descriptor(parent_descriptor, "Workspace staging ownership")
+
+
+def validate_target_path(target: Path) -> None:
+    descriptor = _walk_target_parent(target.parent, create=False)
+    if descriptor is not None:
+        os.close(descriptor)
+
+
+def _prepare_target_parent(path: Path) -> _TargetParent:
+    descriptor = _walk_target_parent(path, create=True)
+    if descriptor is None:
+        raise GitError("Workspace target parent is unavailable")
+    metadata = os.fstat(descriptor)
+    return _TargetParent(path, descriptor, metadata.st_dev, metadata.st_ino)
+
+
+def _walk_target_parent(path: Path, *, create: bool) -> int | None:
+    if not path.is_absolute():
+        raise GitError("Workspace target path must be absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
+    try:
+        _require_safe_directory(os.fstat(descriptor))
+        for part in path.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=descriptor)
+            try:
+                _require_safe_directory(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        result = descriptor
+        descriptor = -1
+        return result
+    except OSError as error:
+        raise GitError("Workspace target parent is unsafe") from error
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _require_safe_directory(metadata: os.stat_result) -> None:
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in {0, os.geteuid()}:
+        raise GitError("Workspace target parent is unsafe")
+    writable = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if writable and not metadata.st_mode & stat.S_ISVTX:
+        raise GitError("Workspace target parent is unsafe")
+
+
+def _require_target_parent(parent: _TargetParent) -> None:
+    try:
+        metadata = parent.path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise GitError("Workspace target parent changed during creation") from error
+    if (
+        metadata.st_dev != parent.device
+        or metadata.st_ino != parent.inode
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise GitError("Workspace target parent changed during creation")
+
+
+def _entry_kind(parent_descriptor: int, name: str) -> str | None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return "symlink" if stat.S_ISLNK(metadata.st_mode) else "present"
+
+
+def _fsync_descriptor(descriptor: int, label: str) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise GitError(f"{label} directory is not durable") from error
 
 
 def _fsync_directory(path: Path, label: str) -> None:
@@ -687,39 +809,11 @@ def _run_git_process(
                 capture_output=True,
                 env=environment,
             )
-        process = subprocess.Popen(  # noqa: S603
+        return _run_supervised_git(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-            pass_fds=(liveness_fd,),
-            start_new_session=True,
-        )
-        stdout_parts: list[bytes] = []
-        stderr_parts: list[bytes] = []
-        stdout_pipe = cast(BinaryIO, process.stdout)
-        stderr_pipe = cast(BinaryIO, process.stderr)
-        readers = (
-            Thread(target=_read_pipe, args=(stdout_pipe, stdout_parts)),
-            Thread(target=_read_pipe, args=(stderr_pipe, stderr_parts)),
-        )
-        started: list[Thread] = []
-        try:
-            for reader in readers:
-                reader.start()
-                started.append(reader)
-            process.wait()
-            _drain_git_group(process)
-            for reader in started:
-                reader.join()
-        except BaseException:
-            _settle_interrupted_git(process, started, finish=finish_on_parent_exit)
-            raise
-        return subprocess.CompletedProcess(
-            command,
-            process.returncode,
-            b"".join(stdout_parts),
-            b"".join(stderr_parts),
+            environment,
+            liveness_fd=liveness_fd,
+            finish_on_parent_exit=finish_on_parent_exit,
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
@@ -727,52 +821,109 @@ def _run_git_process(
         raise GitError(f"Cannot run Git: {error}") from error
 
 
-def _settle_interrupted_git(
-    process: subprocess.Popen[bytes], readers: list[Thread], *, finish: bool
-) -> None:
-    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+def _run_supervised_git(
+    command: list[str],
+    environment: dict[str, str],
+    *,
+    liveness_fd: int,
+    finish_on_parent_exit: bool,
+) -> subprocess.CompletedProcess[bytes]:
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    supervisor = [
+        sys.executable,
+        "-I",
+        str(Path(__file__).with_name("_git_supervisor.py")),
+        str(control_read),
+        str(status_write),
+        str(liveness_fd),
+        *command,
+    ]
     try:
-        if finish:
-            process.wait()
-            _drain_git_group(process)
-        else:
-            _cancel_git_group(process)
-        for reader in readers:
-            reader.join()
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            with _ignore_repeated_sigint():
+                process = subprocess.Popen(  # noqa: S603
+                    supervisor,
+                    stdout=stdout,
+                    stderr=stderr,
+                    env=environment,
+                    pass_fds=(control_read, status_write, liveness_fd),
+                    start_new_session=True,
+                )
+                os.close(control_read)
+                control_read = -1
+                os.close(status_write)
+                status_write = -1
+                try:
+                    child_pid_value = os.read(status_read, 32).strip()
+                    child_pid = (
+                        int(child_pid_value) if child_pid_value.isdigit() else None
+                    )
+                    process.wait()
+                    if child_pid is not None and _process_group_running(child_pid):
+                        _cancel_process_group(child_pid)
+                except BaseException:
+                    with suppress(OSError):
+                        os.write(
+                            control_write,
+                            b"f" if finish_on_parent_exit else b"c",
+                        )
+                    process.wait()
+                    raise
+            stdout.seek(0)
+            stderr.seek(0)
+            return subprocess.CompletedProcess(
+                command, process.returncode, stdout.read(), stderr.read()
+            )
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+        for descriptor in (control_read, control_write, status_read, status_write):
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
 
 
-def _cancel_git_group(process: subprocess.Popen[bytes]) -> None:
+@contextmanager
+def _ignore_repeated_sigint() -> Iterator[None]:
+    try:
+        previous = signal.getsignal(signal.SIGINT)
+        installed = True
+        interrupted = False
+
+        def interrupt(signum: int, frame: FrameType | None) -> None:
+            nonlocal interrupted
+            if interrupted:
+                return
+            interrupted = True
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if callable(previous):
+                previous(signum, frame)
+            elif previous != signal.SIG_IGN:
+                raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, interrupt)
+    except ValueError:
+        installed = False
+        previous = signal.SIG_DFL
+    try:
+        yield
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
+
+
+def _cancel_process_group(process_group: int) -> None:
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    _drain_git_group(process)
-
-
-def _drain_git_group(process: subprocess.Popen[bytes]) -> None:
-    process.poll()
-    if not _process_group_running(process.pid):
-        process.wait()
-        return
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        process.poll()
-        if not _process_group_running(process.pid):
-            process.wait()
+        if not _process_group_running(process_group):
             return
         time.sleep(0.01)
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    while _process_group_running(process.pid):
-        process.poll()
+        os.killpg(process_group, signal.SIGKILL)
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline and _process_group_running(process_group):
         time.sleep(0.01)
-    process.wait()
-
-
-def _read_pipe(pipe: BinaryIO, output: list[bytes]) -> None:
-    output.append(pipe.read())
 
 
 def _process_group_running(process_group: int) -> bool:

@@ -12,6 +12,7 @@ from threading import Event
 import pytest
 from git_helpers import git, initialize_repository
 
+import fangorn.workspaces as workspaces_module
 from fangorn.git import observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
@@ -1578,6 +1579,7 @@ def test_explicit_target_is_canonicalized_before_definition(tmp_path: Path) -> N
     create_repository(repository)
     real_parent = tmp_path / "real-parent"
     real_parent.mkdir()
+    real_parent.chmod(0o700)
     linked_parent = tmp_path / "linked-parent"
     linked_parent.symlink_to(real_parent, target_is_directory=True)
     requested = linked_parent / "unused" / ".." / "topic"
@@ -1594,6 +1596,81 @@ def test_explicit_target_is_canonicalized_before_definition(tmp_path: Path) -> N
 
     assert created.workspace.path == str((real_parent / "topic").resolve())
     assert retried.workspace.definition.id == created.workspace.definition.id
+
+
+def test_create_rejects_unsafe_target_parent_before_state(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+
+    with pytest.raises(WorkspaceError, match="cannot be canonicalized"):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(repository),
+                branch="unsafe-target",
+                path=unsafe / "target",
+            )
+        )
+
+    assert not (tmp_path / "state").exists()
+
+
+def test_create_rejects_dangling_target_symlink(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "target"
+    target.symlink_to(tmp_path / "absent")
+
+    with pytest.raises(WorkspaceError, match="cannot be canonicalized"):
+        facade(tmp_path).create(
+            CreateWorkspace(repository=str(repository), branch="dangling", path=target)
+        )
+
+    assert not (tmp_path / "state").exists()
+
+
+def test_explicit_configuration_uses_its_canonical_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    config = tmp_path / "fangorn.toml"
+    config.write_text("schema_version = 1\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    result = facade(tmp_path).create(
+        CreateWorkspace(
+            repository=str(repository),
+            branch="home-config",
+            path=tmp_path / "target",
+            config=Path("~/fangorn.toml"),
+        )
+    )
+
+    assert result.workspace.definition.configuration == b"schema_version = 1\n"
+
+
+def test_unavailable_boot_probe_never_proves_owner_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = ProcessIdentity("owner", "boot", os.getpid(), "start")
+    probes: list[str | None] = [None, "boot"]
+
+    def boot_identity() -> str:
+        value = probes.pop(0)
+        if value is None:
+            raise WorkspaceError("unavailable")
+        return value
+
+    monkeypatch.setattr(workspaces_module, "_boot_identity", boot_identity)
+    monkeypatch.setattr(
+        workspaces_module, "_process_start_identity", lambda _pid: "start"
+    )
+
+    assert workspaces_module._process_owner_status(owner) == "inconclusive"
+    assert workspaces_module._process_owner_status(owner) == "live"
 
 
 def test_symlink_loop_target_fails_as_workspace_error_before_state(

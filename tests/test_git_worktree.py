@@ -207,7 +207,8 @@ def test_interrupted_refresh_is_replayed_without_completion_receipt(
     [
         (False, False, "terminated"),
         (True, False, "completed"),
-        (False, True, "completed"),
+        (False, True, "terminated"),
+        (True, True, "terminated"),
     ],
 )
 def test_interrupted_owner_waits_for_git_tree_before_releasing_lease(
@@ -261,7 +262,7 @@ finally:
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["FANGORN_STARTED"] = str(started)
     environment["FANGORN_STOPPED"] = str(stopped)
-    environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit or hard_death else "0"
+    environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit else "0"
     environment["FANGORN_DESCENDANT"] = (
         "1" if not finish_on_parent_exit and not hard_death else "0"
     )
@@ -300,6 +301,9 @@ finally:
     while not stopped.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert stopped.read_text(encoding="utf-8") == expected
+    deadline = time.monotonic() + 5
+    while checker._owner_status(owner) != "dead" and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert checker._owner_status(owner) == "dead"
     if hard_death:
         registry.acquire_lease(
@@ -357,34 +361,115 @@ def test_git_cleanup_blocks_repeated_interrupts(
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    started = tmp_path / "started"
+    stopped = tmp_path / "stopped"
     fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "trap 'printf stopped > \"$FANGORN_STOPPED\"; exit 0' TERM\n"
+        'printf started > "$FANGORN_STARTED"\n'
+        "while :; do sleep 0.05; done\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    script = """
+import os
+from pathlib import Path
+from fangorn.git_worktree import _run_git_process
+read_fd, write_fd = os.pipe()
+try:
+    _run_git_process(Path.cwd(), "fetch", liveness_fd=read_fd)
+except KeyboardInterrupt:
+    print("interrupted", flush=True)
+finally:
+    os.close(read_fd)
+    os.close(write_fd)
+"""
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["FANGORN_STARTED"] = str(started)
+    environment["FANGORN_STOPPED"] = str(stopped)
+    child = subprocess.Popen(  # noqa: S603 -- fixed interpreter and test script
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    deadline = time.monotonic() + 5
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    child.send_signal(signal.SIGINT)
+    child.send_signal(signal.SIGINT)
+
+    stdout, _ = child.communicate(timeout=5)
+
+    assert child.returncode == 0
+    assert stdout.strip() == "interrupted"
+    assert stopped.read_text(encoding="utf-8") == "stopped"
+
+
+def test_supervised_git_captures_output_without_reader_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\nhead -c 131072 /dev/zero\nhead -c 131072 /dev/zero >&2\n",
+        encoding="utf-8",
+    )
     fake_git.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
-    original = git_worktree_adapter._drain_git_group
-    masks: list[bool] = []
-
-    def interrupt_first_cleanup(process: subprocess.Popen[bytes]) -> None:
-        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-        masks.append(signal.SIGINT in blocked)
-        if len(masks) == 1:
-            raise KeyboardInterrupt
-        original(process)
-
-    monkeypatch.setattr(
-        git_worktree_adapter, "_drain_git_group", interrupt_first_cleanup
-    )
     liveness, writer = os.pipe()
     try:
-        with pytest.raises(KeyboardInterrupt):
-            git_worktree_adapter._run_git_process(
-                tmp_path, "fetch", liveness_fd=liveness
-            )
+        result = git_worktree_adapter._run_git_process(
+            tmp_path, "fetch", liveness_fd=liveness, finish_on_parent_exit=True
+        )
     finally:
         os.close(liveness)
         os.close(writer)
 
-    assert masks == [False, True]
+    assert result.returncode == 0
+    assert len(result.stdout) == 131072
+    assert len(result.stderr) == 131072
+
+
+def test_worktree_create_rejects_replaced_target_parent_before_git_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    commit = repository(source)
+    parent = tmp_path / "worktrees"
+    parent.mkdir(mode=0o700)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir(mode=0o700)
+    original_parent = tmp_path / "original-parent"
+    original = git_worktree_adapter._run_git_process
+    swapped = False
+
+    def swap_after_probe(*args: object, **kwargs: object) -> object:
+        nonlocal swapped
+        result = original(*args, **kwargs)  # type: ignore[arg-type]
+        if "show-ref" in args and not swapped:
+            swapped = True
+            parent.rename(original_parent)
+            parent.symlink_to(replacement, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(git_worktree_adapter, "_run_git_process", swap_after_probe)
+
+    with pytest.raises(GitError, match="parent changed"):
+        create_worktree(
+            source,
+            target=parent / "topic",
+            branch="topic",
+            commit=commit,
+            ownership_token="a" * 64,
+            reconcile=False,
+        )
+
+    assert not any(replacement.iterdir())
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:
