@@ -26,6 +26,10 @@ class RegistryError(RuntimeError):
     """Registry operation failed without weakening Workspace invariants."""
 
 
+class CreateAlreadyCompleted(RegistryError):
+    """Equivalent create completed before this invocation acquired its lease."""
+
+
 @dataclass(frozen=True)
 class WorkspaceRecord:
     id: str
@@ -341,7 +345,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
             """
             CREATE TRIGGER workspace_create_requires_one_worktree
-            BEFORE UPDATE OF status ON operations
+            BEFORE UPDATE OF status, kind, workspace_id ON operations
             FOR EACH ROW
             WHEN NEW.kind = 'create' AND NEW.status = 'completed'
                 AND (
@@ -401,11 +405,63 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             END
             """,
             """
+            CREATE TRIGGER workspace_aggregate_completion_valid
+            BEFORE UPDATE OF completed_operation_id ON workspace_aggregates
+            FOR EACH ROW
+            WHEN NEW.completed_operation_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM operations
+                WHERE id = NEW.completed_operation_id
+                    AND workspace_id = NEW.workspace_id
+                    AND kind = 'create' AND status = 'completed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is invalid');
+            END
+            """,
+            """
             CREATE TRIGGER workspace_completion_immutable
             BEFORE UPDATE OF completed_operation_id ON workspaces
             FOR EACH ROW
             WHEN OLD.completed_operation_id IS NOT NULL
                 AND NEW.completed_operation_id IS NOT OLD.completed_operation_id
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_completion_valid
+            BEFORE UPDATE OF completed_operation_id ON workspaces
+            FOR EACH ROW
+            WHEN NEW.completed_operation_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM operations
+                WHERE id = NEW.completed_operation_id
+                    AND workspace_id = NEW.id
+                    AND kind = 'create' AND status = 'completed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is invalid');
+            END
+            """,
+            """
+            CREATE TRIGGER completed_create_operation_immutable
+            BEFORE UPDATE OF workspace_id, kind, status ON operations
+            FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM workspace_aggregates
+                WHERE completed_operation_id = OLD.id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER completed_create_operation_delete_immutable
+            BEFORE DELETE ON operations
+            FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM workspace_aggregates
+                WHERE completed_operation_id = OLD.id
+            )
             BEGIN
                 SELECT RAISE(ABORT, 'workspace completion is immutable');
             END
@@ -930,6 +986,16 @@ class Registry:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                if scope_kind == "workspace":
+                    terminal = connection.execute(
+                        "SELECT status FROM workspace_create_intents "
+                        "WHERE workspace_id = ? AND operation_id = ?",
+                        (scope_key, operation_id),
+                    ).fetchone()
+                    if terminal is not None and terminal["status"] == "completed":
+                        raise CreateAlreadyCompleted(
+                            "Workspace create operation already completed"
+                        )
                 row = connection.execute(
                     "SELECT * FROM mutation_leases "
                     "WHERE scope_kind = ? AND scope_key = ?",
@@ -1358,7 +1424,7 @@ class Registry:
                         aggregate_version, origin, completed_operation_id
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL,
-                        ?, ?, ?, ?, ?, 1, 'created', ?
+                        ?, ?, ?, ?, ?, 1, 'created', NULL
                     )
                     """,
                     (
@@ -1377,7 +1443,6 @@ class Registry:
                         configuration_json,
                         configuration_digest,
                         state,
-                        intent.operation_id,
                     ),
                 )
                 connection.execute(
@@ -1409,6 +1474,10 @@ class Registry:
                 ).rowcount
                 if aggregate_changed != 1:
                     raise RegistryError("Workspace completion is already recorded")
+                connection.execute(
+                    "UPDATE workspaces SET completed_operation_id = ? WHERE id = ?",
+                    (intent.operation_id, intent.workspace_id),
+                )
                 connection.execute(
                     "UPDATE workspace_create_intents "
                     "SET status = 'completed', updated_at = ? WHERE operation_id = ?",

@@ -10,6 +10,7 @@ import tomllib
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Literal, cast
 from uuid import uuid4
 
@@ -26,6 +27,7 @@ from fangorn.git_worktree import (
     resolve_commit,
 )
 from fangorn.registry import (
+    CreateAlreadyCompleted,
     CreateIntentRecord,
     ProcessIdentity,
     Registry,
@@ -34,6 +36,8 @@ from fangorn.registry import (
 from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
 
 ADOPTION_ATTEMPTS = 3
+_ACTIVE_INVOCATIONS: set[str] = set()
+_ACTIVE_INVOCATIONS_LOCK = Lock()
 
 
 class WorkspaceError(RuntimeError):
@@ -195,6 +199,7 @@ class Workspaces:
     def create(self, request: CreateWorkspace) -> CreateWorkspaceResult:
         intent: CreateIntentRecord | None = None
         lease_epoch: int | None = None
+        owner: ProcessIdentity | None = None
         try:
             if not request.headless:
                 raise WorkspaceError(
@@ -231,15 +236,7 @@ class Workspaces:
                 prepare_cache=source.clone_url is not None,
             )
             if intent.status == "completed":
-                aggregate, operation = self._load_completed(intent.workspace_id)
-                resource = aggregate.definition.resources[0]
-                inspect_owned_worktree(
-                    Path(aggregate.path),
-                    expected_commit=None,
-                    expected_branch=None,
-                    ownership_token=resource.ownership_token,
-                )
-                return CreateWorkspaceResult(aggregate, operation, created=False)
+                return self._completed_create(intent.workspace_id)
 
             repository = self._prepare_repository(source, intent, owner)
             if intent.resolved_json is None:
@@ -287,13 +284,16 @@ class Workspaces:
                 definition=_create_definition(intent, target, resolved),
             )
 
-            lease_epoch = self._registry.acquire_lease(
-                scope_kind="workspace",
-                scope_key=intent.workspace_id,
-                operation_id=intent.operation_id,
-                owner=owner,
-                owner_status=_owner_status,
-            )
+            try:
+                lease_epoch = self._registry.acquire_lease(
+                    scope_kind="workspace",
+                    scope_key=intent.workspace_id,
+                    operation_id=intent.operation_id,
+                    owner=owner,
+                    owner_status=_owner_status,
+                )
+            except CreateAlreadyCompleted:
+                return self._completed_create(intent.workspace_id)
             lifecycle = plan_create(
                 (LifecycleResource("worktree", "worktree"),), start=request.start
             )
@@ -391,6 +391,10 @@ class Workspaces:
             ):
                 raise WorkspaceError(str(error)) from error
             raise
+        finally:
+            if owner is not None:
+                with _ACTIVE_INVOCATIONS_LOCK:
+                    _ACTIVE_INVOCATIONS.discard(owner.process_instance_id)
 
     def list(self) -> list[Workspace]:
         try:
@@ -513,14 +517,27 @@ class Workspaces:
             status=str(operation_row["status"]),
         )
 
+    def _completed_create(self, workspace_id: str) -> CreateWorkspaceResult:
+        aggregate, operation = self._load_completed(workspace_id)
+        inspect_owned_worktree(
+            Path(aggregate.path),
+            expected_commit=None,
+            expected_branch=None,
+            ownership_token=aggregate.definition.resources[0].ownership_token,
+        )
+        return CreateWorkspaceResult(aggregate, operation, created=False)
+
     def _invocation_process_identity(self) -> ProcessIdentity:
         identity = self._process_identity or _current_process_identity()
-        return ProcessIdentity(
+        invocation = ProcessIdentity(
             process_instance_id=str(uuid4()),
             boot_identity=identity.boot_identity,
             pid=identity.pid,
             process_start_identity=identity.process_start_identity,
         )
+        with _ACTIVE_INVOCATIONS_LOCK:
+            _ACTIVE_INVOCATIONS.add(invocation.process_instance_id)
+        return invocation
 
 
 def _create_definition(
@@ -685,4 +702,11 @@ def _owner_status(owner: ProcessIdentity) -> str:
         current_start = _process_start_identity(owner.pid)
     except WorkspaceError:
         return "inconclusive"
-    return "live" if current_start == owner.process_start_identity else "dead"
+    if current_start != owner.process_start_identity:
+        return "dead"
+    if owner.pid == os.getpid():
+        with _ACTIVE_INVOCATIONS_LOCK:
+            return (
+                "live" if owner.process_instance_id in _ACTIVE_INVOCATIONS else "dead"
+            )
+    return "live"

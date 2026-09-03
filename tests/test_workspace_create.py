@@ -487,18 +487,46 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         headless=True,
     )
     interrupted = False
+    definition_seen = False
+
+    class SimulatedInterruption(BaseException):
+        pass
 
     def interrupt_after_effect(*args: object, **kwargs: object) -> object:
-        nonlocal interrupted
+        nonlocal definition_seen, interrupted
+        with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+            row = connection.execute(
+                "SELECT definition_json FROM workspace_aggregates"
+            ).fetchone()
+        assert row is not None
+        definition = json.loads(row[0])
+        assert definition["id"]
+        assert definition["repository_id"]
+        assert definition["created_from_sha"]
+        assert definition["configuration_digest"]
+        assert definition["resources"] == [
+            {
+                "adapter_api_major": 1,
+                "adapter_id": "fangorn.git-worktree",
+                "configuration": {},
+                "external_reference": None,
+                "kind": "worktree",
+                "locator": str(target.resolve()),
+                "name": "worktree",
+                "ownership_token": definition["resources"][0]["ownership_token"],
+            }
+        ]
+        definition_seen = True
         observation = real_create_worktree(*args, **kwargs)  # type: ignore[arg-type]
         if not interrupted:
             interrupted = True
-            raise RuntimeError("simulated interruption after Git effect")
+            raise SimulatedInterruption("simulated interruption after Git effect")
         return observation
 
     monkeypatch.setattr("fangorn.workspaces.create_worktree", interrupt_after_effect)
-    with pytest.raises(RuntimeError, match="simulated interruption"):
+    with pytest.raises(SimulatedInterruption, match="simulated interruption"):
         workspaces.create(request)
+    assert definition_seen
 
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
         assert connection.execute(
@@ -531,6 +559,79 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         git(target, "rev-parse", "HEAD")
         == recovered.workspace.definition.created_from_sha
     )
+
+
+def test_ended_same_process_invocation_can_recover_when_cleanup_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "worktrees" / "cleanup-contention"
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="cleanup-contention",
+        path=target,
+        request_id="cleanup-contention-1",
+        headless=True,
+    )
+
+    def interrupt(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("effect failed")
+
+    def cleanup_busy(**_kwargs: object) -> None:
+        raise RegistryError("Registry is busy")
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", interrupt)
+    monkeypatch.setattr(workspaces._registry, "fail_create_operation", cleanup_busy)
+    with pytest.raises(RuntimeError, match="effect failed"):
+        workspaces.create(request)
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", real_create_worktree)
+    recovered = facade(tmp_path).create(request)
+    assert recovered.workspace.state == "ready"
+
+
+def test_create_finishing_between_intent_read_and_lease_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "worktrees" / "lease-race"
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="lease-race",
+        path=target,
+        request_id="lease-race-1",
+        headless=True,
+    )
+    first_waiting = Event()
+    release_first = Event()
+    acquire = workspaces._registry.acquire_lease
+    workspace_calls = 0
+
+    def interleaved_acquire(**kwargs: object) -> int:
+        nonlocal workspace_calls
+        if kwargs["scope_kind"] == "workspace":
+            workspace_calls += 1
+            if workspace_calls == 1:
+                first_waiting.set()
+                assert release_first.wait(timeout=10)
+        return acquire(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(workspaces._registry, "acquire_lease", interleaved_acquire)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        delayed = executor.submit(workspaces.create, request)
+        assert first_waiting.wait(timeout=5)
+        completed = workspaces.create(request)
+        release_first.set()
+        retried = delayed.result(timeout=10)
+
+    assert completed.workspace.state == "ready"
+    assert retried.created is False
+    assert retried.workspace.definition.id == completed.workspace.definition.id
+    assert retried.operation.id == completed.operation.id
 
 
 def test_same_facade_rejects_concurrent_create_invocation(
@@ -732,6 +833,64 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
                 "('completed-bypass', 'missing-workspace', 'create', 'completed', "
                 "NULL, ?, ?)",
                 ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+        connection.execute(
+            "INSERT INTO operations VALUES "
+            "('kind-bypass', 'missing-workspace', 'stop', 'completed', NULL, ?, ?)",
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="requires one worktree"):
+            connection.execute(
+                "UPDATE operations SET kind = 'create' WHERE id = 'kind-bypass'"
+            )
+        connection.execute(
+            "INSERT INTO operations VALUES "
+            "('workspace-bypass', ?, 'create', 'running', NULL, ?, ?)",
+            (
+                created.definition.id,
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        connection.execute(
+            "UPDATE operations SET status = 'completed' WHERE id = 'workspace-bypass'"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="requires one worktree"):
+            connection.execute(
+                "UPDATE operations SET workspace_id = 'missing-workspace' "
+                "WHERE id = 'workspace-bypass'"
+            )
+        connection.execute(
+            "INSERT INTO workspace_create_intents "
+            "(operation_id, workspace_id, request_key, request_json, target_path, "
+            "status, created_at, updated_at) VALUES "
+            "('pending-op', 'pending-workspace', 'pending-key', '{}', '/pending', "
+            "'creating', ?, ?)",
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO operations VALUES "
+            "('pending-op', 'pending-workspace', 'stop', 'completed', NULL, ?, ?)",
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO workspace_aggregates "
+            "(workspace_id, definition_json, lifecycle_state) "
+            "VALUES ('pending-workspace', '{}', 'creating')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="completion is invalid"):
+            connection.execute(
+                "UPDATE workspace_aggregates SET completed_operation_id = 'pending-op' "
+                "WHERE workspace_id = 'pending-workspace'"
+            )
+        completed_operation_id = connection.execute(
+            "SELECT completed_operation_id FROM workspaces WHERE id = ?",
+            (created.definition.id,),
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="completion is immutable"):
+            connection.execute(
+                "UPDATE operations SET kind = 'stop' WHERE id = ?",
+                (completed_operation_id,),
             )
 
 
