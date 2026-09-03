@@ -830,6 +830,15 @@ class Registry:
                     raise RegistryError(
                         "Target path belongs to a different Workspace create request"
                     )
+                bound = connection.execute(
+                    "SELECT 1 FROM workspaces WHERE path = ? UNION ALL "
+                    "SELECT 1 FROM workspace_resources WHERE locator = ? LIMIT 1",
+                    (target_path, target_path),
+                ).fetchone()
+                if bound is not None:
+                    raise RegistryError(
+                        "Target path already belongs to an existing Workspace"
+                    )
                 now = _timestamp()
                 connection.execute(
                     """

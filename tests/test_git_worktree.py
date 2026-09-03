@@ -259,6 +259,28 @@ def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -
         )
 
 
+def test_worktree_adapter_rejects_markerless_matching_staging(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    target = tmp_path / "target"
+    token = "f" * 64
+    staging = target.parent / f".fangorn-{token}"
+    git(source, "worktree", "add", "-b", "topic", str(staging), commit)
+
+    with pytest.raises(GitError, match="ownership receipt"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
+
+    assert staging.exists()
+    assert not target.exists()
+
+
 def test_worktree_recovery_never_claims_markerless_final_target(
     tmp_path: Path,
 ) -> None:

@@ -55,19 +55,48 @@ def test_adoption_cannot_claim_an_incomplete_create_target(tmp_path: Path) -> No
 def test_adoption_and_create_use_the_same_repository_identity(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
-    registry = Registry(tmp_path / "state" / "registry.sqlite3")
-    observation = observe_worktree(
-        repository,
-        create_repository_generation=True,
-        create_worktree_generation=True,
-        reserve_observation=registry.reserve_observation,
+    workspaces = facade(tmp_path)
+    created = workspaces.create(
+        CreateWorkspace(
+            repository=str(repository),
+            branch="created",
+            path=tmp_path / "worktrees" / "created",
+        )
+    )
+    adopted_path = tmp_path / "worktrees" / "adopted"
+    git(repository, "worktree", "add", "-b", "adopted", str(adopted_path), "HEAD")
+
+    adopted = workspaces.adopt(adopted_path)
+
+    assert (
+        adopted.workspace.binding.repository_id
+        == created.workspace.definition.repository_id
     )
 
-    adopted, _ = registry.adopt(observation)
 
-    assert adopted.repository_id == registry.repository_id_for_common_dir(
-        str(observation.repository_common_dir)
-    )
+def test_create_cannot_poison_an_adopted_target(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    adopted = workspaces.adopt(repository)
+
+    with pytest.raises(WorkspaceError, match="already belongs"):
+        workspaces.create(
+            CreateWorkspace(
+                repository=str(repository),
+                branch="topic",
+                path=repository,
+                request_id="conflicting-create",
+            )
+        )
+
+    retried = workspaces.adopt(repository)
+    assert retried.created is False
+    assert retried.workspace.binding.id == adopted.workspace.binding.id
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workspace_create_intents"
+        ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize(
@@ -271,6 +300,34 @@ def test_clone_url_resolves_tag_base(tmp_path: Path) -> None:
     assert result.workspace.definition.created_from_sha == tagged_sha
 
 
+def test_new_clone_create_refreshes_cached_remote_head(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    first_sha = create_repository(repository)
+    workspaces = facade(tmp_path)
+    first = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="first",
+            path=tmp_path / "worktrees" / "first",
+        )
+    )
+    (repository / "later.txt").write_text("later\n", encoding="utf-8")
+    git(repository, "add", "later.txt")
+    git(repository, "commit", "-m", "later")
+    second_sha = git(repository, "rev-parse", "HEAD")
+
+    second = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="second",
+            path=tmp_path / "worktrees" / "second",
+        )
+    )
+
+    assert first.workspace.definition.created_from_sha == first_sha
+    assert second.workspace.definition.created_from_sha == second_sha
+
+
 def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
@@ -408,6 +465,13 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
             definition={"id": intent.workspace_id},
         )
     with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.fail_create_operation(
+            operation_id=intent.operation_id,
+            workspace_id=intent.workspace_id,
+            lease_epoch=old_epoch,
+            error="stale failure",
+        )
+    with pytest.raises(RegistryError, match="Stale operation result"):
         registry.finish_operation_step(
             intent.operation_id,
             position=0,
@@ -430,6 +494,14 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
         )
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
         assert connection.execute("SELECT COUNT(*) FROM workspaces").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT epoch, active FROM mutation_leases "
+            "WHERE scope_kind = 'workspace' AND scope_key = ?",
+            (intent.workspace_id,),
+        ).fetchone() == (new_epoch, 1)
+        assert connection.execute(
+            "SELECT error FROM operations WHERE id = ?", (intent.operation_id,)
+        ).fetchone() != ("stale failure",)
     assert (
         registry.start_operation_step(
             intent.operation_id,

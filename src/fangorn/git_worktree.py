@@ -127,6 +127,16 @@ def materialize_cache(
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
         _verify_bare_repository(cache_path, source.normalized)
+        fetched = _run_git_process(
+            cache_path,
+            "fetch",
+            "--prune",
+            "--tags",
+            "origin",
+            "+refs/heads/*:refs/heads/*",
+        )
+        if fetched.returncode != 0:
+            raise GitError(_git_error(fetched))
         return cache_path
     require_supported_git(cache_path.parent)
     prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
@@ -215,6 +225,8 @@ def create_worktree(
     ownership_token: str,
     reconcile: bool,
 ) -> WorktreeObservation:
+    staging = target.parent / f".fangorn-{ownership_token}"
+    receipt = target.parent / f".fangorn-{ownership_token}.intent"
     if target.exists():
         if not reconcile:
             raise GitError(f"Workspace target path already exists: {target}")
@@ -223,14 +235,30 @@ def create_worktree(
             raise GitError("Existing target is not owned by this Workspace create")
         if observation.head != commit or observation.branch != branch:
             raise GitError("Existing target does not match the interrupted create")
-        return observe_worktree(
+        result = observe_worktree(
             target,
             create_repository_generation=True,
             create_worktree_generation=False,
         )
+        _remove_staging_receipt(receipt, ownership_token)
+        return result
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.parent / f".fangorn-{ownership_token}"
+    if reconcile:
+        if receipt.exists():
+            _require_staging_receipt(receipt, ownership_token)
+        elif staging.exists():
+            raise GitError(
+                "Workspace staging path already exists without ownership receipt"
+            )
+        else:
+            _create_staging_receipt(receipt, ownership_token)
+    else:
+        if staging.exists():
+            raise GitError(
+                "Workspace staging path already exists without ownership receipt"
+            )
+        _create_staging_receipt(receipt, ownership_token)
     if staging.exists():
         observation = observe_worktree(staging)
         if observation.git_dir_generation not in {None, ownership_token}:
@@ -238,7 +266,7 @@ def create_worktree(
         if observation.head != commit or observation.branch != branch:
             raise GitError("Staged Worktree does not match the interrupted create")
     else:
-        result = _run_git_process(
+        added = _run_git_process(
             repository,
             "worktree",
             "add",
@@ -247,18 +275,68 @@ def create_worktree(
             str(staging),
             commit,
         )
-        if result.returncode != 0:
-            raise GitError(_git_error(result))
+        if added.returncode != 0:
+            raise GitError(_git_error(added))
         observation = observe_worktree(staging)
     establish_worktree_generation(observation.git_dir, ownership_token)
     moved = _run_git_process(repository, "worktree", "move", str(staging), str(target))
     if moved.returncode != 0:
         raise GitError(_git_error(moved))
-    return observe_worktree(
+    result = observe_worktree(
         target,
         create_repository_generation=True,
         create_worktree_generation=False,
     )
+    _remove_staging_receipt(receipt, ownership_token)
+    return result
+
+
+def _create_staging_receipt(path: Path, ownership_token: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise GitError("Workspace staging ownership receipt is unavailable") from error
+    try:
+        os.write(descriptor, ownership_token.encode())
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _require_staging_receipt(path: Path, ownership_token: str) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            value = os.read(descriptor, 129)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise GitError("Workspace staging ownership receipt is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or value != ownership_token.encode()
+    ):
+        raise GitError("Workspace staging ownership receipt is invalid")
+
+
+def _remove_staging_receipt(path: Path, ownership_token: str) -> None:
+    if not path.exists():
+        return
+    _require_staging_receipt(path, ownership_token)
+    try:
+        path.unlink()
+    except OSError as error:
+        raise GitError(
+            "Workspace staging ownership receipt cannot be removed"
+        ) from error
 
 
 def inspect_owned_worktree(
