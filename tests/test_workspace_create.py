@@ -1162,6 +1162,50 @@ def test_successful_create_eventually_removes_guardian_held_invocation_marker(
         time.sleep(0.01)
 
 
+def test_marker_cleaner_survives_creator_exit_until_guardian_releases(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "registry.sqlite3"
+    script = """
+import subprocess
+import sys
+from pathlib import Path
+from fangorn.git_worktree import _retain_quiescence_guardian
+from fangorn.registry import Registry
+from fangorn.workspaces import Workspaces
+
+target = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(2)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    process_group=0,
+)
+workspaces = Workspaces(Registry(Path(sys.argv[1])))
+owner = workspaces._invocation_process_identity()
+marker = workspaces._invocation_root / owner.process_instance_id
+_retain_quiescence_guardian(
+    target.pid,
+    liveness_fd=workspaces._invocation_descriptor(owner),
+)
+workspaces._finish_invocation(owner)
+print(marker, flush=True)
+"""
+    completed = subprocess.run(  # noqa: S603 -- fixed interpreter and test script
+        [sys.executable, "-c", script, str(database)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    marker = Path(completed.stdout.strip())
+    assert marker.exists()
+
+    deadline = time.monotonic() + 5
+    while marker.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
 def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     created_from_sha = create_repository(repository)

@@ -6,6 +6,8 @@ import json
 import os
 import re
 import secrets
+import select
+import signal
 import stat
 import subprocess
 import sys
@@ -52,22 +54,49 @@ _ACTIVE_INVOCATIONS: dict[str, tuple[int, Path]] = {}
 _ACTIVE_INVOCATIONS_LOCK = Lock()
 
 
-def _unlink_invocation_marker_after_unlock(descriptor: int, marker: Path) -> None:
+def _defer_invocation_marker_cleanup(descriptor: int, marker: Path) -> None:
+    ready_read, ready_write = os.pipe()
+    blocked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        opened = os.fstat(descriptor)
-        current = marker.stat(follow_symlinks=False)
-        if (
-            stat.S_ISREG(current.st_mode)
-            and opened.st_dev == current.st_dev
-            and opened.st_ino == current.st_ino
-        ):
-            marker.unlink()
-    except OSError:
-        pass
+        cleaner = subprocess.Popen(  # noqa: S603 -- fixed cleaner argv
+            [
+                sys.executable,
+                "-I",
+                str(Path(__file__).with_name("_invocation_cleaner.py")),
+                str(descriptor),
+                str(marker),
+                str(ready_write),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                name: value
+                for name, value in os.environ.items()
+                if name not in {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"}
+            },
+            pass_fds=(descriptor, ready_write),
+            process_group=0,
+        )
+    except BaseException:
+        os.close(ready_read)
+        raise
     finally:
-        with suppress(OSError):
-            os.close(descriptor)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        os.close(ready_write)
+    try:
+        readable, _, _ = select.select((ready_read,), (), (), 5)
+        ready = os.read(ready_read, 3) if readable else b""
+    finally:
+        os.close(ready_read)
+    if ready != b"r\n":
+        with suppress(ProcessLookupError):
+            os.killpg(cleaner.pid, signal.SIGKILL)
+        cleaner.wait(timeout=2)
+        raise WorkspaceError("Cannot establish Workspace marker cleaner")
+    with suppress(RuntimeError):
+        Thread(target=cleaner.wait, daemon=True).start()
 
 
 class WorkspaceError(RuntimeError):
@@ -710,16 +739,11 @@ class Workspaces:
                         "Cannot close Workspace invocation marker"
                     ) from errors[0]
                 try:
-                    Thread(
-                        target=_unlink_invocation_marker_after_unlock,
-                        args=(cleanup, marker),
-                        daemon=True,
-                    ).start()
-                except RuntimeError as error:
+                    _defer_invocation_marker_cleanup(cleanup, marker)
+                except (OSError, subprocess.SubprocessError) as error:
                     raise WorkspaceError(
                         "Cannot defer Workspace invocation marker cleanup"
                     ) from error
-                cleanup = -1
                 return
             marker.unlink()
         except OSError as error:
