@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +394,48 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     assert drained == [child]
 
 
+def test_supervisor_reports_git_startup_os_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipes = [os.pipe() for _ in range(5)]
+    control, status, completion, liveness, anchor = pipes
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "supervisor",
+            str(control[0]),
+            str(status[1]),
+            str(completion[1]),
+            str(liveness[0]),
+            str(anchor[1]),
+            "123",
+            "",
+            "-1",
+            "cancel",
+            "3600",
+            str(8 * 1024 * 1024),
+            "git",
+        ],
+    )
+    monkeypatch.setattr(
+        git_supervisor,
+        "_supervise",
+        lambda *_args: (_ for _ in ()).throw(
+            FileNotFoundError(2, "No such file or directory", "git")
+        ),
+    )
+    try:
+        assert git_supervisor.main() == 127
+        assert os.read(status[0], 16) == b"!2\n"
+        assert os.read(completion[0], 1) == b""
+    finally:
+        for read, write in pipes:
+            for descriptor in (read, write):
+                with suppress(OSError):
+                    os.close(descriptor)
+
+
 def test_supervisor_does_not_reap_before_group_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,7 +478,8 @@ def test_supervised_git_rejects_missing_child_handshake(
         returncode = 1
 
         @staticmethod
-        def wait() -> int:
+        def wait(timeout: float | None = None) -> int:
+            del timeout
             return 1
 
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FailedSupervisor())
@@ -476,14 +521,31 @@ def test_supervisor_pid_reader_completes_short_pipe_reads(
     assert git_worktree_adapter._read_supervisor_pid(10) == 123
 
 
-def test_supervisor_pid_reader_returns_without_waiting_for_pipe_close() -> None:
+def test_supervisor_pid_reader_completes_when_frame_writer_closes() -> None:
     read, write = os.pipe()
     try:
         os.write(write, b"123\n")
-        started = time.monotonic()
+        os.close(write)
+        write = -1
 
         assert git_worktree_adapter._read_supervisor_pid(read) == 123
-        assert time.monotonic() - started < 0.1
+    finally:
+        os.close(read)
+        if write >= 0:
+            os.close(write)
+
+
+def test_supervisor_pid_reader_deadline_rejects_unclosed_frame() -> None:
+    read, write = os.pipe()
+    try:
+        os.write(write, b"123\n")
+
+        assert (
+            git_worktree_adapter._read_supervisor_pid(
+                read, deadline=time.monotonic() + 0.05
+            )
+            is None
+        )
     finally:
         os.close(read)
         os.close(write)
@@ -516,6 +578,27 @@ def test_supervisor_completion_reader_requires_one_complete_frame(
 
     chunks = iter((b"0\n", b"extra", b""))
     assert git_worktree_adapter._read_supervisor_completion(10) is None
+
+
+def test_parent_kills_a_supervisor_that_will_not_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HungSupervisor:
+        pid = 123
+        waits = 0
+
+        def wait(self, *, timeout: float) -> int:
+            self.waits += 1
+            if self.waits < 3:
+                raise subprocess.TimeoutExpired(["supervisor"], timeout)
+            return -signal.SIGKILL
+
+    signals: list[int] = []
+    monkeypatch.setattr(os, "killpg", lambda _pid, sent: signals.append(sent))
+
+    git_worktree_adapter._settle_process(HungSupervisor())  # type: ignore[arg-type]
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_portable_group_probe_ignores_zombie_leader(
@@ -1045,6 +1128,37 @@ def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> N
         owner=live,
         owner_status=lambda owner: "dead" if owner == dead else "live",
     )
+
+    assert not abandoned.exists()
+
+
+def test_abandoned_clone_cleanup_accepts_concurrent_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "cache"
+    abandoned = parent / "clone-dead-private"
+    abandoned.mkdir(parents=True)
+    dead = ProcessIdentity("dead", "boot", 1001, "start")
+    (abandoned / "owner.json").write_text(
+        json.dumps(
+            {
+                "process_instance_id": dead.process_instance_id,
+                "boot_identity": dead.boot_identity,
+                "pid": dead.pid,
+                "process_start_identity": dead.process_start_identity,
+            }
+        ),
+        encoding="utf-8",
+    )
+    remove = shutil.rmtree
+
+    def raced_remove(path: Path) -> None:
+        remove(path)
+        raise FileNotFoundError
+
+    monkeypatch.setattr(shutil, "rmtree", raced_remove)
+
+    git_worktree_adapter._cleanup_abandoned_clones(parent, lambda _owner: "dead")
 
     assert not abandoned.exists()
 

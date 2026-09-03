@@ -473,6 +473,14 @@ def test_ci_smoke_tests_installed_artifact_help_and_version() -> None:
         "uv run --isolated --no-project --with dist/*.tar.gz fangorn --version"
         in workflow
     )
+    assert (
+        "uv run --isolated --no-project --with dist/*.whl fangorn workspace create"
+        in workflow
+    )
+    assert (
+        "uv run --isolated --no-project --with dist/*.tar.gz fangorn workspace create"
+        in workflow
+    )
 
 
 def test_publication_gate_accepts_exact_release_artifact_set(tmp_path: Path) -> None:

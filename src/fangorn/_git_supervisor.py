@@ -41,13 +41,19 @@ def main() -> int:
         except OSError as error:
             with suppress(OSError):
                 os.write(status, f"!{error.errno}\n".encode("ascii"))
+                os.close(status)
             return 127
         with suppress(BrokenPipeError):
             os.write(completion, f"{result}\n".encode("ascii"))
+        os.close(completion)
+        completion = -1
         return result
     finally:
-        os.close(anchor_control)
-        os.close(completion)
+        with suppress(OSError):
+            os.close(anchor_control)
+        if completion >= 0:
+            with suppress(OSError):
+                os.close(completion)
 
 
 def _supervise(

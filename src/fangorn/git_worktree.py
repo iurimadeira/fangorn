@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import stat
@@ -328,7 +329,8 @@ def _cleanup_abandoned_clones(
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             continue
         if owner_status(owner) == "dead":
-            shutil.rmtree(resolved)
+            with suppress(FileNotFoundError):
+                shutil.rmtree(resolved)
 
 
 def _refresh_bare_repository(
@@ -950,6 +952,7 @@ def _run_supervised_git(
     process: subprocess.Popen[bytes] | None = None
     process_group: int | None = None
     settled = False
+    deadline = time.monotonic() + GIT_EFFECT_TIMEOUT_SECONDS + 5
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             interrupt_command = b"f" if finish_on_parent_exit else b"c"
@@ -1024,18 +1027,20 @@ def _run_supervised_git(
                         anchor_control_write = -1
                     finally:
                         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-                    child_pid = _read_supervisor_pid(status_read)
+                    child_pid = _read_supervisor_pid(status_read, deadline=deadline)
                     if child_pid is None:
                         raise GitError("Git supervisor failed before child startup")
-                    returncode = _read_supervisor_completion(completion_read)
+                    returncode = _read_supervisor_completion(
+                        completion_read, deadline=deadline
+                    )
                     if returncode is None:
                         _cancel_process_group(process_group)
-                        process.wait()
-                        anchor.wait()
+                        _settle_process(process)
+                        _settle_process(anchor)
                         settled = True
                         raise GitError("Git supervisor failed before completion")
-                    process.wait()
-                    anchor.wait()
+                    _settle_process(process)
+                    _settle_process(anchor)
                     settled = True
                 except BaseException:
                     for descriptor in (control_read, status_write, completion_write):
@@ -1045,15 +1050,20 @@ def _run_supervised_git(
                     with suppress(OSError):
                         os.write(control_write, interrupt_command)
                     if process is not None and not settled:
-                        completion = _read_supervisor_completion(completion_read)
+                        completion = _read_supervisor_completion(
+                            completion_read,
+                            deadline=(
+                                deadline if finish_on_parent_exit else time.monotonic()
+                            ),
+                        )
                         if completion is None and process_group is not None:
                             _cancel_process_group(process_group)
-                        process.wait()
+                        _settle_process(process)
                     if anchor is not None and not settled:
                         with suppress(OSError):
                             os.close(anchor_control_write)
                         _cancel_process_group(anchor.pid)
-                        anchor.wait()
+                        _settle_process(anchor)
                     raise
             stdout.seek(0)
             stderr.seek(0)
@@ -1119,46 +1129,61 @@ def _supervisor_pid(value: bytes) -> int | None:
     return pid if pid <= 2_147_483_647 else None
 
 
-def _read_supervisor_pid(descriptor: int) -> int | None:
-    value = _read_pipe_frame(descriptor, 11)
+def _read_supervisor_pid(
+    descriptor: int, *, deadline: float | None = None
+) -> int | None:
+    value = _read_pipe_frame(descriptor, 11, deadline=deadline)
     if match := re.fullmatch(rb"!([0-9]{1,3})\n", value):
         number = int(match[1])
         raise OSError(number, os.strerror(number))
     return _supervisor_pid(value)
 
 
-def _read_supervisor_completion(descriptor: int) -> int | None:
-    value = _read_pipe_frame(descriptor, 5)
+def _read_supervisor_completion(
+    descriptor: int, *, deadline: float | None = None
+) -> int | None:
+    value = _read_pipe_frame(descriptor, 5, deadline=deadline)
     if not re.fullmatch(rb"-?[0-9]{1,3}\n", value):
         return None
     returncode = int(value[:-1])
     return returncode if -255 <= returncode <= 255 else None
 
 
-def _read_pipe_frame(descriptor: int, limit: int) -> bytes:
+def _read_pipe_frame(
+    descriptor: int, limit: int, *, deadline: float | None = None
+) -> bytes:
     value = bytearray()
-    reached_eof = False
-    while len(value) <= limit and b"\n" not in value:
+    while len(value) <= limit:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return b""
+            readable, _, _ = select.select((descriptor,), (), (), remaining)
+            if not readable:
+                return b""
         chunk = os.read(descriptor, limit + 1 - len(value))
         if not chunk:
-            reached_eof = True
             break
         value.extend(chunk)
-    if reached_eof:
-        return bytes(value)
-    blocking: bool | None = None
-    try:
-        blocking = os.get_blocking(descriptor)
-        os.set_blocking(descriptor, False)
-    except OSError:
-        pass
-    try:
-        with suppress(BlockingIOError):
-            value.extend(os.read(descriptor, limit + 1 - len(value)))
-    finally:
-        if blocking:
-            os.set_blocking(descriptor, True)
     return bytes(value)
+
+
+def _settle_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait(timeout=2)
 
 
 def _read_capture(stream: BinaryIO, limit: int) -> bytes:
