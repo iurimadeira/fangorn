@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from types import MappingProxyType
 from typing import Literal, cast
 from uuid import uuid4
@@ -50,6 +50,24 @@ from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
 ADOPTION_ATTEMPTS = 3
 _ACTIVE_INVOCATIONS: dict[str, tuple[int, Path]] = {}
 _ACTIVE_INVOCATIONS_LOCK = Lock()
+
+
+def _unlink_invocation_marker_after_unlock(descriptor: int, marker: Path) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        opened = os.fstat(descriptor)
+        current = marker.stat(follow_symlinks=False)
+        if (
+            stat.S_ISREG(current.st_mode)
+            and opened.st_dev == current.st_dev
+            and opened.st_ino == current.st_ino
+        ):
+            marker.unlink()
+    except OSError:
+        pass
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 class WorkspaceError(RuntimeError):
@@ -691,15 +709,27 @@ class Workspaces:
                     raise WorkspaceError(
                         "Cannot close Workspace invocation marker"
                     ) from errors[0]
+                try:
+                    Thread(
+                        target=_unlink_invocation_marker_after_unlock,
+                        args=(cleanup, marker),
+                        daemon=True,
+                    ).start()
+                except RuntimeError as error:
+                    raise WorkspaceError(
+                        "Cannot defer Workspace invocation marker cleanup"
+                    ) from error
+                cleanup = -1
                 return
             marker.unlink()
         except OSError as error:
             errors.append(error)
         finally:
-            try:
-                os.close(cleanup)
-            except OSError as error:
-                errors.append(error)
+            if cleanup >= 0:
+                try:
+                    os.close(cleanup)
+                except OSError as error:
+                    errors.append(error)
         if errors:
             raise WorkspaceError(
                 "Cannot clean Workspace invocation marker"

@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1136,6 +1137,29 @@ def test_invocation_marker_cleanup_failure_is_visible(
 
     with pytest.raises(WorkspaceError, match="Cannot clean Workspace invocation"):
         workspaces._finish_invocation(owner)
+
+
+def test_successful_create_eventually_removes_guardian_held_invocation_marker(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+
+    result = workspaces.create(
+        CreateWorkspace(
+            repository=str(repository),
+            branch="marker-cleanup",
+            path=tmp_path / "worktrees" / "marker-cleanup",
+            headless=True,
+        )
+    )
+
+    assert result.workspace.state == "ready"
+    deadline = time.monotonic() + 2
+    while any(workspaces._invocation_root.iterdir()):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
 
 
 def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
