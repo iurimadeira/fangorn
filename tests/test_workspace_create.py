@@ -2618,6 +2618,31 @@ def test_create_rejects_present_empty_configuration(
     assert not (tmp_path / "target").exists()
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_create_rejects_non_utf8_configuration(
+    tmp_path: Path, explicit: bool
+) -> None:
+    source = tmp_path / "repository"
+    create_repository(source)
+    config = tmp_path / "explicit.toml" if explicit else source / "fangorn.toml"
+    config.write_bytes(b"\xff")
+    if not explicit:
+        git(source, "add", "fangorn.toml")
+        git(source, "commit", "-m", "add non-UTF-8 configuration")
+
+    with pytest.raises(WorkspaceError, match="must be valid UTF-8"):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(source),
+                branch="non-utf8-config",
+                path=tmp_path / "target",
+                config=config if explicit else None,
+            )
+        )
+
+    assert not (tmp_path / "target").exists()
+
+
 def test_cli_rejects_temporal_configuration_with_domain_error(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)

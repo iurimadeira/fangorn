@@ -954,7 +954,11 @@ def re_sub_path(value: str) -> str:
 def _configuration_value(content: bytes | None) -> dict[str, object]:
     if content is None:
         return {"schema_version": 1}
-    value = tomllib.loads(content.decode("utf-8"))
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise WorkspaceError("fangorn.toml must be valid UTF-8") from error
+    value = tomllib.loads(decoded)
     unknown = value.keys() - {"schema_version", "services"}
     if unknown:
         raise WorkspaceError(
