@@ -72,6 +72,11 @@ GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
 
+def require_supported_git(path: Path) -> None:
+    """Reject mutation when the process Git does not meet Fangorn's minimum."""
+    _require_supported_git(path)
+
+
 def establish_worktree_generation(directory: Path, ownership_token: str) -> str:
     """Establish the immutable planned owner token for a new Worktree Resource."""
     return _create_generation_marker(

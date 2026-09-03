@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, Mapping
+from typing import Literal
 
 ResourceKind = Literal["worktree", "service", "terminal"]
 ObservationStatus = Literal["absent", "stopped", "ready", "degraded", "unknown"]

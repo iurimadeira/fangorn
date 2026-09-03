@@ -10,10 +10,12 @@ from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from fangorn.git import (
+    REPOSITORY_LOCAL_ENVIRONMENT,
     GitError,
     WorktreeObservation,
     establish_worktree_generation,
     observe_worktree,
+    require_supported_git,
 )
 
 SUPPORTED_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
@@ -50,6 +52,7 @@ def normalize_repository_source(value: str) -> RepositorySource:
         resolved = requested.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise GitError(f"Repository path is unavailable: {requested}") from error
+    require_supported_git(resolved)
     common = _required_git_path(
         resolved, "rev-parse", "--path-format=absolute", "--git-common-dir"
     )
@@ -57,7 +60,7 @@ def normalize_repository_source(value: str) -> RepositorySource:
         name = common.parent.name
     else:
         name = common.name.removesuffix(".git")
-    return RepositorySource(str(common), common, None, name or "repository")
+    return RepositorySource(str(common), resolved, None, name or "repository")
 
 
 def resolve_commit(repository: Path, ref: str | None) -> str:
@@ -71,8 +74,10 @@ def resolve_commit(repository: Path, ref: str | None) -> str:
 def read_configuration(repository: Path, commit: str, explicit: Path | None) -> bytes:
     if explicit is not None:
         try:
+            if explicit.is_symlink():
+                raise GitError("Configuration must be a regular non-symlink file")
             resolved = explicit.resolve(strict=True)
-            if resolved.is_symlink() or not resolved.is_file():
+            if not resolved.is_file():
                 raise GitError("Configuration must be a regular non-symlink file")
             return resolved.read_bytes()
         except GitError:
@@ -99,6 +104,7 @@ def materialize_cache(source: RepositorySource, cache_path: Path) -> Path:
         _verify_bare_repository(cache_path, source.normalized)
         return cache_path
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    require_supported_git(cache_path.parent)
     invocation = Path(tempfile.mkdtemp(prefix="clone-", dir=cache_path.parent))
     clone = invocation / "repository.git"
     try:
@@ -225,8 +231,16 @@ def _run_git_process(
         )
         command.extend(location)
     command.extend(arguments)
+    environment = os.environ.copy()
+    for name in REPOSITORY_LOCAL_ENVIRONMENT:
+        environment.pop(name, None)
     try:
-        return subprocess.run(command, check=False, capture_output=True)  # noqa: S603
+        return subprocess.run(  # noqa: S603
+            command,
+            check=False,
+            capture_output=True,
+            env=environment,
+        )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
     except OSError as error:

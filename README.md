@@ -1,10 +1,16 @@
 # Fangorn
 
-Worktree-native workspace families for humans and agents.
+Recoverable disposable workspaces for humans and agents.
 
-Fangorn records each Workspace as one immutable binding to one real Git
-worktree. This compatibility release can inspect current Git facts and
-enumerate registered Workspaces without moving or changing any checkout.
+Fangorn is named for a forest of related worktrees. A Workspace is a durable,
+structurally immutable aggregate that owns its Resources. A Repository is the
+technical Git identity shared by Worktree Resources; it is not a second
+user-managed project object.
+
+This release creates root headless Workspaces containing one built-in Git
+Worktree Resource. Terminal, Service, parent-lineage, and later lifecycle
+commands are not shipped yet. Existing `info`, `list`, and hidden migration
+`adopt` compatibility commands retain their schema-1 meanings.
 
 ## Requirements
 
@@ -12,7 +18,10 @@ enumerate registered Workspaces without moving or changing any checkout.
 - Git 2.31 or newer
 - Linux or macOS
 
-Click is Fangorn's only third-party runtime dependency.
+Git is required for every Workspace. Headless Workspaces need no terminal
+multiplexer. tmux will be required only when the built-in Terminal Resource is
+selected in a later release. Configured services and third-party adapters will
+require their own tools. Click is Fangorn's only third-party runtime dependency.
 
 ## Install
 
@@ -28,7 +37,36 @@ With pipx:
 pipx install fangorn-cli
 ```
 
-## Use
+## Create
+
+Create from a local checkout or a credential-free clone URL:
+
+```sh
+fangorn workspace create --repo ./my-repository --branch feature --headless
+fangorn workspace create --repo https://example.com/acme/repository.git \
+  --branch feature --path /work/feature --headless
+```
+
+Create starts by default and succeeds as `ready` only after the Worktree
+Resource is observed at its immutable commit, branch, and ownership token.
+`--no-start` provisions the Worktree and returns `stopped`. Use `--base REF` to
+resolve another commit once, `--request-id KEY` for caller idempotency, and
+`--config PATH` to snapshot an explicit `fangorn.toml`.
+
+Equivalent retries return the same Workspace ID, resolved `created_from_sha`,
+target path, and completed operation. Reusing a request ID or target path with
+different immutable fields fails before Git effects. Clone URLs use a shared
+cache under `$XDG_CACHE_HOME/fangorn/repositories`; its acquisition and every
+Workspace mutation use recoverable fenced leases.
+
+Machine output uses schema 2:
+
+```sh
+fangorn --json workspace create --repo ./my-repository \
+  --branch feature --headless
+```
+
+## Inspect compatibility records
 
 Inspect the Workspace containing the current directory or list registered
 Workspaces:
@@ -55,11 +93,12 @@ registered = workspaces.list()
 ```
 
 `fangorn.workspaces.Workspaces` owns Workspace lifecycle behavior; Click only
-parses arguments and renders results.
+parses arguments and renders results. Python callers create with
+`CreateWorkspace` and receive `CreateWorkspaceResult` domain values.
 
-Human-readable output is the default. `info` accepts `--json`; `list` accepts
-`--json` or `--ndjson`. Every machine record includes
-`schema_version: 1`, and errors go to stderr with a nonzero exit status.
+Human-readable output is the default. New create output uses schema 2. `info`
+accepts `--json`; `list` accepts `--json` or `--ndjson`; those compatibility
+records remain schema 1. Errors go to stderr with a nonzero exit status.
 
 State is stored in `$XDG_STATE_HOME/fangorn/registry.sqlite3`, or in
 `$HOME/.local/state/fangorn/registry.sqlite3` when `XDG_STATE_HOME` is unset.

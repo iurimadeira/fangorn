@@ -395,6 +395,8 @@ class Workspaces:
                     source.normalized,
                     path=str(repository),
                     repository_generation=entry[1] if entry is not None else None,
+                    operation_id=operation_id,
+                    lease_epoch=epoch,
                 )
                 self._registry.finish_operation_step(
                     operation_id,

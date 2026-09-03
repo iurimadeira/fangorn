@@ -86,6 +86,7 @@ class LeaseRecord:
     operation_id: str
     owner: ProcessIdentity
     epoch: int
+    aggregate_version: int
     active: bool
 
 
@@ -195,6 +196,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 request_json TEXT NOT NULL,
                 target_path TEXT NOT NULL UNIQUE,
                 resolved_json TEXT,
+                aggregate_version INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -258,6 +260,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 pid INTEGER NOT NULL,
                 process_start_identity TEXT NOT NULL,
                 epoch INTEGER NOT NULL CHECK (epoch > 0),
+                aggregate_version INTEGER NOT NULL CHECK (aggregate_version >= 0),
                 active INTEGER NOT NULL CHECK (active IN (0, 1)),
                 PRIMARY KEY (scope_kind, scope_key)
             )
@@ -741,6 +744,9 @@ class Registry:
                     "WHERE scope_kind = ? AND scope_key = ?",
                     (scope_kind, scope_key),
                 ).fetchone()
+                aggregate_version = self._aggregate_version(
+                    connection, scope_kind=scope_kind, scope_key=scope_key
+                )
                 if row is None:
                     epoch = 1
                     connection.execute(
@@ -748,8 +754,8 @@ class Registry:
                         INSERT INTO mutation_leases (
                             scope_kind, scope_key, operation_id,
                             process_instance_id, boot_identity, pid,
-                            process_start_identity, epoch, active
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                            process_start_identity, epoch, aggregate_version, active
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                         """,
                         (
                             scope_kind,
@@ -760,6 +766,7 @@ class Registry:
                             owner.pid,
                             owner.process_start_identity,
                             epoch,
+                            aggregate_version,
                         ),
                     )
                 else:
@@ -789,7 +796,8 @@ class Registry:
                             UPDATE mutation_leases
                             SET operation_id = ?, process_instance_id = ?,
                                 boot_identity = ?, pid = ?,
-                                process_start_identity = ?, epoch = ?, active = 1
+                                process_start_identity = ?, epoch = ?,
+                                aggregate_version = ?, active = 1
                             WHERE scope_kind = ? AND scope_key = ?
                             """,
                             (
@@ -799,6 +807,7 @@ class Registry:
                                 owner.pid,
                                 owner.process_start_identity,
                                 epoch,
+                                aggregate_version,
                                 scope_kind,
                                 scope_key,
                             ),
@@ -932,11 +941,20 @@ class Registry:
         *,
         path: str,
         repository_generation: str | None,
+        operation_id: str,
+        lease_epoch: int,
     ) -> None:
         with self._connection() as connection:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind="repository",
+                    scope_key=normalized_source,
+                    lease_epoch=lease_epoch,
+                )
                 connection.execute(
                     """
                     INSERT INTO repository_cache_entries (
@@ -1122,6 +1140,24 @@ class Registry:
             return workspace, resources, operation
 
     @staticmethod
+    def _aggregate_version(
+        connection: sqlite3.Connection, *, scope_kind: str, scope_key: str
+    ) -> int:
+        if scope_kind != "workspace":
+            return 0
+        row = connection.execute(
+            "SELECT aggregate_version FROM workspaces WHERE id = ?",
+            (scope_key,),
+        ).fetchone()
+        if row is None:
+            row = connection.execute(
+                "SELECT aggregate_version FROM workspace_create_intents "
+                "WHERE workspace_id = ?",
+                (scope_key,),
+            ).fetchone()
+        return int(row["aggregate_version"]) if row is not None else 0
+
+    @staticmethod
     def _require_lease(
         connection: sqlite3.Connection,
         *,
@@ -1132,7 +1168,8 @@ class Registry:
     ) -> None:
         row = connection.execute(
             """
-            SELECT operation_id, epoch, active FROM mutation_leases
+            SELECT operation_id, epoch, aggregate_version, active
+            FROM mutation_leases
             WHERE scope_kind = ? AND scope_key = ?
             """,
             (scope_kind, scope_key),
@@ -1144,6 +1181,11 @@ class Registry:
             or int(row["epoch"]) != lease_epoch
         ):
             raise RegistryError("Stale operation result rejected by lease fence")
+        current_version = Registry._aggregate_version(
+            connection, scope_kind=scope_kind, scope_key=scope_key
+        )
+        if int(row["aggregate_version"]) != current_version:
+            raise RegistryError("Stale operation result rejected by aggregate version")
 
     def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
         observation_token = _observation_token(observation)
@@ -1438,6 +1480,7 @@ def _lease_from_row(row: sqlite3.Row) -> LeaseRecord:
             process_start_identity=str(row["process_start_identity"]),
         ),
         epoch=int(row["epoch"]),
+        aggregate_version=int(row["aggregate_version"]),
         active=bool(row["active"]),
     )
 
