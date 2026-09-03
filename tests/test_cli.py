@@ -2574,8 +2574,9 @@ def test_read_only_list_proceeds_during_a_registry_write_transaction(
     assert elapsed < 1.5
 
 
-def test_read_only_list_does_not_repair_state_or_database_permissions(
-    tmp_path: Path,
+@pytest.mark.parametrize("unsafe", ["state", "database"])
+def test_read_only_list_rejects_unsafe_permissions_without_repair(
+    tmp_path: Path, unsafe: str
 ) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -2584,14 +2585,100 @@ def test_read_only_list_does_not_repair_state_or_database_permissions(
     adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
     assert adopted.returncode == 0, adopted.stderr
     database = state_directory / "registry.sqlite3"
-    state_directory.chmod(0o777)
-    database.chmod(0o666)
+    target = state_directory if unsafe == "state" else database
+    target.chmod(0o777 if unsafe == "state" else 0o666)
 
     result = run_fangorn(state_home, "list", "--json")
 
-    assert result.returncode == 0, result.stderr
-    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o777
-    assert stat.S_IMODE(database.stat().st_mode) == 0o666
+    assert result.returncode != 0
+    expected = (
+        "Registry state directory unavailable"
+        if unsafe == "state"
+        else "Registry database unavailable"
+    )
+    assert expected in result.stderr
+    assert stat.S_IMODE(target.stat().st_mode) == (
+        0o777 if unsafe == "state" else 0o666
+    )
+
+
+@pytest.mark.parametrize("unsafe", ["state", "database"])
+def test_registry_write_rejects_preexisting_unsafe_permissions(
+    tmp_path: Path, unsafe: str
+) -> None:
+    state_directory = tmp_path / "state"
+    database = state_directory / "registry.sqlite3"
+    registry = Registry(database)
+    with registry._connection():
+        pass
+    target = state_directory if unsafe == "state" else database
+    target.chmod(0o777 if unsafe == "state" else 0o666)
+
+    with (
+        pytest.raises(RegistryError, match=r"Registry .* unavailable"),
+        registry._connection(),
+    ):
+        pass
+
+    assert stat.S_IMODE(target.stat().st_mode) == (
+        0o777 if unsafe == "state" else 0o666
+    )
+
+
+def test_registry_rejects_nonsticky_writable_ancestor(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o777)
+
+    with (
+        pytest.raises(RegistryError, match="Registry state directory unavailable"),
+        Registry(shared / "fangorn" / "registry.sqlite3")._connection(),
+    ):
+        pass
+
+
+def test_registry_accepts_sticky_writable_ancestor(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o1777)
+
+    with Registry(shared / "fangorn" / "registry.sqlite3")._connection():
+        pass
+
+
+def test_registry_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    real = tmp_path / "real-state"
+    real.mkdir()
+    linked = tmp_path / "linked-state"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with (
+        pytest.raises(RegistryError, match="symlink"),
+        Registry(linked / "fangorn" / "registry.sqlite3")._connection(),
+    ):
+        pass
+
+
+def test_registry_rejects_path_replacement_during_sqlite_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_directory = tmp_path / "state"
+    database = state_directory / "registry.sqlite3"
+    registry = Registry(database)
+    with registry._connection():
+        pass
+    real_connect = sqlite3.connect
+
+    def replace_before_connect(database: Any, **kwargs: Any) -> sqlite3.Connection:
+        state_directory.rename(tmp_path / "moved-state")
+        state_directory.mkdir(mode=0o700)
+        (state_directory / "registry.sqlite3").touch(mode=0o600)
+        return cast(sqlite3.Connection, real_connect(database, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", replace_before_connect)
+
+    with pytest.raises(RegistryError, match="identity changed"), registry._connection():
+        pass
 
 
 def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> None:
@@ -2608,7 +2695,9 @@ def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> 
 
     database_state = tmp_path / "database-state"
     database_path = database_state / "fangorn" / "registry.sqlite3"
-    database_path.mkdir(parents=True)
+    database_state.mkdir(mode=0o700)
+    database_path.parent.mkdir(mode=0o700)
+    database_path.mkdir(mode=0o700)
     database_failure = run_fangorn(database_state, "list", "--json")
     assert database_failure.returncode != 0
     assert database_failure.stdout == ""

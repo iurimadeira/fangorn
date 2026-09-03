@@ -206,7 +206,8 @@ def test_workspaces_list_waits_for_concurrent_first_bootstrap(
     state_home = tmp_path / "state"
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     database = state_home / "fangorn" / "registry.sqlite3"
-    database.parent.mkdir(parents=True)
+    state_home.mkdir(mode=0o700)
+    database.parent.mkdir(mode=0o700)
     database.touch(mode=0o600)
 
     with ThreadPoolExecutor(max_workers=1) as executor:

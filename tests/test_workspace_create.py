@@ -225,8 +225,15 @@ def test_equivalent_retry_reuses_resolved_values_and_completed_operation(
     assert retried.workspace.definition.id == first.workspace.definition.id
     assert retried.workspace.definition.created_from_sha == created_from_sha
     assert retried.workspace.path == first.workspace.path
+    assert retried.workspace.branch == "renamed-topic"
     assert retried.operation.id == first.operation.id
     assert retried.operation.status == "completed"
+
+    git(target, "checkout", "--detach")
+    detached = workspaces.create(request)
+
+    assert detached.workspace.definition.created_from_sha == created_from_sha
+    assert detached.workspace.branch is None
 
 
 @pytest.mark.parametrize("replacement", [None, "f" * 64])

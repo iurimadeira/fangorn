@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -1921,51 +1922,79 @@ class Registry:
 
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection | None]:
-        if not _state_directory_exists(self.path.parent):
+        state_descriptor = _open_registry_state_directory(
+            self.path.parent, create=False
+        )
+        if state_descriptor is None:
             yield None
             return
-        if not _database_file_exists(self.path):
-            yield None
-            return
-        deadline = time.monotonic() + READ_INITIALIZATION_TIMEOUT_SECONDS
-        connection: sqlite3.Connection
-        while True:
-            try:
-                connection = sqlite3.connect(
-                    f"{self.path.resolve(strict=True).as_uri()}?mode=ro",
-                    uri=True,
-                    timeout=BUSY_TIMEOUT_SECONDS,
-                    isolation_level=None,
-                )
-            except (OSError, sqlite3.Error) as error:
-                raise RegistryError(
-                    f"Registry database unavailable: {error}"
-                ) from error
-            connection.row_factory = sqlite3.Row
-            try:
-                connection.execute("PRAGMA query_only = ON")
-                connection.execute("BEGIN")
-                self._require_supported_schema(connection)
-            except sqlite3.Error as error:
-                connection.close()
-                if _schema_initialization_in_progress(error):
-                    remaining = deadline - time.monotonic()
-                    if remaining > 0:
-                        time.sleep(
-                            min(READ_INITIALIZATION_RETRY_DELAY_SECONDS, remaining)
-                        )
-                        continue
-                raise _registry_error(error) from error
-            except RegistryError:
-                connection.close()
-                raise
-            break
         try:
-            yield connection
-        except sqlite3.Error as error:
-            raise _registry_error(error) from error
+            database_descriptor = _open_registry_database(
+                state_descriptor, self.path, create=False
+            )
+            if database_descriptor is None:
+                yield None
+                return
+            try:
+                deadline = time.monotonic() + READ_INITIALIZATION_TIMEOUT_SECONDS
+                connection: sqlite3.Connection | None = None
+                while True:
+                    connection = None
+                    try:
+                        _require_registry_path_identity(
+                            self.path, state_descriptor, database_descriptor
+                        )
+                        connection = sqlite3.connect(
+                            f"{self.path.as_uri()}?mode=ro",
+                            uri=True,
+                            timeout=BUSY_TIMEOUT_SECONDS,
+                            isolation_level=None,
+                        )
+                        _require_registry_path_identity(
+                            self.path, state_descriptor, database_descriptor
+                        )
+                    except (OSError, sqlite3.Error) as error:
+                        raise RegistryError(
+                            f"Registry database unavailable: {error}"
+                        ) from error
+                    except RegistryError:
+                        if connection is not None:
+                            connection.close()
+                        raise
+                    if connection is None:
+                        raise RegistryError("Registry database unavailable")
+                    connection.row_factory = sqlite3.Row
+                    try:
+                        connection.execute("PRAGMA query_only = ON")
+                        connection.execute("BEGIN")
+                        self._require_supported_schema(connection)
+                    except sqlite3.Error as error:
+                        connection.close()
+                        if _schema_initialization_in_progress(error):
+                            remaining = deadline - time.monotonic()
+                            if remaining > 0:
+                                time.sleep(
+                                    min(
+                                        READ_INITIALIZATION_RETRY_DELAY_SECONDS,
+                                        remaining,
+                                    )
+                                )
+                                continue
+                        raise _registry_error(error) from error
+                    except RegistryError:
+                        connection.close()
+                        raise
+                    break
+                try:
+                    yield connection
+                except sqlite3.Error as error:
+                    raise _registry_error(error) from error
+                finally:
+                    connection.close()
+            finally:
+                os.close(database_descriptor)
         finally:
-            connection.close()
+            os.close(state_descriptor)
 
     def _require_supported_schema(self, connection: sqlite3.Connection) -> None:
         applied = {
@@ -1985,24 +2014,44 @@ class Registry:
     def _connection(
         self, *, timeout: float | None = None
     ) -> Iterator[sqlite3.Connection]:
-        _prepare_state_directory(self.path.parent)
-        _prepare_database_file(self.path)
+        state_descriptor = _open_registry_state_directory(self.path.parent, create=True)
+        if state_descriptor is None:
+            raise RegistryError("Registry state directory unavailable")
         try:
-            connection = sqlite3.connect(
-                self.path,
-                timeout=BUSY_TIMEOUT_SECONDS if timeout is None else timeout,
-                isolation_level=None,
+            database_descriptor = _open_registry_database(
+                state_descriptor, self.path, create=True
             )
-        except sqlite3.Error as error:
-            raise RegistryError(f"Registry database unavailable: {error}") from error
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            yield connection
-        except sqlite3.Error as error:
-            raise _registry_error(error) from error
+            if database_descriptor is None:
+                raise RegistryError("Registry database unavailable")
+            try:
+                _require_registry_path_identity(
+                    self.path, state_descriptor, database_descriptor
+                )
+                try:
+                    connection = sqlite3.connect(
+                        self.path,
+                        timeout=BUSY_TIMEOUT_SECONDS if timeout is None else timeout,
+                        isolation_level=None,
+                    )
+                except sqlite3.Error as error:
+                    raise RegistryError(
+                        f"Registry database unavailable: {error}"
+                    ) from error
+                try:
+                    _require_registry_path_identity(
+                        self.path, state_descriptor, database_descriptor
+                    )
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    yield connection
+                except sqlite3.Error as error:
+                    raise _registry_error(error) from error
+                finally:
+                    connection.close()
+            finally:
+                os.close(database_descriptor)
         finally:
-            connection.close()
+            os.close(state_descriptor)
 
     def _migrate(self, connection: sqlite3.Connection) -> None:
         try:
@@ -2201,151 +2250,127 @@ def _timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _prepare_state_directory(path: Path) -> None:
-    descriptor: int | None = None
+def _open_registry_state_directory(path: Path, *, create: bool) -> int | None:
+    if not path.is_absolute() or ".." in path.parts:
+        raise RegistryError(f"Registry state directory unavailable: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode):
-            raise RegistryError(
-                f"Registry state directory unavailable: symlink is not allowed: {path}"
-            )
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise RegistryError(
-                f"Registry state directory unavailable: not a directory: {path}"
-            )
-        if metadata.st_uid != os.geteuid():
-            raise RegistryError(
-                "Registry state directory unavailable: not owned by current user: "
-                f"{path}"
-            )
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        opened = os.fstat(descriptor)
-        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
-            raise RegistryError(
-                f"Registry state directory unavailable: identity changed: {path}"
-            )
-        os.fchmod(descriptor, 0o700)
-        if _darwin_acl_allows_write(descriptor):
-            raise RegistryError(
-                f"Registry state directory unavailable: writable ACL: {path}"
-            )
+        descriptor = os.open(path.anchor, flags)
+    except OSError as error:
+        raise _state_directory_error(path, error) from error
+    parts = path.parts[1:]
+    try:
+        if not parts:
+            _require_private_registry_directory(descriptor, path)
+        else:
+            _require_registry_ancestor(descriptor, Path(path.anchor))
+        current = Path(path.anchor)
+        for position, part in enumerate(parts):
+            created = False
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=descriptor)
+            current /= part
+            try:
+                if position == len(parts) - 1:
+                    _require_private_registry_directory(child, current)
+                    if created:
+                        os.fchmod(child, 0o700)
+                        _require_private_registry_directory(child, current)
+                else:
+                    _require_registry_ancestor(child, current)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        result = descriptor
+        descriptor = -1
+        return result
     except RegistryError:
         raise
     except OSError as error:
-        detail = error.strerror or str(error)
-        raise RegistryError(
-            f"Registry state directory unavailable: {path}: {detail}"
-        ) from error
+        raise _state_directory_error(path, error) from error
     finally:
-        if descriptor is not None:
+        if descriptor >= 0:
             os.close(descriptor)
 
 
-def _state_directory_exists(path: Path) -> bool:
+def _require_registry_ancestor(descriptor: int, path: Path) -> None:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in {
+        0,
+        os.geteuid(),
+    }:
+        raise RegistryError(f"Registry state directory unavailable: {path}")
+    writable = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if (writable or _darwin_acl_allows_write(descriptor)) and not (
+        metadata.st_mode & stat.S_ISVTX
+    ):
+        raise RegistryError(f"Registry state directory unavailable: {path}")
+
+
+def _require_private_registry_directory(descriptor: int, path: Path) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or _darwin_acl_allows_write(descriptor)
+    ):
+        raise RegistryError(f"Registry state directory unavailable: {path}")
+
+
+def _state_directory_error(path: Path, error: OSError) -> RegistryError:
+    detail = error.strerror or str(error)
+    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+        detail = "symlink or non-directory component"
+    return RegistryError(f"Registry state directory unavailable: {path}: {detail}")
+
+
+def _open_registry_database(
+    parent_descriptor: int, path: Path, *, create: bool
+) -> int | None:
+    flags = os.O_CLOEXEC | os.O_NOFOLLOW
     descriptor: int | None = None
+    created = False
     try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return False
-    except OSError as error:
-        detail = error.strerror or str(error)
-        raise RegistryError(
-            f"Registry state directory unavailable: {path}: {detail}"
-        ) from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise RegistryError(
-            f"Registry state directory unavailable: symlink is not allowed: {path}"
-        )
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise RegistryError(
-            f"Registry state directory unavailable: not a directory: {path}"
-        )
-    if metadata.st_uid != os.geteuid():
-        raise RegistryError(
-            f"Registry state directory unavailable: not owned by current user: {path}"
-        )
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        opened = os.fstat(descriptor)
-        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
-            raise RegistryError(
-                f"Registry state directory unavailable: identity changed: {path}"
-            )
-        if _darwin_acl_allows_write(descriptor):
-            raise RegistryError(
-                f"Registry state directory unavailable: writable ACL: {path}"
-            )
-        return True
-    except RegistryError:
-        raise
-    except OSError as error:
-        detail = error.strerror or str(error)
-        raise RegistryError(
-            f"Registry state directory unavailable: {path}: {detail}"
-        ) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _prepare_database_file(path: Path) -> None:
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags, 0o600)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RegistryError(
-                f"Registry database unavailable: not a regular file: {path}"
-            )
-        if metadata.st_uid != os.geteuid():
-            raise RegistryError(
-                f"Registry database unavailable: not owned by current user: {path}"
-            )
-        os.fchmod(descriptor, 0o600)
-        if _darwin_acl_allows_write(descriptor):
-            raise RegistryError(f"Registry database unavailable: writable ACL: {path}")
-    except RegistryError:
-        raise
-    except OSError as error:
-        detail = error.strerror or str(error)
-        raise RegistryError(
-            f"Registry database unavailable: {path}: {detail}"
-        ) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _database_file_exists(path: Path) -> bool:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RegistryError(
-                f"Registry database unavailable: not a regular file: {path}"
-            )
-        if metadata.st_uid != os.geteuid():
-            raise RegistryError(
-                f"Registry database unavailable: not owned by current user: {path}"
-            )
-        if _darwin_acl_allows_write(descriptor):
-            raise RegistryError(f"Registry database unavailable: writable ACL: {path}")
-    except FileNotFoundError:
-        return False
+        if create:
+            try:
+                descriptor = os.open(
+                    path.name,
+                    flags | os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(
+                    path.name, flags | os.O_RDWR, dir_fd=parent_descriptor
+                )
+        else:
+            try:
+                descriptor = os.open(
+                    path.name, flags | os.O_RDONLY, dir_fd=parent_descriptor
+                )
+            except FileNotFoundError:
+                return None
+        _require_private_registry_database(descriptor, path)
+        if created:
+            os.fchmod(descriptor, 0o600)
+            _require_private_registry_database(descriptor, path)
+        result = descriptor
+        descriptor = None
+        return result
     except RegistryError:
         raise
     except OSError as error:
@@ -2356,7 +2381,46 @@ def _database_file_exists(path: Path) -> bool:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    return True
+
+
+def _require_private_registry_database(descriptor: int, path: Path) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or _darwin_acl_allows_write(descriptor)
+    ):
+        raise RegistryError(f"Registry database unavailable: {path}")
+
+
+def _require_registry_path_identity(
+    path: Path, state_descriptor: int, database_descriptor: int
+) -> None:
+    try:
+        _require_private_registry_directory(state_descriptor, path.parent)
+        _require_private_registry_database(database_descriptor, path)
+        opened_state = os.fstat(state_descriptor)
+        current_state = path.parent.stat(follow_symlinks=False)
+        opened_database = os.fstat(database_descriptor)
+        current_database = os.stat(
+            path.name, dir_fd=state_descriptor, follow_symlinks=False
+        )
+    except RegistryError:
+        raise
+    except OSError as error:
+        raise RegistryError(
+            f"Registry database identity changed during connection: {path}"
+        ) from error
+    if (
+        opened_state.st_dev != current_state.st_dev
+        or opened_state.st_ino != current_state.st_ino
+        or opened_database.st_dev != current_database.st_dev
+        or opened_database.st_ino != current_database.st_ino
+    ):
+        raise RegistryError(
+            f"Registry database identity changed during connection: {path}"
+        )
 
 
 def _registry_error(error: sqlite3.Error) -> RegistryError:

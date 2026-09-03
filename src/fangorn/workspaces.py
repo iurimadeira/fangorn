@@ -15,7 +15,7 @@ import sys
 import tomllib
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock, Thread
 from types import MappingProxyType
@@ -50,6 +50,7 @@ from fangorn.registry import (
     ProcessIdentity,
     Registry,
     RegistryError,
+    _open_registry_state_directory,
 )
 from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
 
@@ -223,7 +224,7 @@ class WorkspaceAggregate:
     state: str
     version: int
     path: str
-    branch: str
+    branch: str | None
 
 
 @dataclass(frozen=True)
@@ -723,7 +724,7 @@ class Workspaces:
             state=str(row["lifecycle_state"]),
             version=int(row["aggregate_version"]),
             path=str(row["path"]),
-            branch=str(row["branch"]),
+            branch=str(row["branch"]) if row["branch"] is not None else None,
         )
         return aggregate, Operation(
             id=str(operation_row["id"]),
@@ -741,14 +742,21 @@ class Workspaces:
             expected_branch=None,
             ownership_token=aggregate.definition.resources[0].ownership_token,
         )
-        self._registry.inspect_worktree(observation)
+        current = self._registry.inspect_worktree(observation)
+        aggregate = replace(aggregate, path=current.path, branch=current.branch)
         return CreateWorkspaceResult(aggregate, operation, created=created)
 
     def _invocation_process_identity(self) -> ProcessIdentity:
         identity = self._process_identity or _current_process_identity()
         try:
-            self._invocation_root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        except OSError as error:
+            state_descriptor = _open_registry_state_directory(
+                self._invocation_root.parent, create=True
+            )
+            if state_descriptor is None:
+                raise WorkspaceError("Cannot create Workspace invocation marker")
+            os.close(state_descriptor)
+            self._invocation_root.mkdir(mode=0o700, exist_ok=True)
+        except (OSError, RegistryError) as error:
             raise WorkspaceError("Cannot create Workspace invocation marker") from error
         if self._invocation_root.is_symlink() or not self._invocation_root.is_dir():
             raise WorkspaceError("Workspace invocation marker directory is unsafe")

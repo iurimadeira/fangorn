@@ -25,9 +25,10 @@ require their own tools. Repository-configured executable checkout filters and
 filesystem monitors and local configuration includes are rejected; Git hooks
 are disabled during creation. Local Git administrative directories and config
 files must be owned by the current account or root and not writable by another
-account. A user-private group is accepted only without a named writable ACL;
-macOS extended ACLs that allow writes are rejected. Click is Fangorn's only
-third-party runtime dependency.
+account. When group-write is present, any Linux extended access ACL is
+conservatively rejected even if its named entries are read-only; macOS extended
+ACLs that allow writes are rejected. Click is Fangorn's only third-party runtime
+dependency.
 
 ## Install
 
