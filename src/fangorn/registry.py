@@ -6,7 +6,7 @@ import stat
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -467,9 +467,47 @@ class Registry:
                 raise RegistryError("Workspace disappeared from the registry")
             return _workspace_from_row(refreshed)
 
+    def inspect_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
+        with self._read_connection() as connection:
+            if connection is None:
+                raise RegistryError(f"Worktree is not adopted: {observation.path}")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT workspaces.*, repositories.git_common_dir,
+                        repositories.git_common_dir_generation
+                    FROM workspaces
+                    JOIN repositories ON repositories.id = workspaces.repository_id
+                    WHERE workspaces.git_dir = ?
+                    """,
+                    (str(observation.git_dir),),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise _registry_error(error) from error
+            if row is None:
+                raise RegistryError(f"Worktree is not adopted: {observation.path}")
+            if str(row["git_common_dir"]) != str(observation.repository_common_dir):
+                raise RegistryError(
+                    "Git identity is ambiguous; refusing to change the binding"
+                )
+            _validate_repository_binding(row, observation)
+            _validate_worktree_binding(
+                row,
+                repository_id=str(row["repository_id"]),
+                observation=observation,
+            )
+            return replace(
+                _workspace_from_row(row),
+                path=str(observation.path),
+                branch=observation.branch,
+                head=observation.head,
+                last_observed_at=observation.observed_at,
+            )
+
     def list_workspaces(self) -> list[WorkspaceRecord]:
-        with self._connection() as connection:
-            self._migrate(connection)
+        with self._read_connection() as connection:
+            if connection is None:
+                return []
             try:
                 rows = connection.execute(
                     """
@@ -483,6 +521,47 @@ class Registry:
             except sqlite3.Error as error:
                 raise _registry_error(error) from error
             return [_workspace_from_row(row) for row in rows]
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection | None]:
+        if not _state_directory_exists(self.path.parent):
+            yield None
+            return
+        if not _database_file_exists(self.path):
+            yield None
+            return
+        try:
+            connection = sqlite3.connect(
+                f"{self.path.resolve(strict=True).as_uri()}?mode=ro",
+                uri=True,
+                timeout=BUSY_TIMEOUT_SECONDS,
+                isolation_level=None,
+            )
+        except (OSError, sqlite3.Error) as error:
+            raise RegistryError(f"Registry database unavailable: {error}") from error
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            self._require_supported_schema(connection)
+            yield connection
+        except sqlite3.Error as error:
+            raise _registry_error(error) from error
+        finally:
+            connection.close()
+
+    def _require_supported_schema(self, connection: sqlite3.Connection) -> None:
+        applied = {
+            int(row["version"])
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
+        }
+        unknown = {version for version in applied if version > SCHEMA_VERSION}
+        if unknown:
+            versions = ", ".join(str(version) for version in sorted(unknown))
+            raise RegistryError(
+                f"Registry schema is newer than this Fangorn version: {versions}"
+            )
 
     @contextmanager
     def _connection(
@@ -658,6 +737,31 @@ def _prepare_state_directory(path: Path) -> None:
         ) from error
 
 
+def _state_directory_exists(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise RegistryError(
+            f"Registry state directory unavailable: {path}: {detail}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RegistryError(
+            f"Registry state directory unavailable: symlink is not allowed: {path}"
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RegistryError(
+            f"Registry state directory unavailable: not a directory: {path}"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise RegistryError(
+            f"Registry state directory unavailable: not owned by current user: {path}"
+        )
+    return True
+
+
 def _prepare_database_file(path: Path) -> None:
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
@@ -685,6 +789,37 @@ def _prepare_database_file(path: Path) -> None:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _database_file_exists(path: Path) -> bool:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RegistryError(
+                f"Registry database unavailable: not a regular file: {path}"
+            )
+        if metadata.st_uid != os.geteuid():
+            raise RegistryError(
+                f"Registry database unavailable: not owned by current user: {path}"
+            )
+    except FileNotFoundError:
+        return False
+    except RegistryError:
+        raise
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise RegistryError(
+            f"Registry database unavailable: {path}: {detail}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return True
 
 
 def _registry_error(error: sqlite3.Error) -> RegistryError:

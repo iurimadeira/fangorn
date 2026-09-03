@@ -28,6 +28,7 @@ import fangorn.git as git_adapter
 import fangorn.registry as registry_adapter
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
 from fangorn.registry import Registry, RegistryError
+from fangorn.workspaces import WorkspaceError, Workspaces
 
 GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
@@ -73,7 +74,7 @@ def create_repository(path: Path) -> str:
     return git(path, "rev-parse", "HEAD")
 
 
-def test_help_exposes_bootstrap_commands() -> None:
+def test_help_exposes_reads_but_keeps_legacy_adopt_hidden() -> None:
     result = subprocess.run(  # noqa: S603 -- test controls executable and argv
         [fangorn_executable(), "--help"],
         check=False,
@@ -83,9 +84,72 @@ def test_help_exposes_bootstrap_commands() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Worktree-native workspace families" in result.stdout
-    assert "adopt" in result.stdout
+    assert "adopt" not in result.stdout
     assert "info" in result.stdout
     assert "list" in result.stdout
+
+    legacy = subprocess.run(  # noqa: S603 -- test controls executable and argv
+        [fangorn_executable(), "adopt", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert legacy.returncode == 0, legacy.stderr
+    assert "Adopt an existing Git worktree" in legacy.stdout
+
+
+def test_cli_reads_do_not_initialize_missing_state(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+
+    listed = run_fangorn(state_home, "list", "--json")
+    inspected = run_fangorn(state_home, "info", "--json", str(repository))
+
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout) == {"schema_version": 1, "workspaces": []}
+    assert inspected.returncode != 0
+    assert "Worktree is not adopted" in inspected.stderr
+    assert not state_home.exists()
+    assert not (repository / ".git" / GENERATION_MARKER_NAME).exists()
+    assert not (repository / ".git" / REPOSITORY_GENERATION_MARKER_NAME).exists()
+
+
+def test_cli_list_matches_public_python_facade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    workspaces = Workspaces.from_environment()
+    workspaces.adopt(repository)
+
+    expected = {
+        "schema_version": 1,
+        "workspaces": [workspace.as_dict() for workspace in workspaces.list()],
+    }
+    listed = run_fangorn(state_home, "list", "--json")
+
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout) == expected
+
+
+def test_cli_info_failure_matches_public_python_facade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    with pytest.raises(WorkspaceError) as raised:
+        Workspaces.from_environment().inspect(repository)
+    inspected = run_fangorn(state_home, "info", "--json", str(repository))
+
+    assert inspected.returncode != 0
+    assert inspected.stdout == ""
+    assert inspected.stderr == f"Error: {raised.value}\n"
 
 
 def test_package_version_comes_from_distribution_metadata(
@@ -1471,6 +1535,21 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     adopted_payload = cast(dict[str, object], json.loads(adopted.stdout))
     adopted_workspace = cast(dict[str, object], adopted_payload["workspace"])
     workspace_id = adopted_workspace["id"]
+    database = state_home / "fangorn" / "registry.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        stored_before = connection.execute(
+            """
+            SELECT path, branch, head, last_observed_at, last_observation_token
+            FROM workspaces WHERE id = ?
+            """,
+            (workspace_id,),
+        ).fetchone()
+        clock_before = connection.execute(
+            "SELECT current_token FROM observation_clock WHERE singleton = 1"
+        ).fetchone()
+    finally:
+        connection.close()
     nested_path = repository / "nested" / "directory"
     nested_path.mkdir(parents=True)
     git(repository, "branch", "-m", "topic")
@@ -1490,6 +1569,26 @@ def test_info_resolves_and_reconciles_only_an_adopted_worktree(tmp_path: Path) -
     assert human.stdout.startswith(f"Workspace {workspace_id}\n")
     assert f"Path: {repository.resolve()}\n" in human.stdout
     assert "Branch: topic\n" in human.stdout
+    connection = sqlite3.connect(database)
+    try:
+        assert (
+            connection.execute(
+                """
+            SELECT path, branch, head, last_observed_at, last_observation_token
+            FROM workspaces WHERE id = ?
+            """,
+                (workspace_id,),
+            ).fetchone()
+            == stored_before
+        )
+        assert (
+            connection.execute(
+                "SELECT current_token FROM observation_clock WHERE singleton = 1"
+            ).fetchone()
+            == clock_before
+        )
+    finally:
+        connection.close()
 
     other_repository = tmp_path / "other"
     create_repository(other_repository)
@@ -2135,7 +2234,9 @@ def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
     assert "schema_migrations" not in tables
 
 
-def test_registry_contention_fails_after_a_bounded_wait(tmp_path: Path) -> None:
+def test_read_only_list_proceeds_during_a_registry_write_transaction(
+    tmp_path: Path,
+) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
     state_home = tmp_path / "state"
@@ -2152,28 +2253,29 @@ def test_registry_contention_fails_after_a_bounded_wait(tmp_path: Path) -> None:
         connection.rollback()
         connection.close()
 
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "Registry remained busy for 2 seconds" in result.stderr
-    assert 1.5 <= elapsed < 6
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["schema_version"] == 1
+    assert elapsed < 1.5
 
 
-def test_registry_repairs_private_state_and_database_permissions(
+def test_read_only_list_does_not_repair_state_or_database_permissions(
     tmp_path: Path,
 ) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
     state_home = tmp_path / "state"
     state_directory = state_home / "fangorn"
-    state_directory.mkdir(parents=True, mode=0o777)
-    state_directory.chmod(0o777)
+    adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
+    assert adopted.returncode == 0, adopted.stderr
     database = state_directory / "registry.sqlite3"
-    database.touch(mode=0o666)
+    state_directory.chmod(0o777)
     database.chmod(0o666)
 
     result = run_fangorn(state_home, "list", "--json")
 
     assert result.returncode == 0, result.stderr
-    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o700
-    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o777
+    assert stat.S_IMODE(database.stat().st_mode) == 0o666
 
 
 def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> None:

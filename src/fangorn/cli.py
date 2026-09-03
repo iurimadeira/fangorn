@@ -6,10 +6,8 @@ from pathlib import Path
 import click
 
 from fangorn import __version__
-from fangorn.git import GitError, observe_worktree
-from fangorn.registry import Registry, RegistryError, WorkspaceRecord
+from fangorn.workspaces import WorkspaceError, WorkspaceRecord, Workspaces
 
-ADOPTION_ATTEMPTS = 3
 COMMAND_PATH = click.Path(
     path_type=Path,
     exists=False,
@@ -26,7 +24,7 @@ def main() -> None:
     """Worktree-native workspace families for humans and agents."""
 
 
-@main.command()
+@main.command(hidden=True)
 @click.option("--json", "as_json", is_flag=True, help="Emit versioned JSON.")
 @click.argument(
     "path",
@@ -36,47 +34,21 @@ def main() -> None:
 def adopt(path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
     try:
-        registry = Registry.from_environment()
-        markerless_reobserved = False
-        for _ in range(ADOPTION_ATTEMPTS):
-            observation = observe_worktree(
-                path,
-                reserve_observation=registry.reserve_observation,
-            )
-            requirements = registry.marker_creation_requirements(
-                observation,
-                markerless_reobserved=markerless_reobserved,
-            )
-            if requirements is None:
-                markerless_reobserved = True
-                continue
-            create_repository_generation, create_worktree_generation = requirements
-            if create_repository_generation or create_worktree_generation:
-                observation = observe_worktree(
-                    path,
-                    create_repository_generation=create_repository_generation,
-                    create_worktree_generation=create_worktree_generation,
-                    reserve_observation=registry.reserve_observation,
-                )
-            workspace, created = registry.adopt(observation)
-            break
-        else:
-            raise RegistryError(
-                "Concurrent equivalent adoption did not settle; retry the command"
-            )
-    except (GitError, RegistryError) as error:
+        result = Workspaces.from_environment().adopt(path)
+    except WorkspaceError as error:
         raise click.ClickException(_human(str(error))) from error
 
+    workspace = result.workspace
     if as_json:
         _echo_json(
             {
                 "schema_version": 1,
-                "created": created,
+                "created": result.created,
                 "workspace": workspace.as_dict(),
             }
         )
         return
-    action = "Adopted" if created else "Already adopted"
+    action = "Adopted" if result.created else "Already adopted"
     click.echo(f"{action} Workspace {workspace.id}")
     _echo_workspace(workspace)
 
@@ -91,12 +63,8 @@ def adopt(path: Path, as_json: bool) -> None:
 def info(path: Path, as_json: bool) -> None:
     """Inspect the Workspace bound to a Git worktree."""
     try:
-        registry = Registry.from_environment()
-        observation = observe_worktree(
-            path, reserve_observation=registry.reserve_observation
-        )
-        workspace = registry.get_by_worktree(observation)
-    except (GitError, RegistryError) as error:
+        workspace = Workspaces.from_environment().inspect(path)
+    except WorkspaceError as error:
         raise click.ClickException(_human(str(error))) from error
 
     if as_json:
@@ -119,8 +87,8 @@ def list_workspaces(as_json: bool, as_ndjson: bool) -> None:
     if as_json and as_ndjson:
         raise click.UsageError("Choose only one of --json or --ndjson")
     try:
-        workspaces = Registry.from_environment().list_workspaces()
-    except RegistryError as error:
+        workspaces = Workspaces.from_environment().list()
+    except WorkspaceError as error:
         raise click.ClickException(_human(str(error))) from error
 
     if as_json:
