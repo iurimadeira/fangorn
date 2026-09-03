@@ -11,10 +11,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from git_helpers import git, initialize_repository
@@ -28,6 +29,7 @@ import fangorn.workspaces as workspaces_adapter
 from fangorn.git import (
     GitError,
     GitQuiescenceError,
+    WorktreeObservation,
     establish_worktree_generation,
     observe_worktree,
     repository_generation,
@@ -2257,6 +2259,35 @@ def test_worktree_reconciliation_rejects_another_repository(tmp_path: Path) -> N
         )
 
 
+def test_staged_worktree_reconciliation_rejects_another_repository(
+    tmp_path: Path,
+) -> None:
+    expected = tmp_path / "expected"
+    commit = repository(expected)
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "--no-hardlinks", str(expected), str(other))
+    target = tmp_path / "target"
+    token = "7" * 64
+    staging = target.parent / f".fangorn-{token}"
+    receipt = target.parent / f".fangorn-{token}.intent"
+    git(other, "worktree", "add", "-b", "topic", str(staging), commit)
+    establish_worktree_generation(observe_worktree(staging).git_dir, token)
+    receipt.write_text(token, encoding="ascii")
+
+    with pytest.raises(GitError, match="Repository identity"):
+        create_worktree(
+            expected,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
+
+    assert staging.exists()
+    assert not target.exists()
+
+
 def test_worktree_creation_disables_repository_hooks(tmp_path: Path) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
@@ -2309,6 +2340,45 @@ def test_checkout_configuration_rejects_core_worktree(tmp_path: Path) -> None:
 
     with pytest.raises(GitError, match="unsafe checkout configuration"):
         git_worktree_adapter._reject_executable_checkout_configuration(source)
+
+
+def test_reconciliation_rejects_reported_worktree_path_redirection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    target = tmp_path / "target"
+    token = "6" * 64
+    create_worktree(
+        source,
+        target=target,
+        branch="topic",
+        commit=commit,
+        ownership_token=token,
+        reconcile=False,
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    observe = cast(
+        Callable[..., WorktreeObservation],
+        vars(git_worktree_adapter)["observe_worktree"],
+    )
+
+    def redirected(path: Path, **kwargs: Any) -> WorktreeObservation:
+        observation = observe(path, **kwargs)
+        return replace(observation, path=outside) if path == target else observation
+
+    monkeypatch.setattr(git_worktree_adapter, "observe_worktree", redirected)
+
+    with pytest.raises(GitError, match="Worktree path"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=True,
+        )
 
 
 @pytest.mark.parametrize("entry", ["directory", "config"])

@@ -740,8 +740,9 @@ def create_worktree(
             if target_kind == "symlink" or not reconcile:
                 raise GitError(f"Workspace target path already exists: {target}")
             observation = observe_worktree(target, liveness_fd=liveness_fd)
-            _require_expected_repository(
+            _require_expected_worktree_identity(
                 observation,
+                target,
                 expected_repository_common_dir,
                 expected_repository_generation,
             )
@@ -755,8 +756,9 @@ def create_worktree(
                 create_worktree_generation=False,
                 liveness_fd=liveness_fd,
             )
-            _require_expected_repository(
+            _require_expected_worktree_identity(
                 result,
+                target,
                 expected_repository_common_dir,
                 expected_repository_generation,
             )
@@ -786,8 +788,9 @@ def create_worktree(
                 raise GitError("Workspace staging path is unsafe")
             _secure_staging_directory(parent.descriptor, staging.name)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
-            _require_expected_repository(
+            _require_expected_worktree_identity(
                 observation,
+                staging,
                 expected_repository_common_dir,
                 expected_repository_generation,
             )
@@ -858,15 +861,17 @@ def create_worktree(
             _require_target_parent(parent)
             _secure_staging_directory(parent.descriptor, staging.name)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
-            _require_expected_repository(
+            _require_expected_worktree_identity(
                 observation,
+                staging,
                 expected_repository_common_dir,
                 expected_repository_generation,
             )
         establish_worktree_generation(observation.git_dir, ownership_token)
         observation = observe_worktree(staging, liveness_fd=liveness_fd)
-        _require_expected_repository(
+        _require_expected_worktree_identity(
             observation,
+            staging,
             expected_repository_common_dir,
             expected_repository_generation,
         )
@@ -913,8 +918,9 @@ def create_worktree(
                 raise GitError(_git_error(selected))
             _require_target_parent(parent)
             observation = observe_worktree(staging, liveness_fd=liveness_fd)
-            _require_expected_repository(
+            _require_expected_worktree_identity(
                 observation,
+                staging,
                 expected_repository_common_dir,
                 expected_repository_generation,
             )
@@ -949,8 +955,9 @@ def create_worktree(
             create_worktree_generation=False,
             liveness_fd=liveness_fd,
         )
-        _require_expected_repository(
+        _require_expected_worktree_identity(
             result,
+            target,
             expected_repository_common_dir,
             expected_repository_generation,
         )
@@ -1334,8 +1341,9 @@ def inspect_owned_worktree(
     if expected_repository_common_dir is not None:
         if expected_repository_generation is None:
             raise GitError("Expected Repository identity is incomplete")
-        _require_expected_repository(
+        _require_expected_worktree_identity(
             observation,
+            target,
             expected_repository_common_dir,
             expected_repository_generation,
         )
@@ -1351,11 +1359,14 @@ def inspect_owned_worktree(
     return observation
 
 
-def _require_expected_repository(
+def _require_expected_worktree_identity(
     observation: WorktreeObservation,
+    expected_path: Path,
     expected_common_dir: Path,
     expected_generation: str,
 ) -> None:
+    if observation.path != expected_path:
+        raise GitError("Worktree path changed during Workspace creation")
     if (
         observation.repository_common_dir != expected_common_dir
         or observation.git_common_dir_generation != expected_generation
