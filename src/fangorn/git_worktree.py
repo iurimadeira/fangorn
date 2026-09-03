@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import ctypes
 import errno
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import select
 import shutil
@@ -1112,9 +1114,34 @@ def _require_trusted_checkout_component(descriptor: int, *, final: bool) -> None
 
 
 def _writable_by_another_principal(metadata: os.stat_result, descriptor: int) -> bool:
-    return bool(metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) or (
-        sys.platform == "darwin" and _darwin_acl_allows_write(descriptor)
-    )
+    if metadata.st_mode & stat.S_IWOTH:
+        return True
+    if sys.platform == "darwin" and _darwin_acl_allows_write(descriptor):
+        return True
+    if not metadata.st_mode & stat.S_IWGRP:
+        return False
+    if sys.platform.startswith("linux") and _linux_has_named_acl(descriptor):
+        return True
+    try:
+        group = grp.getgrgid(metadata.st_gid)
+        member_uids = {pwd.getpwnam(name).pw_uid for name in group.gr_mem}
+        member_uids.update(
+            account.pw_uid
+            for account in pwd.getpwall()
+            if account.pw_gid == metadata.st_gid
+        )
+    except (KeyError, OSError):
+        return True
+    return bool(member_uids - {os.geteuid()})
+
+
+def _linux_has_named_acl(descriptor: int) -> bool:
+    try:
+        return "system.posix_acl_access" in os.listxattr(descriptor)
+    except OSError as error:
+        if error.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            return False
+        raise GitError("Repository checkout configuration ACL is unsafe") from error
 
 
 def _darwin_acl_allows_write(descriptor: int) -> bool:

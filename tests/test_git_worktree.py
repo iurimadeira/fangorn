@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+import grp
 import json
 import os
+import pwd
 import select
 import shutil
 import signal
@@ -2432,13 +2434,19 @@ def test_worktree_creation_rejects_shared_repository_configuration(
     assert not (tmp_path / "target").exists()
 
 
-def test_worktree_creation_rejects_group_writable_configuration(
-    tmp_path: Path,
+def test_worktree_creation_rejects_configuration_writable_by_shared_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
     configured = source / ".git" / "config"
     configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
+
+    class OtherAccount:
+        pw_uid = os.geteuid() + 1
+        pw_gid = configured.stat().st_gid
+
+    monkeypatch.setattr(pwd, "getpwall", lambda: [OtherAccount()])
 
     with pytest.raises(GitError, match="checkout configuration is unsafe"):
         create_worktree(
@@ -2448,6 +2456,53 @@ def test_worktree_creation_rejects_group_writable_configuration(
             commit=commit,
             ownership_token="f" * 64,
             reconcile=False,
+        )
+
+
+def test_private_group_write_is_accepted_without_named_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    configured = source / ".git" / "config"
+    configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
+
+    class Group:
+        gr_mem: tuple[str, ...] = ()
+
+    class CurrentAccount:
+        pw_uid = os.geteuid()
+        pw_gid = configured.stat().st_gid
+
+    monkeypatch.setattr(grp, "getgrgid", lambda _gid: Group())
+    monkeypatch.setattr(pwd, "getpwall", lambda: [CurrentAccount()])
+    monkeypatch.setattr(os, "listxattr", lambda _descriptor: [])
+
+    result = create_worktree(
+        source,
+        target=tmp_path / "target",
+        branch="topic",
+        commit=commit,
+        ownership_token="5" * 64,
+        reconcile=False,
+    )
+
+    assert result.path == (tmp_path / "target")
+
+
+def test_linux_named_acl_is_not_treated_as_a_private_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = tmp_path / "config"
+    configured.write_text("", encoding="utf-8")
+    configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
+    with configured.open("rb") as stream:
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(
+            os, "listxattr", lambda descriptor: ["system.posix_acl_access"]
+        )
+        assert git_worktree_adapter._writable_by_another_principal(
+            os.fstat(stream.fileno()), stream.fileno()
         )
 
 
