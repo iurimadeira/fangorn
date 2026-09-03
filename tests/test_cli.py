@@ -354,7 +354,7 @@ def test_help_exposes_reads_but_keeps_legacy_adopt_hidden() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Worktree-native workspace families" in result.stdout
+    assert "Recoverable disposable Workspaces" in result.stdout
     assert "adopt" not in result.stdout
     assert "info" in result.stdout
     assert "list" in result.stdout

@@ -32,7 +32,7 @@ COMMAND_PATH = click.Path(
 @click.version_option(__version__)
 @click.pass_context
 def main(context: click.Context, root_json: bool) -> None:
-    """Worktree-native workspace families for humans and agents."""
+    """Recoverable disposable Workspaces for humans and agents."""
     context.ensure_object(dict)
     context.obj["json"] = root_json
 

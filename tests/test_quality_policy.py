@@ -12,6 +12,15 @@ def test_readme_documents_public_facade_without_legacy_adopt_flow() -> None:
 
     assert "fangorn.workspaces.Workspaces" in readme
     assert "fangorn adopt" not in readme
+    for marker in (
+        "root headless Workspaces",
+        "Python 3.12 or newer",
+        "Create starts by default",
+        "`--no-start` provisions",
+        "Equivalent retries return the same Workspace ID",
+        "recoverable fenced leases",
+    ):
+        assert marker in readme
 
 
 def test_local_quality_configuration_matches_the_public_contract() -> None:
