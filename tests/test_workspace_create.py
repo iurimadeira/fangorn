@@ -1673,6 +1673,42 @@ def test_unavailable_boot_probe_never_proves_owner_dead(
     assert workspaces_module._process_owner_status(owner) == "live"
 
 
+def test_boot_identity_normalizes_darwin_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = Path.read_text
+
+    def unavailable_proc(path: Path, *args: object, **kwargs: object) -> str:
+        if path == Path("/proc/sys/kernel/random/boot_id"):
+            raise OSError
+        return original(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", unavailable_proc)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "{ sec = 123, usec = 456 } trailing text\n", ""
+        ),
+    )
+
+    assert workspaces_module._boot_identity() == "darwin:123:456"
+
+
+def test_boot_identity_fails_without_a_stable_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", ""),
+    )
+
+    with pytest.raises(WorkspaceError, match="host boot identity"):
+        workspaces_module._current_process_identity()
+
+
 def test_symlink_loop_target_fails_as_workspace_error_before_state(
     tmp_path: Path,
 ) -> None:

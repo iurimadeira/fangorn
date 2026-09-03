@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 from git_helpers import git, initialize_repository
 
+import fangorn._git_supervisor as git_supervisor
 import fangorn.git_worktree as git_worktree_adapter
 from fangorn.git import GitError, establish_worktree_generation
 from fangorn.git_worktree import (
@@ -324,6 +325,15 @@ def test_process_group_probe_falls_back_when_proc_is_unavailable(
     assert git_worktree_adapter._process_group_running(2**30) is False
 
 
+def test_supervisor_process_group_probe_falls_back_without_proc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+
+    assert git_supervisor._process_group_running(os.getpgrp()) is True
+    assert git_supervisor._process_group_running(2**30) is False
+
+
 def test_successful_git_drains_term_ignoring_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -470,6 +480,67 @@ def test_worktree_create_rejects_replaced_target_parent_before_git_effect(
         )
 
     assert not any(replacement.iterdir())
+
+
+def test_target_parent_walk_rejects_relative_and_symlink_paths(tmp_path: Path) -> None:
+    with pytest.raises(GitError, match="must be absolute"):
+        git_worktree_adapter._walk_target_parent(Path("relative"), create=False)
+
+    linked = tmp_path / "linked"
+    linked.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(GitError, match="unsafe"):
+        git_worktree_adapter._walk_target_parent(linked, create=False)
+
+
+def test_target_parent_walk_rechecks_mkdir_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "raced"
+    original = os.mkdir
+
+    def raced_mkdir(
+        path: str | bytes,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        original(path, mode, dir_fd=dir_fd)
+        raise FileExistsError
+
+    monkeypatch.setattr(os, "mkdir", raced_mkdir)
+    descriptor = git_worktree_adapter._walk_target_parent(target, create=True)
+    assert descriptor is not None
+    os.close(descriptor)
+
+
+def test_target_parent_helpers_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata = tmp_path.stat()
+    monkeypatch.setattr(os, "geteuid", lambda: metadata.st_uid + 1)
+    with pytest.raises(GitError, match="unsafe"):
+        git_worktree_adapter._require_safe_directory(metadata)
+
+    monkeypatch.undo()
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    guarded = git_worktree_adapter._prepare_target_parent(parent)
+    parent.rename(tmp_path / "moved")
+    try:
+        with pytest.raises(GitError, match="changed"):
+            git_worktree_adapter._require_target_parent(guarded)
+    finally:
+        os.close(guarded.descriptor)
+
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    monkeypatch.setattr(
+        os, "fsync", lambda _descriptor: (_ for _ in ()).throw(OSError())
+    )
+    try:
+        with pytest.raises(GitError, match="not durable"):
+            git_worktree_adapter._fsync_descriptor(descriptor, "Target")
+    finally:
+        os.close(descriptor)
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:
