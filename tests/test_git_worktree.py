@@ -155,6 +155,21 @@ def test_explicit_configuration_is_read_from_validated_descriptor(
     assert swapped
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_configuration_reads_are_bounded(tmp_path: Path, explicit: bool) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    configuration = tmp_path / "explicit.toml" if explicit else source / "fangorn.toml"
+    configuration.write_bytes(b"#" * (1024 * 1024 + 1))
+    if not explicit:
+        git(source, "add", "fangorn.toml")
+        git(source, "commit", "-m", "add oversized configuration")
+        commit = git(source, "rev-parse", "HEAD")
+
+    with pytest.raises(GitError, match="Configuration exceeds 1 MiB"):
+        read_configuration(source, commit, configuration if explicit else None)
+
+
 def test_materialize_local_source_requires_and_returns_path(tmp_path: Path) -> None:
     source = RepositorySource("local", tmp_path, None, "local")
 

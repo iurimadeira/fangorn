@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 SUPPORTED_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
 GIT_EFFECT_TIMEOUT_SECONDS = 3600
 GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
+CONFIGURATION_LIMIT = 1024 * 1024
 UNPROVEN_GROUP_TERMINATION = 256
 
 
@@ -169,7 +170,10 @@ def read_configuration(
                     raise GitError("Configuration must be a regular non-symlink file")
                 with os.fdopen(descriptor, "rb") as opened:
                     descriptor = -1
-                    return opened.read()
+                    content = opened.read(CONFIGURATION_LIMIT + 1)
+                    if len(content) > CONFIGURATION_LIMIT:
+                        raise GitError("Configuration exceeds 1 MiB")
+                    return content
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
@@ -185,6 +189,8 @@ def read_configuration(
         repository, "show", f"{commit}:fangorn.toml", liveness_fd=liveness_fd
     )
     if result.returncode == 0:
+        if len(result.stdout) > CONFIGURATION_LIMIT:
+            raise GitError("Configuration exceeds 1 MiB")
         return result.stdout
     if (
         b"does not exist" in result.stderr
