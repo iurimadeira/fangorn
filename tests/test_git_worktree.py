@@ -6,7 +6,7 @@ import grp
 import json
 import os
 import pwd
-import select
+import selectors
 import shutil
 import signal
 import stat
@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from types import TracebackType
 from typing import Any, cast
 
 import pytest
@@ -49,6 +50,49 @@ from fangorn.git_worktree import (
 )
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
 from fangorn.workspaces import Workspaces
+
+
+class _StubSelector:
+    def __init__(self, readiness: Iterator[bool]) -> None:
+        self._readiness = readiness
+        self._keys: dict[int, selectors.SelectorKey] = {}
+
+    def register(self, descriptor: int, events: int) -> selectors.SelectorKey:
+        key = selectors.SelectorKey(descriptor, descriptor, events, None)
+        self._keys[descriptor] = key
+        return key
+
+    def unregister(self, descriptor: int) -> selectors.SelectorKey:
+        return self._keys.pop(descriptor)
+
+    def select(
+        self, timeout: float | None = None
+    ) -> list[tuple[selectors.SelectorKey, int]]:
+        del timeout
+        if not next(self._readiness, False):
+            return []
+        key = next(iter(self._keys.values()))
+        return [(key, selectors.EVENT_READ)]
+
+    def close(self) -> None:
+        self._keys.clear()
+
+    def __enter__(self) -> _StubSelector:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+
+def _stub_selector(*readiness: bool) -> Callable[[], _StubSelector]:
+    states = iter(readiness)
+    return lambda: _StubSelector(states)
 
 
 def repository(path: Path) -> str:
@@ -646,6 +690,7 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     monkeypatch.setattr(git_supervisor, "_drain", drain)
     monkeypatch.setattr(git_supervisor, "_child_running", lambda _child: False)
     monkeypatch.setattr(git_supervisor, "_finish_captures", lambda *_args: "ok")
+    monkeypatch.setattr(selectors, "DefaultSelector", _stub_selector())
 
     assert git_supervisor.main() == 0
     assert drained == [child]
@@ -784,7 +829,7 @@ def test_supervisor_pid_reader_completes_short_pipe_reads(
 ) -> None:
     chunks = iter((b"12", b"3\n", b""))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
-    monkeypatch.setattr(select, "select", lambda *_args: ([], [], []))
+    monkeypatch.setattr(selectors, "DefaultSelector", _stub_selector())
 
     assert git_worktree_adapter._read_supervisor_pid(10) == 123
 
@@ -833,7 +878,7 @@ def test_supervisor_pid_reader_rejects_split_trailing_data(
 ) -> None:
     chunks = iter((b"123\n", b"e"))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
-    monkeypatch.setattr(select, "select", lambda *_args: ([10], [], []))
+    monkeypatch.setattr(selectors, "DefaultSelector", _stub_selector(True))
 
     assert git_worktree_adapter._read_supervisor_pid(10) is None
 
@@ -843,8 +888,11 @@ def test_supervisor_completion_reader_requires_one_complete_frame(
 ) -> None:
     chunks = iter((b"-1", b"5\n", b""))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
-    checks = iter(([], [], [10]))
-    monkeypatch.setattr(select, "select", lambda *_args: (next(checks), [], []))
+    monkeypatch.setattr(
+        selectors,
+        "DefaultSelector",
+        _stub_selector(False, False, True),
+    )
     assert git_worktree_adapter._read_supervisor_completion(10) == -15
 
     chunks = iter((b"256\n", b""))
@@ -1253,14 +1301,24 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
 ) -> None:
     liveness_read, liveness_write = os.pipe()
     ready_read, ready_write = os.pipe()
-    states = iter((OSError("probe failed"), True, False))
+    states = iter(
+        (
+            OSError("probe failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ProcessLookupError(),
+        )
+    )
     sleeps: list[float] = []
 
-    def running(_process_group: int) -> bool:
+    def probe(_pid: int, _signal: int) -> None:
         state = next(states)
         if isinstance(state, BaseException):
             raise state
-        return state
 
     monkeypatch.setattr(
         sys,
@@ -1269,7 +1327,8 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
     )
     monkeypatch.setattr(signal, "signal", lambda *_args: None)
     monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
-    monkeypatch.setattr(git_guardian, "_process_group_running", running)
+    monkeypatch.setattr(os, "kill", probe)
+    monkeypatch.setattr(git_guardian, "_process_group_running", lambda _group: False)
     monkeypatch.setattr(time, "sleep", sleeps.append)
     try:
         assert git_guardian.main() == 0
@@ -1284,7 +1343,52 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
             with suppress(OSError):
                 os.close(descriptor)
 
-    assert sleeps == [0.01, 0.02]
+    assert sleeps == [0.01, 0.02, 0.04, 0.08, 0.16, 0.25, 0.25]
+    assert max(sleeps) == 0.25
+
+
+def test_guardian_scans_group_only_after_two_cheap_leader_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    liveness_read, liveness_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    events: list[str] = []
+    probes = iter((PermissionError(), ProcessLookupError()))
+    scans = iter((True, False))
+
+    def probe(_pid: int, sent: int) -> None:
+        assert sent == 0
+        events.append("probe")
+        raise next(probes)
+
+    def scan(_process_group: int) -> bool:
+        events.append("scan")
+        return next(scans)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["guardian", "123", str(liveness_read), str(ready_write)],
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    monkeypatch.setattr(os, "kill", probe)
+    monkeypatch.setattr(git_guardian, "_process_group_running", scan)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    try:
+        assert git_guardian.main() == 0
+        assert os.read(ready_read, 2) == b"r\n"
+    finally:
+        for descriptor in (
+            liveness_read,
+            liveness_write,
+            ready_read,
+            ready_write,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+
+    assert events == ["probe", "probe", "scan", "scan"]
 
 
 def test_guardian_persists_unknown_quiescence_after_probe_budget(
@@ -1296,7 +1400,7 @@ def test_guardian_persists_unknown_quiescence_after_probe_budget(
     ready_read, ready_write = os.pipe()
     probes = 0
 
-    def unavailable(_process_group: int) -> bool:
+    def unavailable(_pid: int, _signal: int) -> None:
         nonlocal probes
         probes += 1
         raise OSError("probe unavailable")
@@ -1308,7 +1412,12 @@ def test_guardian_persists_unknown_quiescence_after_probe_budget(
     )
     monkeypatch.setattr(signal, "signal", lambda *_args: None)
     monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
-    monkeypatch.setattr(git_guardian, "_process_group_running", unavailable)
+    monkeypatch.setattr(os, "kill", unavailable)
+    monkeypatch.setattr(
+        git_guardian,
+        "_process_group_running",
+        lambda _group: (_ for _ in ()).throw(AssertionError("must not scan")),
+    )
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
     try:
         assert git_guardian.main() == 1

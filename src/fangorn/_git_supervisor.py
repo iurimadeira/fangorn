@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-import select
+import selectors
 import signal
 import subprocess
 import sys
@@ -93,56 +93,60 @@ def _supervise(
         child.stderr.fileno(): [2, 0],
     }
     deadline = time.monotonic() + timeout
-    while True:
+    with selectors.DefaultSelector() as selector:
+        selector.register(control, selectors.EVENT_READ)
+        for descriptor in captures:
+            selector.register(descriptor, selectors.EVENT_READ)
+        while True:
+            if time.monotonic() >= deadline:
+                _close_captures(captures, selector)
+                return _limit_result(
+                    _drain(child, process_group), "Git operation exceeded one hour"
+                )
+            if not _child_running(child):
+                break
+            readable = [key.fd for key, _events in selector.select(0.01)]
+            if _forward_captures(readable, captures, output_limit, selector):
+                _close_captures(captures, selector)
+                return _limit_result(
+                    _drain(child, process_group),
+                    "Git diagnostic output exceeded 8 MiB",
+                )
+            if control not in readable:
+                continue
+            command_byte = os.read(control, 1)
+            if not command_byte:
+                stopped = (_finish if finish_on_owner_exit else _drain)(
+                    child, process_group
+                )
+                if failure := _completion_failure(
+                    stopped, captures, output_limit, deadline, selector
+                ):
+                    return failure
+                return child.returncode
+            if command_byte == b"c":
+                stopped = _drain(child, process_group)
+                if failure := _completion_failure(
+                    stopped, captures, output_limit, deadline, selector
+                ):
+                    return failure
+                return child.returncode
+            if command_byte == b"f":
+                stopped = _finish(child, process_group)
+                if failure := _completion_failure(
+                    stopped, captures, output_limit, deadline, selector
+                ):
+                    return failure
+                return child.returncode
+        stopped = _drain(child, process_group)
+        if failure := _completion_failure(
+            stopped, captures, output_limit, deadline, selector
+        ):
+            return failure
         if time.monotonic() >= deadline:
-            _close_captures(captures)
-            return _limit_result(
-                _drain(child, process_group), "Git operation exceeded one hour"
-            )
-        if not _child_running(child):
-            break
-        readable, _, _ = select.select((control, *captures), (), (), 0.01)
-        if _forward_captures(readable, captures, output_limit):
-            _close_captures(captures)
-            return _limit_result(
-                _drain(child, process_group),
-                "Git diagnostic output exceeded 8 MiB",
-            )
-        if not readable:
-            continue
-        if control not in readable:
-            continue
-        command_byte = os.read(control, 1)
-        if not command_byte:
-            stopped = (_finish if finish_on_owner_exit else _drain)(
-                child, process_group
-            )
-            if failure := _completion_failure(
-                stopped, captures, output_limit, deadline
-            ):
-                return failure
-            return child.returncode
-        if command_byte == b"c":
-            stopped = _drain(child, process_group)
-            if failure := _completion_failure(
-                stopped, captures, output_limit, deadline
-            ):
-                return failure
-            return child.returncode
-        if command_byte == b"f":
-            stopped = _finish(child, process_group)
-            if failure := _completion_failure(
-                stopped, captures, output_limit, deadline
-            ):
-                return failure
-            return child.returncode
-    stopped = _drain(child, process_group)
-    if failure := _completion_failure(stopped, captures, output_limit, deadline):
-        return failure
-    if time.monotonic() >= deadline:
-        _replace_output("Git operation exceeded one hour")
-        return 124
-    return child.returncode
+            _replace_output("Git operation exceeded one hour")
+            return 124
+        return child.returncode
 
 
 def _limit_result(stopped: bool, message: str) -> int:
@@ -154,12 +158,16 @@ def _limit_result(stopped: bool, message: str) -> int:
 
 
 def _forward_captures(
-    readable: list[int], captures: dict[int, list[int]], limit: int
+    readable: list[int],
+    captures: dict[int, list[int]],
+    limit: int,
+    selector: selectors.BaseSelector,
 ) -> bool:
     exceeded = False
     for descriptor in set(readable) & captures.keys():
         chunk = os.read(descriptor, 65536)
         if not chunk:
+            selector.unregister(descriptor)
             del captures[descriptor]
             continue
         destination, written = captures[descriptor]
@@ -174,20 +182,32 @@ def _forward_captures(
 
 
 def _finish_captures(
-    captures: dict[int, list[int]], limit: int, deadline: float
+    captures: dict[int, list[int]],
+    limit: int,
+    deadline: float,
+    selector: selectors.BaseSelector | None = None,
 ) -> str:
     exceeded = False
-    while captures:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _close_captures(captures)
-            return "timeout"
-        readable, _, _ = select.select(tuple(captures), (), (), remaining)
-        if not readable:
-            _close_captures(captures)
-            return "timeout"
-        exceeded |= _forward_captures(readable, captures, limit)
-    return "exceeded" if exceeded else "ok"
+    owned_selector = selector is None
+    if selector is None:
+        selector = selectors.DefaultSelector()
+        for descriptor in captures:
+            selector.register(descriptor, selectors.EVENT_READ)
+    try:
+        while captures:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _close_captures(captures, selector)
+                return "timeout"
+            readable = [key.fd for key, _events in selector.select(remaining)]
+            if not readable:
+                _close_captures(captures, selector)
+                return "timeout"
+            exceeded |= _forward_captures(readable, captures, limit, selector)
+        return "exceeded" if exceeded else "ok"
+    finally:
+        if owned_selector:
+            selector.close()
 
 
 def _completion_failure(
@@ -195,13 +215,14 @@ def _completion_failure(
     captures: dict[int, list[int]],
     output_limit: int,
     deadline: float,
+    selector: selectors.BaseSelector | None = None,
 ) -> int | None:
     if not stopped:
-        _close_captures(captures)
+        _close_captures(captures, selector)
         _replace_output("Git process-group termination could not be confirmed")
         return UNPROVEN_GROUP_TERMINATION
     capture = _finish_captures(
-        captures, output_limit, min(deadline, time.monotonic() + 2)
+        captures, output_limit, min(deadline, time.monotonic() + 2), selector
     )
     if capture == "ok":
         return None
@@ -213,8 +234,12 @@ def _completion_failure(
     return 124
 
 
-def _close_captures(captures: dict[int, list[int]]) -> None:
+def _close_captures(
+    captures: dict[int, list[int]], selector: selectors.BaseSelector | None = None
+) -> None:
     for descriptor in captures:
+        if selector is not None:
+            selector.unregister(descriptor)
         os.close(descriptor)
     captures.clear()
 

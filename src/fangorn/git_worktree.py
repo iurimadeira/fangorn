@@ -8,7 +8,7 @@ import json
 import os
 import pwd
 import re
-import select
+import selectors
 import shutil
 import signal
 import stat
@@ -1885,25 +1885,25 @@ def _read_pipe_frame(
     descriptor: int, limit: int, *, deadline: float | None = None
 ) -> bytes:
     value = bytearray()
-    while len(value) <= limit:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return b""
-            readable, _, _ = select.select((descriptor,), (), (), remaining)
-            if not readable:
-                return b""
-        chunk = os.read(descriptor, limit + 1 - len(value))
-        if not chunk:
-            break
-        value.extend(chunk)
-        if b"\n" in value:
-            if value.index(b"\n") != len(value) - 1:
+    with selectors.DefaultSelector() as selector:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while len(value) <= limit:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return b""
+                if not selector.select(remaining):
+                    return b""
+            chunk = os.read(descriptor, limit + 1 - len(value))
+            if not chunk:
+                break
+            value.extend(chunk)
+            if b"\n" in value:
+                if value.index(b"\n") != len(value) - 1:
+                    return bytes(value)
+                if selector.select(0):
+                    value.extend(os.read(descriptor, 1))
                 return bytes(value)
-            readable, _, _ = select.select((descriptor,), (), (), 0)
-            if readable:
-                value.extend(os.read(descriptor, 1))
-            return bytes(value)
     return bytes(value)
 
 

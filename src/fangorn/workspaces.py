@@ -7,7 +7,7 @@ import json
 import os
 import re
 import secrets
-import select
+import selectors
 import signal
 import stat
 import subprocess
@@ -118,8 +118,9 @@ def _defer_invocation_marker_cleanup(descriptor: int, marker: Path) -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         os.close(ready_write)
     try:
-        readable, _, _ = select.select((ready_read,), (), (), 5)
-        ready = os.read(ready_read, 3) if readable else b""
+        with selectors.DefaultSelector() as selector:
+            selector.register(ready_read, selectors.EVENT_READ)
+            ready = os.read(ready_read, 3) if selector.select(5) else b""
     finally:
         os.close(ready_read)
     if ready != b"r\n":

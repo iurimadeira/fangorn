@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-import select
+import selectors
 import signal
 import sys
 import time
@@ -17,13 +17,14 @@ def main() -> int:
     if os.read(control, 1) != b"a":
         return 1
     deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        readable, _, _ = select.select((control,), (), (), remaining)
-        if readable and not os.read(control, 1):
-            break
+    with selectors.DefaultSelector() as selector:
+        selector.register(control, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if selector.select(remaining) and not os.read(control, 1):
+                break
     os.killpg(os.getpgrp(), signal.SIGKILL)
     return 1
 

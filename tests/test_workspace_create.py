@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import resource
 import shutil
 import signal
 import sqlite3
@@ -1623,6 +1624,83 @@ def test_successful_create_eventually_removes_guardian_held_invocation_marker(
     while any(workspaces._invocation_root.iterdir()):
         assert time.monotonic() < deadline
         time.sleep(0.01)
+
+
+def test_headless_create_and_cleanup_support_high_file_descriptors(
+    tmp_path: Path,
+) -> None:
+    required_limit = 2048
+    _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard_limit != resource.RLIM_INFINITY and hard_limit < required_limit:
+        pytest.skip("RLIMIT_NOFILE cannot provide safe high-FD test headroom")
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    database = tmp_path / "state" / "registry.sqlite3"
+    target = tmp_path / "worktrees" / "high-fd"
+    script = """
+import json
+import os
+import resource
+import sys
+import time
+from pathlib import Path
+from fangorn.registry import Registry
+from fangorn.workspaces import CreateWorkspace, Workspaces
+
+held = []
+try:
+    required_limit = int(sys.argv[4])
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < required_limit:
+        resource.setrlimit(
+            resource.RLIMIT_NOFILE,
+            (required_limit, hard_limit),
+        )
+    while not held or held[-1] < 1024:
+        held.append(os.open(os.devnull, os.O_RDONLY))
+    database = Path(sys.argv[1])
+    workspaces = Workspaces(
+        Registry(database),
+        data_home=database.parent / "data",
+        cache_home=database.parent / "cache",
+    )
+    result = workspaces.create(CreateWorkspace(
+        repository=sys.argv[2],
+        branch="high-fd",
+        path=Path(sys.argv[3]),
+        headless=True,
+    ))
+    deadline = time.monotonic() + 10
+    while any(workspaces._invocation_root.iterdir()):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Workspace invocation marker cleanup timed out")
+        time.sleep(0.01)
+    print(json.dumps({"highest_fd": held[-1], "state": result.workspace.state}))
+finally:
+    for descriptor in held:
+        os.close(descriptor)
+"""
+
+    completed = subprocess.run(  # noqa: S603 -- fixed interpreter and test script
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(database),
+            str(repository),
+            str(target),
+            str(required_limit),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["highest_fd"] >= 1024
+    assert payload["state"] == "ready"
 
 
 def test_marker_cleaner_survives_creator_exit_until_guardian_releases(
