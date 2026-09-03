@@ -412,6 +412,7 @@ class Workspaces:
                     scope_kind="workspace",
                     scope_key=intent.workspace_id,
                     lease_epoch=lease_epoch,
+                    enter_state=step.enter_state,
                 )
                 if step.action == "create":
                     observation = create_worktree(

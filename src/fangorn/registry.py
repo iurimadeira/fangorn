@@ -1226,7 +1226,12 @@ class Registry:
         scope_kind: str,
         scope_key: str,
         lease_epoch: int,
+        enter_state: str | None = None,
     ) -> str:
+        if enter_state is not None and (
+            scope_kind != "workspace" or enter_state != "starting"
+        ):
+            raise RegistryError("Workspace lifecycle transition is invalid")
         with self._connection() as connection:
             self._migrate(connection)
             try:
@@ -1252,6 +1257,16 @@ class Registry:
                         "WHERE operation_id = ? AND position = ?",
                         (operation_id, position),
                     )
+                if enter_state is not None:
+                    changed = connection.execute(
+                        "UPDATE workspace_aggregates SET lifecycle_state = ? "
+                        "WHERE workspace_id = ? AND completed_operation_id IS NULL",
+                        (enter_state, scope_key),
+                    ).rowcount
+                    if changed != 1:
+                        raise RegistryError(
+                            "Workspace lifecycle transition is unavailable"
+                        )
                 connection.commit()
                 return status
             except (sqlite3.Error, RegistryError) as error:

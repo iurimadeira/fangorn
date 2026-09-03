@@ -24,6 +24,7 @@ class Observation:
 class PlanStep:
     action: Literal["create", "start", "inspect"]
     resource_name: str
+    enter_state: Literal["starting"] | None = None
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,14 @@ class CreatePlan:
 def plan_create(resources: tuple[Resource, ...], *, start: bool) -> CreatePlan:
     create = tuple(PlanStep("create", resource.name) for resource in resources)
     start_steps = (
-        tuple(PlanStep("start", resource.name) for resource in resources)
+        tuple(
+            PlanStep(
+                "start",
+                resource.name,
+                enter_state="starting" if position == 0 else None,
+            )
+            for position, resource in enumerate(resources)
+        )
         if start
         else ()
     )

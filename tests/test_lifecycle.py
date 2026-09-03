@@ -22,7 +22,7 @@ def test_default_create_plans_declared_resources_to_ready() -> None:
         PlanStep("create", "worktree"),
         PlanStep("create", "api"),
         PlanStep("create", "terminal"),
-        PlanStep("start", "worktree"),
+        PlanStep("start", "worktree", enter_state="starting"),
         PlanStep("start", "api"),
         PlanStep("start", "terminal"),
         PlanStep("inspect", "worktree"),

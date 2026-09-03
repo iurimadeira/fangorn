@@ -149,6 +149,47 @@ def test_create_root_headless_local_workspace(
     assert git(target, "rev-parse", "HEAD") == created_from_sha
 
 
+@pytest.mark.parametrize(
+    ("start", "expected_intermediate"),
+    [(True, "starting"), (False, "creating")],
+)
+def test_create_persists_intermediate_lifecycle_state_before_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: bool,
+    expected_intermediate: str,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    database = tmp_path / "state" / "registry.sqlite3"
+    observed_states: list[str] = []
+
+    def inspect(*args: object, **kwargs: object) -> object:
+        with sqlite3.connect(database) as connection:
+            observed_states.append(
+                connection.execute(
+                    "SELECT lifecycle_state FROM workspace_aggregates"
+                ).fetchone()[0]
+            )
+        return real_inspect_owned_worktree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("fangorn.workspaces.inspect_owned_worktree", inspect)
+
+    result = facade(tmp_path).create(
+        CreateWorkspace(
+            repository=str(repository),
+            branch=f"lifecycle-{expected_intermediate}",
+            path=tmp_path / "worktree",
+            headless=True,
+            start=start,
+        )
+    )
+
+    assert observed_states
+    assert set(observed_states) == {expected_intermediate}
+    assert result.workspace.state == ("ready" if start else "stopped")
+
+
 def test_equivalent_retry_reuses_resolved_values_and_completed_operation(
     tmp_path: Path,
 ) -> None:
@@ -1617,9 +1658,22 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
 
     with pytest.raises(WorkspaceError, match="creation is incomplete"):
         facade(tmp_path).adopt(target)
+    recovery_states: list[str] = []
+
+    def inspect_recovery(*args: object, **kwargs: object) -> object:
+        with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+            recovery_states.append(
+                connection.execute(
+                    "SELECT lifecycle_state FROM workspace_aggregates"
+                ).fetchone()[0]
+            )
+        return real_inspect_owned_worktree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("fangorn.workspaces.inspect_owned_worktree", inspect_recovery)
     recovered = facade(tmp_path).create(request)
     adopted = facade(tmp_path).adopt(target)
 
+    assert set(recovery_states) == {"starting"}
     assert recovered.created is False
     assert recovered.workspace.state == "ready"
     assert adopted.created is False
