@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import os
 import re
@@ -11,7 +13,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from fangorn.git import (
@@ -49,6 +51,8 @@ def normalize_repository_source(value: str) -> RepositorySource:
             raise GitError("Repository URLs must not contain query or fragment data")
         scheme = parsed.scheme.lower()
         hostname = parsed.hostname.lower() if parsed.hostname else ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
         port = f":{parsed.port}" if parsed.port is not None else ""
         netloc = f"{hostname}{port}"
         path = re.sub("/+", "/", parsed.path).rstrip("/")
@@ -111,15 +115,24 @@ def validate_branch_name(branch: str) -> None:
 def read_configuration(repository: Path, commit: str, explicit: Path | None) -> bytes:
     if explicit is not None:
         try:
-            if explicit.is_symlink():
-                raise GitError("Configuration must be a regular non-symlink file")
-            resolved = explicit.resolve(strict=True)
-            if not resolved.is_file():
-                raise GitError("Configuration must be a regular non-symlink file")
-            return resolved.read_bytes()
+            descriptor = os.open(explicit, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise GitError("Configuration must be a regular non-symlink file")
+                with os.fdopen(descriptor, "rb") as opened:
+                    descriptor = -1
+                    return opened.read()
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
         except GitError:
             raise
         except (OSError, RuntimeError) as error:
+            if isinstance(error, OSError) and error.errno == errno.ELOOP:
+                raise GitError(
+                    "Configuration must be a regular non-symlink file"
+                ) from error
             raise GitError(f"Configuration is unavailable: {explicit}") from error
     result = _run_git_process(repository, "show", f"{commit}:fangorn.toml")
     if result.returncode == 0:
@@ -141,6 +154,7 @@ def materialize_cache(
     refresh: bool = True,
     refresh_default_head: bool = True,
     liveness_fd: int | None = None,
+    preparation_id: str | None = None,
 ) -> Path:
     if source.clone_url is None:
         if source.path is None:
@@ -151,12 +165,19 @@ def materialize_cache(
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
         _verify_bare_repository(cache_path, source.normalized)
-        if refresh:
+        prepared = preparation_id is not None and _preparation_receipt_matches(
+            cache_path, preparation_id, refresh_default_head
+        )
+        if refresh and not prepared:
             _refresh_bare_repository(
                 cache_path,
                 update_default=refresh_default_head,
                 liveness_fd=liveness_fd,
             )
+            if preparation_id is not None:
+                _write_preparation_receipt(
+                    cache_path, preparation_id, refresh_default_head
+                )
         _fsync_directory(cache_path.parent, "Repository cache publication")
         return cache_path
     require_supported_git(cache_path.parent)
@@ -202,6 +223,8 @@ def materialize_cache(
         except FileExistsError:
             _verify_bare_repository(cache_path, source.normalized)
         _fsync_directory(cache_path.parent, "Repository cache publication")
+        if preparation_id is not None:
+            _write_preparation_receipt(cache_path, preparation_id, refresh_default_head)
         return cache_path
     finally:
         if invocation.parent == cache_path.parent and invocation.name.startswith(
@@ -272,6 +295,62 @@ def _refresh_bare_repository(
         )
         if head.returncode != 0:
             raise GitError(_git_error(head))
+
+
+def _preparation_receipt_path(path: Path, preparation_id: str) -> Path:
+    digest = hashlib.sha256(preparation_id.encode()).hexdigest()
+    return path / f"fangorn-preparation-{digest}.json"
+
+
+def _preparation_receipt_matches(
+    path: Path, preparation_id: str, update_default: bool
+) -> bool:
+    receipt = _preparation_receipt_path(path, preparation_id)
+    try:
+        loaded: object = json.loads(receipt.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    value = cast(dict[str, object], loaded)
+    return value == {
+        "repository_generation": repository_generation(path, create=False),
+        "update_default": update_default,
+    }
+
+
+def _write_preparation_receipt(
+    path: Path, preparation_id: str, update_default: bool
+) -> None:
+    generation = repository_generation(path, create=False)
+    if generation is None:
+        raise GitError("Repository cache generation marker is unavailable")
+    receipt = _preparation_receipt_path(path, preparation_id)
+    payload = json.dumps(
+        {"repository_generation": generation, "update_default": update_default},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{receipt.name}.", dir=path)
+    temporary = Path(temporary_name)
+    try:
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("short write")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, receipt)
+        _fsync_directory(path, "Repository preparation receipt")
+    except OSError as error:
+        raise GitError("Repository preparation receipt is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def create_worktree(
@@ -574,12 +653,31 @@ def _run_git_process(
         ]
         inherited = (control_read, liveness_fd)
     try:
-        return subprocess.run(  # noqa: S603
+        if liveness_fd is None:
+            return subprocess.run(  # noqa: S603
+                command,
+                check=False,
+                capture_output=True,
+                env=environment,
+            )
+        process = subprocess.Popen(  # noqa: S603
             supervised,
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=environment,
             pass_fds=inherited,
+            start_new_session=liveness_fd is not None,
+        )
+        try:
+            stdout, stderr = process.communicate()
+        except BaseException:
+            if control_write is not None:
+                os.close(control_write)
+                control_write = None
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(
+            supervised, process.returncode, stdout, stderr
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error

@@ -1748,6 +1748,8 @@ def test_create_rejects_unsupported_definition_before_state(
     ("configuration", "message"),
     [
         ("schema_version = 2\n", "schema_version = 1"),
+        ("schema_version = true\n", "schema_version = 1"),
+        ("schema_version = 1.0\n", "schema_version = 1"),
         (
             "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
             "Service Resources are not available",

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import cast
 
@@ -20,7 +23,8 @@ from fangorn.git_worktree import (
     read_configuration,
     resolve_commit,
 )
-from fangorn.registry import ProcessIdentity
+from fangorn.registry import ProcessIdentity, Registry, RegistryError
+from fangorn.workspaces import Workspaces
 
 
 def repository(path: Path) -> str:
@@ -44,6 +48,19 @@ def test_repository_source_normalizes_urls_and_local_identity(tmp_path: Path) ->
     assert url_source.normalized == "https://example.com/acme/widgets.git"
     assert url_source.clone_url == url_source.normalized
     assert url_source.name == "widgets"
+
+
+@pytest.mark.parametrize(
+    ("source", "normalized"),
+    [
+        ("https://[2001:db8::1]/repo.git", "https://[2001:db8::1]/repo.git"),
+        ("ssh://[2001:db8::1]:2222/repo.git", "ssh://[2001:db8::1]:2222/repo.git"),
+    ],
+)
+def test_repository_source_preserves_ipv6_authority(
+    source: str, normalized: str
+) -> None:
+    assert normalize_repository_source(source).normalized == normalized
 
 
 @pytest.mark.parametrize(
@@ -84,6 +101,35 @@ def test_commit_and_configuration_reads_are_immutable(tmp_path: Path) -> None:
         read_configuration(source, commit, tmp_path / "missing.toml")
 
 
+def test_explicit_configuration_is_read_from_validated_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    explicit = tmp_path / "explicit.toml"
+    replacement = tmp_path / "replacement.toml"
+    explicit.write_bytes(b"schema_version = 1\n")
+    replacement.write_bytes(b"schema_version = 2\n")
+    real_open = os.open
+    swapped = False
+
+    def swap_after_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes], flags: int
+    ) -> int:
+        nonlocal swapped
+        descriptor = real_open(path, flags)
+        if path == explicit:
+            swapped = True
+            explicit.unlink()
+            explicit.symlink_to(replacement)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swap_after_open)
+
+    assert read_configuration(source, commit, explicit) == b"schema_version = 1\n"
+    assert swapped
+
+
 def test_materialize_local_source_requires_and_returns_path(tmp_path: Path) -> None:
     source = RepositorySource("local", tmp_path, None, "local")
 
@@ -113,6 +159,114 @@ def test_clone_cache_reuses_only_matching_bare_repository(tmp_path: Path) -> Non
     invalid_cache.mkdir()
     with pytest.raises(GitError, match="not a bare repository"):
         materialize_cache(source, invalid_cache)
+
+
+def test_interrupted_refresh_is_replayed_without_completion_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_repository = tmp_path / "source"
+    repository(source_repository)
+    cache = tmp_path / "cache" / "repository.git"
+    source = normalize_repository_source(source_repository.as_uri())
+    materialize_cache(source, cache, preparation_id="initial")
+    from fangorn import git_worktree
+
+    original = git_worktree._run_git_process
+    fetches = 0
+
+    class Interrupted(BaseException):
+        pass
+
+    def interrupt_after_fetch(*args: object, **kwargs: object) -> object:
+        nonlocal fetches
+        result = original(*args, **kwargs)  # type: ignore[arg-type]
+        if "fetch" in args:
+            fetches += 1
+            if fetches == 1:
+                raise Interrupted
+        return result
+
+    monkeypatch.setattr(git_worktree, "_run_git_process", interrupt_after_fetch)
+    with pytest.raises(Interrupted):
+        materialize_cache(source, cache, preparation_id="retry")
+    materialize_cache(source, cache, preparation_id="retry")
+
+    assert fetches == 2
+
+
+def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    started = tmp_path / "started"
+    stopped = tmp_path / "stopped"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "trap 'sleep 0.5; printf stopped > \"$FANGORN_STOPPED\"; exit 0' TERM\n"
+        'printf started > "$FANGORN_STARTED"\n'
+        "while :; do sleep 0.05; done\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    database = tmp_path / "state" / "registry.sqlite3"
+    script = """
+import json
+import sys
+from dataclasses import asdict
+from pathlib import Path
+from fangorn.git_worktree import _run_git_process
+from fangorn.registry import Registry
+from fangorn.workspaces import Workspaces
+registry = Registry(Path(sys.argv[1]))
+intent, _ = registry.begin_create_intent(request_key="interrupt", request_id=None,
+    request_json="{}", target_path=str(Path(sys.argv[1]).parent / "target"),
+    workspace_id="workspace", operation_id="operation", prepare_cache=True)
+w = Workspaces(registry)
+owner = w._invocation_process_identity()
+epoch = registry.acquire_lease(scope_kind="repository", scope_key="source",
+    operation_id=intent.operation_id, owner=owner, owner_status=w._owner_status)
+print(json.dumps(asdict(owner)), flush=True)
+try:
+    _run_git_process(Path.cwd(), "fetch", liveness_fd=w._invocation_descriptor(owner))
+finally:
+    registry.release_lease(scope_kind="repository", scope_key="source",
+        operation_id=intent.operation_id, lease_epoch=epoch)
+    w._finish_invocation(owner)
+"""
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["FANGORN_STARTED"] = str(started)
+    environment["FANGORN_STOPPED"] = str(stopped)
+    child = subprocess.Popen(  # noqa: S603 -- fixed interpreter and test script
+        [sys.executable, "-c", script, str(database)],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    assert child.stdout is not None
+    owner = ProcessIdentity(**json.loads(child.stdout.readline()))
+    deadline = time.monotonic() + 5
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+
+    child.send_signal(signal.SIGINT)
+    registry = Registry(database)
+    checker = Workspaces(registry)
+    with pytest.raises(RegistryError, match="mutation is busy"):
+        registry.acquire_lease(
+            scope_kind="repository",
+            scope_key="source",
+            operation_id="operation",
+            owner=ProcessIdentity("new", "boot", os.getpid(), "start"),
+            owner_status=checker._owner_status,
+        )
+    child.wait(timeout=5)
+
+    assert stopped.read_text(encoding="utf-8") == "stopped"
+    assert checker._owner_status(owner) == "dead"
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:

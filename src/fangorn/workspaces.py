@@ -475,9 +475,10 @@ class Workspaces:
                 selected,
                 owner=owner,
                 owner_status=self._owner_status,
-                refresh=previous == "pending",
+                refresh=previous != "completed",
                 refresh_default_head=refresh_default_head,
                 liveness_fd=self._invocation_descriptor(owner),
+                preparation_id=operation_id,
             )
             generation = repository_generation(repository, create=entry is None)
             if generation is None:
@@ -766,7 +767,7 @@ def _configuration_value(content: bytes) -> dict[str, object]:
     if not content:
         return {"schema_version": 1}
     value = tomllib.loads(content.decode("utf-8"))
-    if value.get("schema_version") != 1:
+    if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         raise WorkspaceError("fangorn.toml requires schema_version = 1")
     if value.get("services"):
         raise WorkspaceError("Service Resources are not available in this release")
