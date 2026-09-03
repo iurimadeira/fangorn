@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -52,6 +53,33 @@ from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
 ADOPTION_ATTEMPTS = 3
 _ACTIVE_INVOCATIONS: dict[str, tuple[int, Path]] = {}
 _ACTIVE_INVOCATIONS_LOCK = Lock()
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    _fields_ = (
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    )
 
 
 def _defer_invocation_marker_cleanup(descriptor: int, marker: Path) -> None:
@@ -1059,22 +1087,36 @@ def _process_start_identity(pid: int) -> str:
         fields = stat_path.read_text(encoding="ascii").rsplit(")", 1)[1].split()
         return fields[19]
     except (OSError, IndexError):
-        environment = os.environ.copy()
-        environment.update({"LANG": "C", "LC_ALL": "C", "TZ": "UTC"})
-        try:
-            result = subprocess.run(  # noqa: S603
-                ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=environment,
-                timeout=2,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise WorkspaceError("Cannot establish process start identity") from error
-        if result.returncode != 0 or not result.stdout.strip():
-            raise WorkspaceError("Cannot establish process start identity") from None
-        return result.stdout.strip()
+        if sys.platform == "darwin":
+            return _darwin_process_start_identity(pid)
+        raise WorkspaceError("Cannot establish process start identity") from None
+
+
+def _darwin_process_start_identity(pid: int) -> str:
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError as error:
+        raise WorkspaceError("Cannot establish process start identity") from error
+    proc_pidinfo = library.proc_pidinfo
+    proc_pidinfo.argtypes = (
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    proc_pidinfo.restype = ctypes.c_int
+    info = _ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    result = proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+    if (
+        result != size
+        or info.pbi_pid != pid
+        or info.pbi_start_tvsec <= 0
+        or not 0 <= info.pbi_start_tvusec < 1_000_000
+    ):
+        raise WorkspaceError("Cannot establish process start identity")
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec:06d}"
 
 
 def _process_owner_status(

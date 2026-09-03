@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
@@ -2478,6 +2479,57 @@ def test_boot_identity_fails_without_a_stable_probe(
 
     with pytest.raises(WorkspaceError, match="host boot identity"):
         workspaces_module._current_process_identity()
+
+
+def test_process_start_identity_uses_darwin_microseconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = Path.read_text
+
+    def unavailable_proc(path: Path, *args: object, **kwargs: object) -> str:
+        if path == Path("/proc/123/stat"):
+            raise OSError
+        return original(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    class ProcPidInfo:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(
+            self,
+            pid: int,
+            flavor: int,
+            arg: int,
+            buffer: Any,
+            size: int,
+        ) -> int:
+            assert (pid, flavor, arg, size) == (123, 3, 0, 136)
+            info = ctypes.cast(
+                buffer, ctypes.POINTER(workspaces_module._ProcBsdInfo)
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_start_tvsec = 1_725_000_000
+            info.pbi_start_tvusec = 456
+            return size
+
+    class LibProc:
+        proc_pidinfo = ProcPidInfo()
+
+    monkeypatch.setattr(Path, "read_text", unavailable_proc)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: LibProc())
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("process identity must not use ps")
+        ),
+    )
+
+    assert ctypes.sizeof(workspaces_module._ProcBsdInfo) == 136
+    assert workspaces_module._ProcBsdInfo.pbi_start_tvsec.offset == 120
+    assert workspaces_module._ProcBsdInfo.pbi_start_tvusec.offset == 128
+    assert workspaces_module._process_start_identity(123) == "darwin:1725000000:000456"
 
 
 def test_portable_identity_probes_fail_closed_on_timeout(
