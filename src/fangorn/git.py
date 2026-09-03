@@ -104,9 +104,9 @@ def _run_git(
     allowed_exit_codes: frozenset[int] = frozenset(),
     liveness_fd: int | None = None,
 ) -> str | None:
-    from fangorn.git_worktree import _run_git_query_process
+    from fangorn.git_worktree import _run_git_process
 
-    result = _run_git_query_process(
+    result = _run_git_process(
         path,
         *arguments,
         liveness_fd=liveness_fd,

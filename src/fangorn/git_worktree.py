@@ -39,7 +39,6 @@ if TYPE_CHECKING:
 
 SUPPORTED_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
 GIT_EFFECT_TIMEOUT_SECONDS = 3600
-GIT_QUERY_TIMEOUT_SECONDS = 30
 GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
 UNPROVEN_GROUP_TERMINATION = 256
 
@@ -147,7 +146,7 @@ def _remote_ref_candidates(ref: str | None) -> tuple[str, ...]:
 
 
 def validate_branch_name(branch: str) -> None:
-    result = _run_git_query_process(Path.cwd(), "check-ref-format", "--branch", branch)
+    result = _run_git_process(Path.cwd(), "check-ref-format", "--branch", branch)
     if result.returncode != 0:
         raise GitError("Workspace branch is invalid")
 
@@ -180,7 +179,7 @@ def read_configuration(
                     "Configuration must be a regular non-symlink file"
                 ) from error
             raise GitError(f"Configuration is unavailable: {explicit}") from error
-    result = _run_git_query_process(
+    result = _run_git_process(
         repository, "show", f"{commit}:fangorn.toml", liveness_fd=liveness_fd
     )
     if result.returncode == 0:
@@ -744,7 +743,7 @@ def create_worktree(
             if observation.head != commit or observation.branch not in {None, branch}:
                 raise GitError("Staged Worktree does not match the interrupted create")
         else:
-            branch_exists = _run_git_query_process(
+            branch_exists = _run_git_process(
                 repository,
                 "show-ref",
                 "--verify",
@@ -805,7 +804,7 @@ def create_worktree(
         establish_worktree_generation(observation.git_dir, ownership_token)
         observation = observe_worktree(staging, liveness_fd=liveness_fd)
         if observation.head != commit or observation.branch != branch:
-            branch_exists = _run_git_query_process(
+            branch_exists = _run_git_process(
                 repository,
                 "show-ref",
                 "--verify",
@@ -878,13 +877,14 @@ def create_worktree(
 def _reject_executable_checkout_configuration(
     worktree_descriptor: int, *, liveness_fd: int | None = None
 ) -> None:
-    configured = _run_git_query_process(
+    configured = _run_git_process(
         Path("."),
         "config",
         "--includes",
         "--name-only",
         "--list",
         liveness_fd=liveness_fd,
+        extra_fds=(worktree_descriptor,),
         working_directory_fd=worktree_descriptor,
     )
     if configured.returncode != 0:
@@ -1153,84 +1153,10 @@ def _required_git_path(
 
 
 def _run_git(path: Path, *arguments: str, liveness_fd: int | None = None) -> str:
-    result = _run_git_query_process(path, *arguments, liveness_fd=liveness_fd)
+    result = _run_git_process(path, *arguments, liveness_fd=liveness_fd)
     if result.returncode != 0:
         raise GitError(_git_error(result))
     return result.stdout.decode("utf-8", errors="replace").strip()
-
-
-def _run_git_query_process(
-    path: Path,
-    *arguments: str,
-    git_dir: bool = False,
-    liveness_fd: int | None = None,
-    working_directory_fd: int | None = None,
-    disable_hooks: bool = True,
-    isolate_config: bool = True,
-) -> subprocess.CompletedProcess[bytes]:
-    del liveness_fd
-    command = ["git"]
-    if git_dir:
-        command.append(f"--git-dir={path}")
-    else:
-        command.extend(("-C", str(path)))
-    if disable_hooks:
-        command.extend(("-c", "core.hooksPath=/dev/null"))
-    command.extend(arguments)
-    environment = os.environ.copy()
-    environment["LC_ALL"] = "C"
-    environment["LANG"] = "C"
-    for name in REPOSITORY_LOCAL_ENVIRONMENT:
-        environment.pop(name, None)
-    if isolate_config:
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = os.devnull
-    try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            process = subprocess.Popen(  # noqa: S603 -- fixed read-only Git argv
-                command,
-                stdout=stdout,
-                stderr=stderr,
-                env=environment,
-                pass_fds=(
-                    (working_directory_fd,) if working_directory_fd is not None else ()
-                ),
-                process_group=0,
-                preexec_fn=(
-                    (lambda: os.fchdir(working_directory_fd))
-                    if working_directory_fd is not None
-                    else None
-                ),
-            )
-            timed_out = False
-            try:
-                returncode = process.wait(timeout=GIT_QUERY_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    _cancel_process_group(process.pid, deadline=time.monotonic() + 5)
-                except GitQuiescenceError as error:
-                    raise GitError("Cannot terminate bounded Git query") from error
-                process.wait(timeout=1)
-                returncode = 124
-            stdout_size = os.fstat(stdout.fileno()).st_size
-            stderr_size = os.fstat(stderr.fileno()).st_size
-            stdout.seek(0)
-            stderr.seek(0)
-            captured_stdout = _read_capture(stdout, GIT_CAPTURE_LIMIT)
-            captured_stderr = _read_capture(stderr, GIT_CAPTURE_LIMIT)
-            if timed_out:
-                captured_stderr = b"Git query exceeded 30 seconds\n"
-            elif max(stdout_size, stderr_size) > GIT_CAPTURE_LIMIT:
-                returncode = 124
-                captured_stderr = b"Git diagnostic output exceeded 8 MiB\n"
-            return subprocess.CompletedProcess(
-                command, returncode, captured_stdout, captured_stderr
-            )
-    except FileNotFoundError as error:
-        raise GitError("Git executable was not found") from error
-    except OSError as error:
-        raise GitError(f"Cannot run Git: {error.strerror or error}") from error
 
 
 def _run_git_process(

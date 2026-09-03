@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -1756,53 +1757,56 @@ def test_in_operation_inspection_keeps_cross_process_lease_fenced(
     create_repository(repository)
     database = tmp_path / "state" / "registry.sqlite3"
     target = tmp_path / "worktrees" / "inspection-fence"
-    sleeper_pid = tmp_path / "sleeper.pid"
+    git_pid = tmp_path / "git.pid"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "${FANGORN_BLOCK_INSPECT:-}" = 1 ]; then\n'
+        "  trap '' TERM\n"
+        '  printf "%s" "$$" > "$FANGORN_GIT_PID"\n'
+        "  while :; do sleep 0.05; done\n"
+        "fi\n"
+        'exec "$FANGORN_REAL_GIT" "$@"\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
     script = """
-import subprocess
+import os
 import sys
 from pathlib import Path
 import fangorn.workspaces as module
-from fangorn.git import GitQuiescenceError
-from fangorn.git_worktree import _retain_quiescence_guardian
 from fangorn.registry import Registry
-from fangorn.workspaces import CreateWorkspace, WorkspaceError, Workspaces
+from fangorn.workspaces import CreateWorkspace, Workspaces
 
 real_inspect = module.inspect_owned_worktree
-failed = False
-def fail_once(*args, **kwargs):
-    global failed
-    if failed:
+def block_in_real_inspection(*args, **kwargs):
+    os.environ["FANGORN_BLOCK_INSPECT"] = "1"
+    try:
         return real_inspect(*args, **kwargs)
-    failed = True
-    liveness = kwargs.get("liveness_fd")
-    if liveness is None:
-        raise AssertionError("in-operation inspection lost invocation liveness")
-    sleeper = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, process_group=0,
-    )
-    Path(sys.argv[4]).write_text(str(sleeper.pid), encoding="ascii")
-    _retain_quiescence_guardian(sleeper.pid, liveness_fd=liveness)
-    raise GitQuiescenceError("inspection quiescence is unproven")
+    finally:
+        os.environ.pop("FANGORN_BLOCK_INSPECT", None)
 
-module.inspect_owned_worktree = fail_once
-try:
-    Workspaces(
-        Registry(Path(sys.argv[1])),
-        data_home=Path(sys.argv[1]).parent / "data",
-        cache_home=Path(sys.argv[1]).parent / "cache",
-    ).create(CreateWorkspace(
-        repository=sys.argv[2], branch="inspection-fence", path=Path(sys.argv[3]),
-        request_id="inspection-fence-1", headless=True,
-    ))
-except WorkspaceError as error:
-    if "inspection quiescence is unproven" not in str(error):
-        raise
-else:
-    raise AssertionError("inspection quiescence failure was not surfaced")
+module.inspect_owned_worktree = block_in_real_inspection
+Workspaces(
+    Registry(Path(sys.argv[1])),
+    data_home=Path(sys.argv[1]).parent / "data",
+    cache_home=Path(sys.argv[1]).parent / "cache",
+).create(CreateWorkspace(
+    repository=sys.argv[2], branch="inspection-fence", path=Path(sys.argv[3]),
+    request_id="inspection-fence-1", headless=True,
+))
 """
-    completed = subprocess.run(  # noqa: S603 -- fixed interpreter and test script
+    environment = {
+        **dict(os.environ),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FANGORN_REAL_GIT": real_git,
+        "FANGORN_GIT_PID": str(git_pid),
+    }
+    child = subprocess.Popen(  # noqa: S603 -- fixed interpreter and test script
         [
             sys.executable,
             "-c",
@@ -1810,14 +1814,20 @@ else:
             str(database),
             str(repository),
             str(target),
-            str(sleeper_pid),
         ],
-        check=False,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        env=environment,
     )
-    assert completed.returncode == 0, completed.stderr
-    process_group = int(sleeper_pid.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 10
+    while not git_pid.exists() and child.poll() is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert git_pid.exists(), child.stderr.read() if child.stderr is not None else ""
+    process_group = os.getpgid(int(git_pid.read_text(encoding="ascii")))
+    child.kill()
+    child.wait(timeout=5)
     request = CreateWorkspace(
         repository=str(repository),
         branch="inspection-fence",
@@ -1826,14 +1836,10 @@ else:
         headless=True,
     )
     workspaces = facade(tmp_path)
-    try:
-        with pytest.raises(WorkspaceError, match="Workspace mutation is busy"):
-            workspaces.create(request)
-    finally:
-        with suppress(ProcessLookupError):
-            os.killpg(process_group, signal.SIGKILL)
+    with pytest.raises(WorkspaceError, match="Workspace mutation is busy"):
+        workspaces.create(request)
 
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 10
     while True:
         try:
             recovered = workspaces.create(request)
@@ -1843,6 +1849,8 @@ else:
             assert time.monotonic() < deadline
             time.sleep(0.01)
     assert recovered.workspace.state == "ready"
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process_group, 0)
 
 
 def test_repository_release_failure_preserves_cache_failure(

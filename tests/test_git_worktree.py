@@ -1287,41 +1287,6 @@ def test_worktree_observation_batches_identity_queries(
     assert sum("--show-toplevel" in call for call in calls) == 2
 
 
-def test_read_only_git_query_has_a_process_group_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
-    fake_git.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setattr(git_worktree_adapter, "GIT_QUERY_TIMEOUT_SECONDS", 0.01)
-
-    result = git_worktree_adapter._run_git_query_process(tmp_path, "--version")
-
-    assert result.returncode == 124
-    assert result.stderr == b"Git query exceeded 30 seconds\n"
-
-
-def test_read_only_git_query_bounds_retained_diagnostics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\nprintf 1234567890\n", encoding="utf-8")
-    fake_git.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setattr(git_worktree_adapter, "GIT_CAPTURE_LIMIT", 4)
-
-    result = git_worktree_adapter._run_git_query_process(tmp_path, "--version")
-
-    assert result.returncode == 124
-    assert len(result.stdout) <= 4
-    assert result.stderr == b"Git diagnostic output exceeded 8 MiB\n"
-
-
 def test_parent_group_probe_rejects_malformed_ps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
