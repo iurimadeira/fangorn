@@ -9,6 +9,7 @@ import time
 
 def main() -> int:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     control = int(sys.argv[1])
     liveness = int(sys.argv[2])
     timeout = int(sys.argv[3])

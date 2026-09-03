@@ -17,6 +17,10 @@ class GitError(RuntimeError):
     """Git could not prove a requested worktree identity."""
 
 
+class GitQuiescenceError(GitError):
+    """Git process-group termination could not be proven."""
+
+
 @dataclass(frozen=True)
 class WorktreeObservation:
     repository_common_dir: Path

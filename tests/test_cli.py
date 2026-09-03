@@ -932,7 +932,6 @@ def test_concurrent_adopter_retries_while_transaction_reobservation_is_slow(
     original_sleep = time.sleep
 
     monkeypatch.setattr(registry_adapter, "BUSY_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(registry_adapter, "ADOPTION_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr(registry_adapter, "ADOPTION_RETRY_DELAY_SECONDS", 0.001)
 
     def record_retry(delay: float) -> None:

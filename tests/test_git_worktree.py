@@ -20,7 +20,12 @@ from git_helpers import git, initialize_repository
 import fangorn._git_anchor as git_anchor
 import fangorn._git_supervisor as git_supervisor
 import fangorn.git_worktree as git_worktree_adapter
-from fangorn.git import GitError, establish_worktree_generation, repository_generation
+from fangorn.git import (
+    GitError,
+    GitQuiescenceError,
+    establish_worktree_generation,
+    repository_generation,
+)
 from fangorn.git_worktree import (
     RepositorySource,
     create_worktree,
@@ -490,6 +495,9 @@ def test_supervised_git_rejects_missing_child_handshake(
             return 1
 
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FailedSupervisor())
+    monkeypatch.setattr(
+        git_worktree_adapter, "_process_group_running", lambda *_args, **_kwargs: False
+    )
     write = os.write
     monkeypatch.setattr(
         os,
@@ -583,6 +591,9 @@ def test_supervisor_completion_reader_requires_one_complete_frame(
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
     assert git_worktree_adapter._read_supervisor_completion(10) == -15
 
+    chunks = iter((b"256\n", b""))
+    assert git_worktree_adapter._read_supervisor_completion(10) == 256
+
     chunks = iter((b"0\n", b"extra", b""))
     assert git_worktree_adapter._read_supervisor_completion(10) is None
 
@@ -643,25 +654,39 @@ def test_portable_group_probe_ignores_zombie_leader(
         git_supervisor._process_group_running(77)
 
 
-def test_group_probe_falls_back_when_proc_scan_is_incomplete(
+def test_supervisor_group_probe_bounds_ps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(["ps"], 0, "123 77 S\n", "")
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        run,
+    )
+
+    assert git_supervisor._process_group_running(77, timeout=0.25) is True
+    observed_timeout = captured["timeout"]
+    assert isinstance(observed_timeout, (int, float))
+    assert 0 < observed_timeout <= 0.25
+
+
+def test_process_group_proc_probes_stop_at_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Path, "is_dir", lambda _path: True)
     monkeypatch.setattr(Path, "iterdir", lambda _path: iter((Path("/proc/123"),)))
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError()),
-    )
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 0, "123 77 S\n", ""
-        ),
-    )
 
-    assert git_supervisor._process_group_running(77) is True
+    for module in (git_supervisor, git_worktree_adapter):
+        clock = iter((0.0, 0.25))
+        monkeypatch.setattr(module.time, "monotonic", lambda clock=clock: next(clock))
+        with pytest.raises(subprocess.TimeoutExpired):
+            module._process_group_running(77, timeout=0.25)
 
 
 def test_supervisor_group_probe_ignores_watchdog_leader(
@@ -736,7 +761,10 @@ def test_supervisor_rejects_completion_without_proven_group_stop(
         lambda *_args: (_ for _ in ()).throw(AssertionError("must close immediately")),
     )
 
-    assert git_supervisor._completion_failure(False, {}, 1, time.monotonic()) == 125
+    assert (
+        git_supervisor._completion_failure(False, {}, 1, time.monotonic())
+        == git_supervisor.UNPROVEN_GROUP_TERMINATION
+    )
     assert diagnostics == ["Git process-group termination could not be confirmed"]
 
 
@@ -757,7 +785,7 @@ def test_anchor_survives_group_termination_before_arming(
 ) -> None:
     control_reader, control_writer = os.pipe()
     liveness_reader, liveness_writer = os.pipe()
-    handlers: list[tuple[int, Any]] = []
+    events: list[tuple[object, object]] = []
     os.write(control_writer, b"x")
     monkeypatch.setattr(
         sys,
@@ -765,7 +793,12 @@ def test_anchor_survives_group_termination_before_arming(
         ["anchor", str(control_reader), str(liveness_reader), "1"],
     )
     monkeypatch.setattr(
-        signal, "signal", lambda number, handler: handlers.append((number, handler))
+        signal, "signal", lambda number, handler: events.append((number, handler))
+    )
+    monkeypatch.setattr(
+        signal,
+        "pthread_sigmask",
+        lambda operation, signals: events.append((operation, signals)),
     )
     try:
         assert git_anchor.main() == 1
@@ -778,7 +811,66 @@ def test_anchor_survives_group_termination_before_arming(
         ):
             os.close(descriptor)
 
-    assert handlers == [(signal.SIGTERM, signal.SIG_IGN)]
+    assert events == [
+        (signal.SIGTERM, signal.SIG_IGN),
+        (signal.SIG_UNBLOCK, {signal.SIGTERM}),
+    ]
+
+
+def test_anchor_inherits_blocked_term_until_handler_is_ready() -> None:
+    control_reader, control_writer = os.pipe()
+    liveness_reader, liveness_writer = os.pipe()
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    anchor: subprocess.Popen[bytes] | None = None
+    try:
+        anchor = subprocess.Popen(  # noqa: S603 -- fixed watchdog argv
+            [
+                sys.executable,
+                "-I",
+                str(Path(git_anchor.__file__)),
+                str(control_reader),
+                str(liveness_reader),
+                "1",
+            ],
+            pass_fds=(control_reader, liveness_reader),
+            process_group=0,
+        )
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+    try:
+        os.killpg(anchor.pid, signal.SIGTERM)
+        os.write(control_writer, b"a")
+        time.sleep(0.05)
+        assert anchor.poll() is None
+    finally:
+        os.close(control_writer)
+        for descriptor in (control_reader, liveness_reader, liveness_writer):
+            os.close(descriptor)
+        with suppress(subprocess.TimeoutExpired):
+            anchor.wait(timeout=2)
+        if anchor.poll() is None:
+            os.killpg(anchor.pid, signal.SIGKILL)
+            anchor.wait(timeout=2)
+
+
+def test_parent_rejects_completion_without_final_group_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_read_supervisor_completion",
+        lambda *_args, **_kwargs: git_worktree_adapter.UNPROVEN_GROUP_TERMINATION,
+    )
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_wait_for_process_group_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            GitError("observation unavailable")
+        ),
+    )
+
+    with pytest.raises(GitQuiescenceError, match="Cannot confirm"):
+        git_worktree_adapter._run_git_process(tmp_path, "--version")
 
 
 def test_parent_group_probe_rejects_malformed_ps(
@@ -810,7 +902,9 @@ def test_parent_group_probe_bounds_portable_ps(
     monkeypatch.setattr(subprocess, "run", run)
 
     assert git_worktree_adapter._process_group_running(77, timeout=0.25) is False
-    assert captured["timeout"] == 0.25
+    observed_timeout = captured["timeout"]
+    assert isinstance(observed_timeout, (int, float))
+    assert 0 < observed_timeout <= 0.25
 
 
 def test_parent_group_cleanup_stops_at_deadline(

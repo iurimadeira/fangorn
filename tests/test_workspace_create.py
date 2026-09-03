@@ -15,7 +15,7 @@ import pytest
 from git_helpers import git, initialize_repository
 
 import fangorn.workspaces as workspaces_module
-from fangorn.git import observe_worktree
+from fangorn.git import GitQuiescenceError, observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
 from fangorn.workspaces import (
@@ -1471,6 +1471,50 @@ def test_cleanup_persistence_failure_is_reported_with_effect_failure(
         WorkspaceError,
         match="effect failed; failed to persist create failure: Registry is busy",
     ):
+        workspaces.create(request)
+
+
+@pytest.mark.parametrize("clone", [False, True])
+def test_unproven_git_quiescence_keeps_leases_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clone: bool
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=repository.as_uri() if clone else str(repository),
+        branch="unproven-quiescence",
+        path=tmp_path / "worktrees" / "unproven-quiescence",
+        request_id="unproven-quiescence-1",
+        headless=True,
+    )
+
+    def fail_quiescence(*_args: object, **_kwargs: object) -> object:
+        raise GitQuiescenceError("Cannot confirm Git process-group termination")
+
+    monkeypatch.setattr(
+        "fangorn.workspaces.materialize_cache"
+        if clone
+        else "fangorn.workspaces.create_worktree",
+        fail_quiescence,
+    )
+
+    with pytest.raises(WorkspaceError, match="Cannot confirm"):
+        workspaces.create(request)
+
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        active = dict(
+            connection.execute(
+                "SELECT scope_kind, active FROM mutation_leases"
+            ).fetchall()
+        )
+        assert active["workspace"] == 1
+        assert active.get("repository") == (1 if clone else None)
+        assert connection.execute("SELECT status FROM operations").fetchone() == (
+            "running",
+        )
+
+    with pytest.raises(WorkspaceError, match="Workspace mutation is busy"):
         workspaces.create(request)
 
 

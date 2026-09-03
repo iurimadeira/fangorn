@@ -25,6 +25,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 from fangorn.git import (
     REPOSITORY_LOCAL_ENVIRONMENT,
     GitError,
+    GitQuiescenceError,
     WorktreeObservation,
     establish_worktree_generation,
     observe_worktree,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 SUPPORTED_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
 GIT_EFFECT_TIMEOUT_SECONDS = 3600
 GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
+UNPROVEN_GROUP_TERMINATION = 256
 
 
 @dataclass(frozen=True)
@@ -1048,21 +1050,27 @@ def _run_supervised_git(
                         signal.SIG_BLOCK, {signal.SIGINT}
                     )
                     try:
-                        anchor = subprocess.Popen(  # noqa: S603 -- fixed watchdog argv
-                            [
-                                sys.executable,
-                                "-I",
-                                str(Path(__file__).with_name("_git_anchor.py")),
-                                str(anchor_control_read),
-                                str(liveness_fd),
-                                str(GIT_EFFECT_TIMEOUT_SECONDS),
-                            ],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            pass_fds=(anchor_control_read, liveness_fd),
-                            process_group=0,
+                        anchor_mask = signal.pthread_sigmask(
+                            signal.SIG_BLOCK, {signal.SIGTERM}
                         )
+                        try:
+                            anchor = subprocess.Popen(  # noqa: S603 -- fixed watchdog argv
+                                [
+                                    sys.executable,
+                                    "-I",
+                                    str(Path(__file__).with_name("_git_anchor.py")),
+                                    str(anchor_control_read),
+                                    str(liveness_fd),
+                                    str(GIT_EFFECT_TIMEOUT_SECONDS),
+                                ],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                pass_fds=(anchor_control_read, liveness_fd),
+                                process_group=0,
+                            )
+                        finally:
+                            signal.pthread_sigmask(signal.SIG_SETMASK, anchor_mask)
                         os.close(anchor_control_read)
                         anchor_control_read = -1
                         os.write(anchor_control_write, b"a")
@@ -1128,6 +1136,17 @@ def _run_supervised_git(
                     _settle_process(process)
                     _settle_process(anchor)
                     settled = True
+                    if returncode == UNPROVEN_GROUP_TERMINATION:
+                        try:
+                            _wait_for_process_group_state(
+                                process_group,
+                                deadline=min(deadline, time.monotonic() + 5),
+                            )
+                        except GitError as error:
+                            raise GitQuiescenceError(
+                                "Cannot confirm Git process-group termination"
+                            ) from error
+                        returncode = 125
                 except BaseException:
                     for descriptor in (control_read, status_write, completion_write):
                         if descriptor >= 0:
@@ -1234,7 +1253,7 @@ def _read_supervisor_completion(
     if not re.fullmatch(rb"-?[0-9]{1,3}\n", value):
         return None
     returncode = int(value[:-1])
-    return returncode if -255 <= returncode <= 255 else None
+    return returncode if -255 <= returncode <= UNPROVEN_GROUP_TERMINATION else None
 
 
 def _read_pipe_frame(
@@ -1288,16 +1307,15 @@ def _cancel_process_group(process_group: int, *, deadline: float | None = None) 
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGTERM)
     try:
-        if not _wait_for_process_group_state(
+        _wait_for_process_group_state(
             process_group, deadline=min(deadline, time.monotonic() + 2)
-        ):
-            return
-    except GitError:
+        )
+        return
+    except GitQuiescenceError:
         pass
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGKILL)
-    if _wait_for_process_group_state(process_group, deadline=deadline):
-        raise GitError("Cannot confirm Git process-group termination")
+    _wait_for_process_group_state(process_group, deadline=deadline)
 
 
 def _wait_for_process_group_state(process_group: int, *, deadline: float) -> bool:
@@ -1310,15 +1328,18 @@ def _wait_for_process_group_state(process_group: int, *, deadline: float) -> boo
         except (OSError, subprocess.SubprocessError):
             pass
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-    raise GitError("Cannot confirm Git process-group termination")
+    raise GitQuiescenceError("Cannot confirm Git process-group termination")
 
 
 def _process_group_running(process_group: int, *, timeout: float = 1) -> bool:
+    deadline = time.monotonic() + timeout
     proc = Path("/proc")
     if proc.is_dir():
         parsed = False
         complete = True
         for entry in proc.iterdir():
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("/proc process-group scan", timeout)
             if not entry.name.isdigit():
                 continue
             try:
@@ -1328,6 +1349,8 @@ def _process_group_running(process_group: int, *, timeout: float = 1) -> bool:
                     .rpartition(")")[2]
                     .split()
                 )
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("/proc process-group scan", timeout)
                 parsed = True
                 if int(fields[2]) == process_group and fields[0] != "Z":
                     return True
@@ -1337,6 +1360,9 @@ def _process_group_running(process_group: int, *, timeout: float = 1) -> bool:
                 complete = False
         if parsed and complete:
             return False
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("process-group probe", timeout)
     result = subprocess.run(
         ["/bin/ps", "-axo", "pgid=,state="],
         check=True,
@@ -1344,7 +1370,7 @@ def _process_group_running(process_group: int, *, timeout: float = 1) -> bool:
         env={"LANG": "C", "PATH": "/usr/bin:/bin"},
         start_new_session=True,
         text=True,
-        timeout=timeout,
+        timeout=remaining,
     )
     running = False
     for line in result.stdout.splitlines():

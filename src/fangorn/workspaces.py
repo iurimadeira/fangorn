@@ -21,7 +21,12 @@ from uuid import uuid4
 
 from fangorn._lifecycle import Observation, finish_create, plan_create
 from fangorn._lifecycle import Resource as LifecycleResource
-from fangorn.git import GitError, observe_worktree, repository_generation
+from fangorn.git import (
+    GitError,
+    GitQuiescenceError,
+    observe_worktree,
+    repository_generation,
+)
 from fangorn.git_worktree import (
     RepositorySource,
     create_worktree,
@@ -415,7 +420,11 @@ class Workspaces:
             aggregate, operation = self._load_completed(intent.workspace_id)
             return CreateWorkspaceResult(aggregate, operation, created=created)
         except BaseException as error:
-            if intent is not None and lease_epoch is not None:
+            if (
+                intent is not None
+                and lease_epoch is not None
+                and not isinstance(error, GitQuiescenceError)
+            ):
                 try:
                     self._registry.fail_create_operation(
                         operation_id=intent.operation_id,
@@ -536,20 +545,21 @@ class Workspaces:
             primary_error = error
             raise
         finally:
-            try:
-                self._registry.release_lease(
-                    scope_kind="repository",
-                    scope_key=source.normalized,
-                    operation_id=operation_id,
-                    lease_epoch=epoch,
-                )
-            except RegistryError as release_error:
-                if primary_error is not None:
-                    raise WorkspaceError(
-                        f"{primary_error}; failed to release Repository lease: "
-                        f"{release_error}"
-                    ) from primary_error
-                raise
+            if not isinstance(primary_error, GitQuiescenceError):
+                try:
+                    self._registry.release_lease(
+                        scope_kind="repository",
+                        scope_key=source.normalized,
+                        operation_id=operation_id,
+                        lease_epoch=epoch,
+                    )
+                except RegistryError as release_error:
+                    if primary_error is not None:
+                        raise WorkspaceError(
+                            f"{primary_error}; failed to release Repository lease: "
+                            f"{release_error}"
+                        ) from primary_error
+                    raise
 
     def _load_completed(
         self, workspace_id: str

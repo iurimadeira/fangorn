@@ -9,6 +9,8 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+UNPROVEN_GROUP_TERMINATION = 256
+
 
 def main() -> int:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -188,7 +190,7 @@ def _completion_failure(
     if not stopped:
         _close_captures(captures)
         _replace_output("Git process-group termination could not be confirmed")
-        return 125
+        return UNPROVEN_GROUP_TERMINATION
     capture = _finish_captures(
         captures, output_limit, min(deadline, time.monotonic() + 2)
     )
@@ -271,11 +273,14 @@ def _child_running(child: subprocess.Popen[bytes]) -> bool:
 def _process_group_running(
     process_group: int, *, ignore_pid: int | None = None, timeout: float = 1
 ) -> bool:
+    deadline = time.monotonic() + timeout
     proc = Path("/proc")
     if proc.is_dir():
         parsed = False
         complete = True
         for entry in proc.iterdir():
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("/proc process-group scan", timeout)
             if not entry.name.isdigit():
                 continue
             try:
@@ -285,6 +290,8 @@ def _process_group_running(
                     .rpartition(")")[2]
                     .split()
                 )
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("/proc process-group scan", timeout)
                 parsed = True
                 if (
                     int(entry.name) != ignore_pid
@@ -298,6 +305,9 @@ def _process_group_running(
                 complete = False
         if parsed and complete:
             return False
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("process-group probe", timeout)
     result = subprocess.run(
         ["/bin/ps", "-axo", "pid=,pgid=,state="],
         check=True,
@@ -305,7 +315,7 @@ def _process_group_running(
         env={"LANG": "C", "PATH": "/usr/bin:/bin"},
         start_new_session=True,
         text=True,
-        timeout=timeout,
+        timeout=remaining,
     )
     running = False
     for line in result.stdout.splitlines():
