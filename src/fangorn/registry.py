@@ -248,6 +248,10 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             """
+            CREATE UNIQUE INDEX workspace_one_worktree
+            ON workspace_resources(workspace_id) WHERE kind = 'worktree'
+            """,
+            """
             CREATE TABLE repository_cache_entries (
                 normalized_source TEXT PRIMARY KEY NOT NULL,
                 path TEXT NOT NULL UNIQUE,
@@ -325,6 +329,10 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 SELECT 1 FROM workspace_aggregates
                 WHERE workspace_id = NEW.workspace_id
                     AND completed_operation_id IS NOT NULL
+            )
+            OR EXISTS (
+                SELECT 1 FROM workspaces
+                WHERE id = NEW.workspace_id AND completed_operation_id IS NOT NULL
             )
             BEGIN
                 SELECT RAISE(ABORT, 'workspace resource membership is immutable');
@@ -419,6 +427,28 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             END
             """,
             """
+            CREATE TRIGGER workspace_aggregate_completion_valid_on_insert
+            BEFORE INSERT ON workspace_aggregates
+            FOR EACH ROW
+            WHEN NEW.completed_operation_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM operations
+                WHERE id = NEW.completed_operation_id
+                    AND workspace_id = NEW.workspace_id
+                    AND kind = 'create' AND status = 'completed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is invalid');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_aggregate_delete_immutable
+            BEFORE DELETE ON workspace_aggregates
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace definition is immutable');
+            END
+            """,
+            """
             CREATE TRIGGER workspace_completion_immutable
             BEFORE UPDATE OF completed_operation_id ON workspaces
             FOR EACH ROW
@@ -443,12 +473,29 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             END
             """,
             """
+            CREATE TRIGGER workspace_completion_valid_on_insert
+            BEFORE INSERT ON workspaces
+            FOR EACH ROW
+            WHEN NEW.completed_operation_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM operations
+                WHERE id = NEW.completed_operation_id
+                    AND workspace_id = NEW.id
+                    AND kind = 'create' AND status = 'completed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is invalid');
+            END
+            """,
+            """
             CREATE TRIGGER completed_create_operation_immutable
             BEFORE UPDATE OF workspace_id, kind, status ON operations
             FOR EACH ROW
             WHEN EXISTS (
                 SELECT 1 FROM workspace_aggregates
                 WHERE completed_operation_id = OLD.id
+            )
+            OR EXISTS (
+                SELECT 1 FROM workspaces WHERE completed_operation_id = OLD.id
             )
             BEGIN
                 SELECT RAISE(ABORT, 'workspace completion is immutable');
@@ -461,6 +508,9 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             WHEN EXISTS (
                 SELECT 1 FROM workspace_aggregates
                 WHERE completed_operation_id = OLD.id
+            )
+            OR EXISTS (
+                SELECT 1 FROM workspaces WHERE completed_operation_id = OLD.id
             )
             BEGIN
                 SELECT RAISE(ABORT, 'workspace completion is immutable');

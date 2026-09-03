@@ -237,6 +237,16 @@ class Workspaces:
             )
             if intent.status == "completed":
                 return self._completed_create(intent.workspace_id)
+            try:
+                lease_epoch = self._registry.acquire_lease(
+                    scope_kind="workspace",
+                    scope_key=intent.workspace_id,
+                    operation_id=intent.operation_id,
+                    owner=owner,
+                    owner_status=_owner_status,
+                )
+            except CreateAlreadyCompleted:
+                return self._completed_create(intent.workspace_id)
 
             repository = self._prepare_repository(source, intent, owner)
             if intent.resolved_json is None:
@@ -284,16 +294,6 @@ class Workspaces:
                 definition=_create_definition(intent, target, resolved),
             )
 
-            try:
-                lease_epoch = self._registry.acquire_lease(
-                    scope_kind="workspace",
-                    scope_key=intent.workspace_id,
-                    operation_id=intent.operation_id,
-                    owner=owner,
-                    owner_status=_owner_status,
-                )
-            except CreateAlreadyCompleted:
-                return self._completed_create(intent.workspace_id)
             lifecycle = plan_create(
                 (LifecycleResource("worktree", "worktree"),), start=request.start
             )

@@ -719,6 +719,17 @@ def test_resolved_sha_survives_configuration_failure_and_ref_movement(
     monkeypatch.setattr("fangorn.workspaces.read_configuration", fail_configuration)
     with pytest.raises(WorkspaceError, match="configuration unavailable"):
         facade(tmp_path).create(request)
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT resolved_sha, status FROM workspace_create_intents "
+            "WHERE request_id = ?",
+            (request.request_id,),
+        ).fetchone() == (original_sha, "create_failed")
+        assert connection.execute(
+            "SELECT status FROM operations WHERE id = (SELECT operation_id "
+            "FROM workspace_create_intents WHERE request_id = ?)",
+            (request.request_id,),
+        ).fetchone() == ("failed",)
     (repository / "later.txt").write_text("later\n", encoding="utf-8")
     git(repository, "add", "later.txt")
     git(repository, "commit", "-m", "move source ref")
@@ -891,6 +902,59 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
             connection.execute(
                 "UPDATE operations SET kind = 'stop' WHERE id = ?",
                 (completed_operation_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="definition is immutable"):
+            connection.execute(
+                "DELETE FROM workspace_aggregates WHERE workspace_id = ?",
+                (created.definition.id,),
+            )
+        repository_id = connection.execute(
+            "SELECT repository_id FROM workspaces WHERE id = ?",
+            (created.definition.id,),
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="completion is invalid"):
+            connection.execute(
+                "INSERT INTO workspaces "
+                "(id, repository_id, git_dir, git_dir_generation, path, created_at, "
+                "last_observed_at, last_observation_token, completed_operation_id) "
+                "VALUES ('ghost-workspace', ?, '/ghost-git-dir', ?, '/ghost', ?, ?, "
+                "1, 'ghost-operation')",
+                (
+                    repository_id,
+                    "e" * 64,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+
+    with sqlite3.connect(database) as connection:
+        resource = (
+            "pending-resource",
+            0,
+            "worktree",
+            "worktree",
+            "fangorn.git-worktree",
+            1,
+            "{}",
+            None,
+            str(tmp_path / "pending-resource"),
+            "d" * 64,
+            "created",
+        )
+        connection.execute(
+            "INSERT INTO workspace_resources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            resource,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            connection.execute(
+                "INSERT INTO workspace_resources VALUES "
+                "(?, 1, 'second-worktree', 'worktree', 'fangorn.git-worktree', 1, "
+                "'{}', NULL, ?, ?, 'created')",
+                (
+                    "pending-resource",
+                    str(tmp_path / "second-pending-resource"),
+                    "c" * 64,
+                ),
             )
 
 
