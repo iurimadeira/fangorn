@@ -27,7 +27,7 @@ def main() -> int:
                 return 0
         except (OSError, subprocess.SubprocessError):
             pass
-        time.sleep(0.1)
+        time.sleep(0.01)
 
 
 def _process_group_running(process_group: int) -> bool:
