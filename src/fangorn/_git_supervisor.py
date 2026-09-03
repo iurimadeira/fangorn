@@ -15,17 +15,25 @@ def main() -> int:
     status = int(sys.argv[2])
     liveness = int(sys.argv[3])
     inherited = tuple(int(value) for value in sys.argv[4].split(",") if value)
+    finish_on_owner_exit = sys.argv[5] == "finish"
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
-        sys.argv[5:], start_new_session=True, pass_fds=(liveness, *inherited)
+        sys.argv[6:], start_new_session=True, pass_fds=(liveness, *inherited)
     )
-    os.write(status, f"{child.pid}\n".encode("ascii"))
-    os.close(status)
+    try:
+        os.write(status, f"{child.pid}\n".encode("ascii"))
+    except BrokenPipeError:
+        pass
+    finally:
+        os.close(status)
     while child.poll() is None:
         readable, _, _ = select.select((control,), (), (), 0.01)
         if not readable:
             continue
         command = os.read(control, 1)
-        if not command or command == b"c":
+        if not command:
+            (_finish if finish_on_owner_exit else _drain)(child)
+            return child.returncode
+        if command == b"c":
             _drain(child)
             return child.returncode
         if command == b"f":

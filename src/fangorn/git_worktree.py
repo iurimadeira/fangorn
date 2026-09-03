@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -701,8 +702,15 @@ def _entry_kind(parent_descriptor: int, name: str) -> str | None:
 
 
 def _descriptor_entry(parent_descriptor: int, name: str) -> str:
-    root = "/dev/fd" if Path("/dev/fd").is_dir() else "/proc/self/fd"
-    return f"{root}/{parent_descriptor}/{name}"
+    proc_descriptor = Path(f"/proc/self/fd/{parent_descriptor}")
+    if proc_descriptor.is_dir():
+        return str(proc_descriptor / name)
+    if sys.platform == "darwin":
+        value = fcntl.fcntl(parent_descriptor, 50, b"\0" * 1024)
+        path = Path(os.fsdecode(value.split(b"\0", 1)[0]))
+        if path.is_absolute():
+            return str(path / name)
+    raise GitError("Workspace target parent descriptor is unavailable")
 
 
 def _fsync_descriptor(descriptor: int, label: str) -> None:
@@ -854,6 +862,7 @@ def _run_supervised_git(
         str(status_write),
         str(liveness_fd),
         ",".join(str(descriptor) for descriptor in extra_fds),
+        "finish" if finish_on_parent_exit else "cancel",
         *command,
     ]
     try:

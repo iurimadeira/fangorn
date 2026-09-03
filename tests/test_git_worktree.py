@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -286,12 +287,7 @@ finally:
         time.sleep(0.01)
     assert started.exists()
 
-    if hard_death and finish_on_parent_exit:
-        child.send_signal(signal.SIGINT)
-        time.sleep(0.1)
-        child.send_signal(signal.SIGKILL)
-    else:
-        child.send_signal(signal.SIGKILL if hard_death else signal.SIGINT)
+    child.send_signal(signal.SIGKILL if hard_death else signal.SIGINT)
     registry = Registry(database)
     checker = Workspaces(registry)
     with pytest.raises(RegistryError, match="mutation is busy"):
@@ -337,6 +333,33 @@ def test_supervisor_process_group_probe_falls_back_without_proc(
 
     assert git_supervisor._process_group_running(os.getpgrp()) is True
     assert git_supervisor._process_group_running(2**30) is False
+
+
+def test_supervisor_drains_git_when_owner_dies_before_status_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        pid = 123
+        returncode = 0
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    child = Child()
+    drained: list[object] = []
+    monkeypatch.setattr(
+        sys, "argv", ["supervisor", "10", "11", "12", "", "cancel", "git"]
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(
+        os, "write", lambda *args: (_ for _ in ()).throw(BrokenPipeError())
+    )
+    monkeypatch.setattr(os, "close", lambda _descriptor: None)
+    monkeypatch.setattr(git_supervisor, "_drain", drained.append)
+
+    assert git_supervisor.main() == 0
+    assert drained == [child]
 
 
 def test_successful_git_drains_term_ignoring_descendants(
@@ -548,6 +571,24 @@ def test_target_parent_helpers_fail_closed(
             git_worktree_adapter._fsync_descriptor(descriptor, "Target")
     finally:
         os.close(descriptor)
+
+
+def test_descriptor_entry_uses_darwin_directory_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        fcntl,
+        "fcntl",
+        lambda *args: (
+            os.fsencode(tmp_path) + b"\0" * (1024 - len(os.fsencode(tmp_path)))
+        ),
+    )
+
+    assert git_worktree_adapter._descriptor_entry(10, "target") == str(
+        tmp_path / "target"
+    )
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:
