@@ -45,6 +45,7 @@ GIT_EFFECT_TIMEOUT_SECONDS = 3600
 GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
 CONFIGURATION_LIMIT = 1024 * 1024
 UNPROVEN_GROUP_TERMINATION = 256
+_DARWIN_O_EXEC = 0x40000000
 
 
 @dataclass(frozen=True)
@@ -201,25 +202,24 @@ def read_configuration(
 def _open_configuration_file(path: Path) -> int:
     if not path.is_absolute():
         raise GitError("Configuration is unavailable")
-    directory_flags = (
-        getattr(os, "O_PATH", getattr(os, "O_EVTONLY", os.O_RDONLY))
-        | os.O_CLOEXEC
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-    )
-    descriptor = os.open(path.anchor, directory_flags)
+    directory_flags = _configuration_directory_flags()
+    descriptors = [os.open(path.anchor, directory_flags)]
     try:
         for part in path.parts[1:-1]:
+            if part == "..":
+                if len(descriptors) > 1:
+                    child = descriptors.pop()
+                    os.close(child)
+                continue
             try:
-                child = os.open(part, directory_flags, dir_fd=descriptor)
+                child = os.open(part, directory_flags, dir_fd=descriptors[-1])
             except OSError as error:
                 raise GitError(f"Configuration is unavailable: {path}") from error
-            os.close(descriptor)
-            descriptor = child
+            descriptors.append(child)
         result = os.open(
             path.name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=descriptor,
+            dir_fd=descriptors[-1],
         )
         try:
             regular = stat.S_ISREG(os.fstat(result).st_mode)
@@ -231,7 +231,18 @@ def _open_configuration_file(path: Path) -> int:
             raise GitError("Configuration must be a regular non-symlink file")
         return result
     finally:
-        os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _configuration_directory_flags() -> int:
+    # Python does not expose Darwin O_SEARCH; XNU defines it as O_EXEC | O_DIRECTORY.
+    access = (
+        _DARWIN_O_EXEC
+        if sys.platform == "darwin"
+        else getattr(os, "O_PATH", os.O_RDONLY)
+    )
+    return access | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def materialize_cache(

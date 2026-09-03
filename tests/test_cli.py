@@ -2576,7 +2576,17 @@ def test_read_only_list_proceeds_during_a_registry_write_transaction(
 
 @pytest.mark.parametrize(
     ("unsafe", "mode"),
-    (("state", 0o777), ("state", 0o755), ("database", 0o666), ("database", 0o644)),
+    (
+        ("state", 0o777),
+        ("state", 0o755),
+        ("state", 0o500),
+        ("state", 0o1700),
+        ("database", 0o666),
+        ("database", 0o644),
+        ("database", 0o400),
+        ("database", 0o700),
+        ("database", 0o1600),
+    ),
 )
 def test_read_only_list_rejects_unsafe_permissions_without_repair(
     tmp_path: Path, unsafe: str, mode: int
@@ -2605,7 +2615,17 @@ def test_read_only_list_rejects_unsafe_permissions_without_repair(
 
 @pytest.mark.parametrize(
     ("unsafe", "mode"),
-    (("state", 0o777), ("state", 0o755), ("database", 0o666), ("database", 0o644)),
+    (
+        ("state", 0o777),
+        ("state", 0o755),
+        ("state", 0o500),
+        ("state", 0o1700),
+        ("database", 0o666),
+        ("database", 0o644),
+        ("database", 0o400),
+        ("database", 0o700),
+        ("database", 0o1600),
+    ),
 )
 def test_registry_write_rejects_preexisting_unsafe_permissions(
     tmp_path: Path, unsafe: str, mode: int
@@ -2719,35 +2739,21 @@ def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> 
     assert "Traceback" not in symlink_failure.stderr
 
 
-def test_registry_write_rejects_writable_state_directory_acl(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("entry", ["state", "database"])
+def test_registry_write_rejects_unsafe_private_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
 ) -> None:
     monkeypatch.setattr(
         registry_adapter,
-        "_darwin_acl_allows_write",
-        lambda descriptor: stat.S_ISDIR(os.fstat(descriptor).st_mode),
+        "_darwin_acl_allows_private_access",
+        lambda descriptor: (
+            stat.S_ISDIR(os.fstat(descriptor).st_mode) == (entry == "state")
+        ),
         raising=False,
     )
 
     with (
-        pytest.raises(RegistryError, match="Registry state directory unavailable"),
-        Registry(tmp_path / "state" / "registry.sqlite3")._connection(),
-    ):
-        pass
-
-
-def test_registry_write_rejects_writable_database_acl(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        registry_adapter,
-        "_darwin_acl_allows_write",
-        lambda descriptor: stat.S_ISREG(os.fstat(descriptor).st_mode),
-        raising=False,
-    )
-
-    with (
-        pytest.raises(RegistryError, match="Registry database unavailable"),
+        pytest.raises(RegistryError, match=rf"Registry {entry}.*unavailable"),
         Registry(tmp_path / "state" / "registry.sqlite3")._connection(),
     ):
         pass

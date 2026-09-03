@@ -8,6 +8,7 @@ _DARWIN_ACL_TYPE_EXTENDED = 0x100
 _DARWIN_ACL_EXTENDED_ALLOW = 1
 _DARWIN_ACL_FIRST_ENTRY = 0
 _DARWIN_ACL_NEXT_ENTRY = -1
+_DARWIN_ACL_READ_OR_SEARCH = 2 | 8
 _DARWIN_ACL_WRITE = 4 | 16 | 32 | 64 | 256 | 1024 | 4096 | 8192
 
 
@@ -15,7 +16,17 @@ def descriptor_has_writable_acl(descriptor: int) -> bool:
     return sys.platform == "darwin" and darwin_acl_allows_write(descriptor)
 
 
+def descriptor_has_private_acl(descriptor: int) -> bool:
+    return sys.platform == "darwin" and _darwin_acl_allows(
+        descriptor, _DARWIN_ACL_READ_OR_SEARCH | _DARWIN_ACL_WRITE
+    )
+
+
 def darwin_acl_allows_write(descriptor: int) -> bool:
+    return _darwin_acl_allows(descriptor, _DARWIN_ACL_WRITE)
+
+
+def _darwin_acl_allows(descriptor: int, permissions_mask: int) -> bool:
     try:
         library = ctypes.CDLL(None, use_errno=True)
         get_acl = library.acl_get_fd_np
@@ -55,7 +66,7 @@ def darwin_acl_allows_write(descriptor: int) -> bool:
             if tag.value == _DARWIN_ACL_EXTENDED_ALLOW:
                 if get_permissions(entry, ctypes.byref(permissions)) != 0:
                     raise OSError(errno.EIO, "Cannot inspect descriptor ACL")
-                if permissions.value & _DARWIN_ACL_WRITE:
+                if permissions.value & permissions_mask:
                     return True
             ctypes.set_errno(0)
             status = get_entry(acl, _DARWIN_ACL_NEXT_ENTRY, ctypes.byref(entry))

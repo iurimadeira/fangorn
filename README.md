@@ -127,9 +127,10 @@ State is stored in `$XDG_STATE_HOME/fangorn/registry.sqlite3`, or in
 Every path component must be a real directory owned by root or the current
 user; writable ancestors are accepted only when sticky. The final `fangorn`
 directory and `registry.sqlite3` must be owned by the current user, private
-(`0700` and `0600`), and free of writable macOS ACLs. Read commands refuse
-unsafe existing state without changing its permissions. Repair a custom state
-location before retrying; Fangorn creates missing components privately.
+(`0700` and `0600`), and free of macOS ACLs granting read, search, or write
+access. Read commands refuse unsafe existing state without changing its
+permissions. Repair a custom state location before retrying; Fangorn creates
+missing components privately.
 
 ## Develop
 

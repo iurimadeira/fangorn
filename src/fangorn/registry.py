@@ -14,6 +14,9 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fangorn._permissions import (
+    descriptor_has_private_acl as _darwin_acl_allows_private_access,
+)
+from fangorn._permissions import (
     descriptor_has_writable_acl as _darwin_acl_allows_write,
 )
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
@@ -2282,10 +2285,9 @@ def _open_registry_state_directory(path: Path, *, create: bool) -> int | None:
             current /= part
             try:
                 if position == len(parts) - 1:
-                    _require_private_registry_directory(child, current)
                     if created:
                         os.fchmod(child, 0o700)
-                        _require_private_registry_directory(child, current)
+                    _require_private_registry_directory(child, current)
                 else:
                     _require_registry_ancestor(child, current)
             except BaseException:
@@ -2324,8 +2326,8 @@ def _require_private_registry_directory(descriptor: int, path: Path) -> None:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
-        or _darwin_acl_allows_write(descriptor)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or _darwin_acl_allows_private_access(descriptor)
     ):
         raise RegistryError(f"Registry state directory unavailable: {path}")
 
@@ -2364,10 +2366,9 @@ def _open_registry_database(
                 )
             except FileNotFoundError:
                 return None
-        _require_private_registry_database(descriptor, path)
         if created:
             os.fchmod(descriptor, 0o600)
-            _require_private_registry_database(descriptor, path)
+        _require_private_registry_database(descriptor, path)
         result = descriptor
         descriptor = None
         return result
@@ -2388,8 +2389,8 @@ def _require_private_registry_database(descriptor: int, path: Path) -> None:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
-        or _darwin_acl_allows_write(descriptor)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or _darwin_acl_allows_private_access(descriptor)
     ):
         raise RegistryError(f"Registry database unavailable: {path}")
 

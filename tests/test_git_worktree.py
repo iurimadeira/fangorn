@@ -26,6 +26,7 @@ from git_helpers import git, initialize_repository
 import fangorn._git_anchor as git_anchor
 import fangorn._git_guardian as git_guardian
 import fangorn._git_supervisor as git_supervisor
+import fangorn._permissions as permissions_adapter
 import fangorn.git as git_adapter
 import fangorn.git_worktree as git_worktree_adapter
 import fangorn.workspaces as workspaces_adapter
@@ -263,18 +264,42 @@ def test_explicit_configuration_normalizes_ancestor_symlink_errors(
         read_configuration(source, commit, explicit)
 
 
-def test_explicit_configuration_supports_parent_segments(tmp_path: Path) -> None:
+def test_explicit_configuration_parent_segments_stay_bound_to_opened_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
-    directory = tmp_path / "directory"
-    directory.mkdir()
+    controlled = tmp_path / "controlled"
+    controlled.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
     explicit = tmp_path / "fangorn.toml"
-    explicit.write_bytes(b"schema_version = 1\n")
+    explicit.write_bytes(b"schema_version = 1\n# trusted\n")
+    (redirected / explicit.name).write_bytes(b"schema_version = 1\n# secret\n")
+    real_open = os.open
+    moved = False
+
+    def move_opened_ancestor(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal moved
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if not moved and path == controlled.name:
+            controlled.rename(redirected / controlled.name)
+            moved = True
+        return descriptor
+
+    monkeypatch.setattr(os, "open", move_opened_ancestor)
 
     assert (
-        read_configuration(source, commit, directory / ".." / explicit.name)
-        == b"schema_version = 1\n"
+        read_configuration(source, commit, controlled / ".." / explicit.name)
+        == b"schema_version = 1\n# trusted\n"
     )
+    assert moved
 
 
 def test_explicit_configuration_supports_search_only_ancestors(tmp_path: Path) -> None:
@@ -290,6 +315,16 @@ def test_explicit_configuration_supports_search_only_ancestors(tmp_path: Path) -
         assert read_configuration(source, commit, explicit) == b"schema_version = 1\n"
     finally:
         parent.chmod(stat.S_IRWXU)
+
+
+def test_configuration_directory_flags_use_darwin_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert git_worktree_adapter._configuration_directory_flags() == (
+        0x40000000 | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -2712,6 +2747,53 @@ def test_darwin_acl_uses_native_iteration_and_einval_termination(
         assert git_worktree_adapter._darwin_acl_allows_write(10) is expected
     assert calls == ([0] if expected else [0, -1, -1])
     assert freed == [123]
+
+
+@pytest.mark.parametrize("permissions", [2, 8])
+def test_darwin_private_acl_rejects_read_and_search(
+    monkeypatch: pytest.MonkeyPatch, permissions: int
+) -> None:
+    class Function:
+        argtypes: object = None
+        restype: object = None
+
+        def __init__(self, callback: Callable[..., int]) -> None:
+            self.callback = callback
+
+        def __call__(self, *arguments: Any) -> int:
+            return self.callback(*arguments)
+
+    def set_tag(_entry: object, target: Any) -> int:
+        ctypes.cast(target, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        return 0
+
+    def set_permissions(_entry: object, target: Any) -> int:
+        ctypes.cast(
+            target, ctypes.POINTER(ctypes.c_uint64)
+        ).contents.value = permissions
+        return 0
+
+    calls = 0
+
+    def get_entry(_acl: object, _which: int, _entry: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 0
+        ctypes.set_errno(errno.EINVAL)
+        return -1
+
+    class Library:
+        acl_get_fd_np = Function(lambda _fd, _kind: 123)
+        acl_get_entry = Function(get_entry)
+        acl_get_tag_type = Function(set_tag)
+        acl_get_permset_mask_np = Function(set_permissions)
+        acl_free = Function(lambda _acl: 0)
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: Library())
+
+    assert permissions_adapter.descriptor_has_private_acl(10)
 
 
 def test_cache_namespace_rejects_writable_acl(
