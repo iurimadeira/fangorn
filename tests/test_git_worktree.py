@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from git_helpers import git, initialize_repository
@@ -350,7 +350,7 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["supervisor", "10", "11", "12", "", "-1", "cancel", "git"],
+        ["supervisor", "10", "11", "12", "13", "", "-1", "cancel", "git"],
     )
     monkeypatch.setattr(os, "fstat", lambda _descriptor: object())
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
@@ -381,7 +381,7 @@ def test_supervisor_does_not_reap_before_group_cleanup(
             raise AssertionError("cleanup must not reap through poll")
 
     child = Child()
-    monkeypatch.setattr(git_supervisor, "_process_group_running", lambda _pid: False)
+    monkeypatch.setattr(git_supervisor, "_process_group_members", lambda _pid: set())
 
     git_supervisor._drain(child)  # type: ignore[arg-type]
 
@@ -402,6 +402,7 @@ def test_supervised_git_rejects_missing_child_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FailedSupervisor:
+        pid = 2**30
         returncode = 1
 
         @staticmethod
@@ -435,7 +436,7 @@ def test_supervisor_pid_accepts_canonical_positive_pid() -> None:
 def test_supervisor_pid_reader_completes_short_pipe_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    chunks = iter((b"12", b"3\n"))
+    chunks = iter((b"12", b"3\n", b""))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
 
     assert git_worktree_adapter._read_supervisor_pid(10) == 123
@@ -448,6 +449,76 @@ def test_supervisor_pid_reader_rejects_eof_before_newline(
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
 
     assert git_worktree_adapter._read_supervisor_pid(10) is None
+
+
+def test_supervisor_pid_reader_rejects_split_trailing_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = iter((b"123\n", b"extra", b""))
+    monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+
+    assert git_worktree_adapter._read_supervisor_pid(10) is None
+
+
+def test_supervisor_completion_reader_requires_one_complete_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = iter((b"-1", b"5\n", b""))
+    monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+    assert git_worktree_adapter._read_supervisor_completion(10) == -15
+
+    chunks = iter((b"0\n", b"extra", b""))
+    assert git_worktree_adapter._read_supervisor_completion(10) is None
+
+
+def test_portable_group_probe_ignores_zombie_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "123 77 Z\n124 77 S\n", ""
+        ),
+    )
+    monkeypatch.setattr(os, "getpid", lambda: 999)
+
+    assert git_supervisor._process_group_members(77) == {124}
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "123 77 Z\n", ""
+        ),
+    )
+    assert git_supervisor._process_group_members(77) == set()
+
+
+def test_supervised_git_rejects_ignored_sigchld_before_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invoked = False
+
+    def popen(*args: object, **kwargs: object) -> object:
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("supervisor must not start")
+
+    monkeypatch.setattr(signal, "getsignal", lambda _signal: signal.SIG_IGN)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    liveness, writer = os.pipe()
+    try:
+        with pytest.raises(GitError, match="SIGCHLD"):
+            git_worktree_adapter._run_git_process(
+                tmp_path, "show-ref", liveness_fd=liveness
+            )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+    assert invoked is False
 
 
 def test_successful_git_drains_term_ignoring_descendants(
@@ -533,6 +604,80 @@ finally:
     assert child.returncode == 0
     assert stdout.strip() == "interrupted"
     assert stopped.read_text(encoding="utf-8") == "stopped"
+
+
+def test_git_cleanup_owns_supervisor_before_pending_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    started = tmp_path / "started"
+    stopped = tmp_path / "stopped"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "trap 'printf stopped > \"$FANGORN_STOPPED\"; exit 0' TERM\n"
+        'printf started > "$FANGORN_STARTED"\n'
+        "while :; do sleep 0.05; done\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FANGORN_STARTED", str(started))
+    monkeypatch.setenv("FANGORN_STOPPED", str(stopped))
+    real_popen = subprocess.Popen
+
+    def interrupt_after_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        process = real_popen(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGINT)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", interrupt_after_spawn)
+    liveness, writer = os.pipe()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            git_worktree_adapter._run_git_process(
+                tmp_path, "fetch", liveness_fd=liveness
+            )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+    assert stopped.read_text(encoding="utf-8") == "stopped"
+
+
+def test_supervised_git_cleans_group_when_supervisor_dies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    process_group = tmp_path / "process-group"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'printf "%s" "$PPID" > "$FANGORN_GROUP"\n'
+        "(trap '' TERM; while :; do sleep 0.05; done) >/dev/null 2>&1 &\n"
+        "sleep 0.05\n"
+        'kill -KILL "$PPID"\n'
+        "while :; do sleep 0.05; done\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FANGORN_GROUP", str(process_group))
+    liveness, writer = os.pipe()
+    try:
+        with pytest.raises(GitError, match="failed before completion"):
+            git_worktree_adapter._run_git_process(
+                tmp_path, "fetch", liveness_fd=liveness
+            )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+    assert not git_worktree_adapter._process_group_running(
+        int(process_group.read_text(encoding="ascii"))
+    )
 
 
 def test_supervised_git_captures_output_without_reader_threads(

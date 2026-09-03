@@ -859,56 +859,95 @@ def _run_supervised_git(
     extra_fds: tuple[int, ...],
     working_directory_fd: int | None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        raise GitError("Cannot supervise Git while SIGCHLD is ignored")
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
+    completion_read, completion_write = os.pipe()
     supervisor = [
         sys.executable,
         "-I",
         str(Path(__file__).with_name("_git_supervisor.py")),
         str(control_read),
         str(status_write),
+        str(completion_write),
         str(liveness_fd),
         ",".join(str(descriptor) for descriptor in extra_fds),
         str(working_directory_fd if working_directory_fd is not None else -1),
         "finish" if finish_on_parent_exit else "cancel",
         *command,
     ]
+    process: subprocess.Popen[bytes] | None = None
+    settled = False
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             interrupt_command = b"f" if finish_on_parent_exit else b"c"
             with _ignore_repeated_sigint(control_write, interrupt_command):
-                process = subprocess.Popen(  # noqa: S603
-                    supervisor,
-                    stdout=stdout,
-                    stderr=stderr,
-                    env=environment,
-                    pass_fds=(control_read, status_write, liveness_fd, *extra_fds),
-                    start_new_session=True,
-                )
-                os.close(control_read)
-                control_read = -1
-                os.close(status_write)
-                status_write = -1
                 try:
+                    previous_mask = signal.pthread_sigmask(
+                        signal.SIG_BLOCK, {signal.SIGINT}
+                    )
+                    try:
+                        process = subprocess.Popen(  # noqa: S603
+                            supervisor,
+                            stdout=stdout,
+                            stderr=stderr,
+                            env=environment,
+                            pass_fds=(
+                                control_read,
+                                status_write,
+                                completion_write,
+                                liveness_fd,
+                                *extra_fds,
+                            ),
+                            start_new_session=True,
+                        )
+                        os.close(control_read)
+                        control_read = -1
+                        os.close(status_write)
+                        status_write = -1
+                        os.close(completion_write)
+                        completion_write = -1
+                    finally:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                     child_pid = _read_supervisor_pid(status_read)
                     if child_pid is None:
                         raise GitError("Git supervisor failed before child startup")
+                    returncode = _read_supervisor_completion(completion_read)
+                    if returncode is None:
+                        _cancel_process_group(process.pid)
+                        process.wait()
+                        settled = True
+                        raise GitError("Git supervisor failed before completion")
                     process.wait()
+                    settled = True
                 except BaseException:
+                    for descriptor in (control_read, status_write, completion_write):
+                        if descriptor >= 0:
+                            with suppress(OSError):
+                                os.close(descriptor)
                     with suppress(OSError):
-                        os.write(
-                            control_write,
-                            b"f" if finish_on_parent_exit else b"c",
-                        )
-                    process.wait()
+                        os.write(control_write, interrupt_command)
+                    if process is not None and not settled:
+                        completion = _read_supervisor_completion(completion_read)
+                        if completion is None:
+                            _cancel_process_group(process.pid)
+                        process.wait()
                     raise
             stdout.seek(0)
             stderr.seek(0)
             return subprocess.CompletedProcess(
-                command, process.returncode, stdout.read(), stderr.read()
+                command, returncode, stdout.read(), stderr.read()
             )
     finally:
-        for descriptor in (control_read, control_write, status_read, status_write):
+        for descriptor in (
+            control_read,
+            control_write,
+            status_read,
+            status_write,
+            completion_read,
+            completion_write,
+        ):
             if descriptor >= 0:
                 with suppress(OSError):
                     os.close(descriptor)
@@ -955,13 +994,25 @@ def _supervisor_pid(value: bytes) -> int | None:
 
 
 def _read_supervisor_pid(descriptor: int) -> int | None:
+    return _supervisor_pid(_read_pipe_frame(descriptor, 11))
+
+
+def _read_supervisor_completion(descriptor: int) -> int | None:
+    value = _read_pipe_frame(descriptor, 5)
+    if not re.fullmatch(rb"-?[0-9]{1,3}\n", value):
+        return None
+    returncode = int(value[:-1])
+    return returncode if -255 <= returncode <= 255 else None
+
+
+def _read_pipe_frame(descriptor: int, limit: int) -> bytes:
     value = bytearray()
-    while len(value) < 12 and b"\n" not in value:
-        chunk = os.read(descriptor, 12 - len(value))
+    while len(value) <= limit:
+        chunk = os.read(descriptor, limit + 1 - len(value))
         if not chunk:
             break
         value.extend(chunk)
-    return _supervisor_pid(bytes(value))
+    return bytes(value)
 
 
 def _cancel_process_group(process_group: int) -> None:
@@ -974,8 +1025,7 @@ def _cancel_process_group(process_group: int) -> None:
         time.sleep(0.01)
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGKILL)
-    deadline = time.monotonic() + 0.25
-    while time.monotonic() < deadline and _process_group_running(process_group):
+    while _process_group_running(process_group):
         time.sleep(0.01)
 
 
@@ -1000,11 +1050,21 @@ def _process_group_running(process_group: int) -> bool:
                 continue
         if parsed:
             return False
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    return True
+    result = subprocess.run(
+        ["/bin/ps", "-axo", "pgid=,state="],
+        check=True,
+        capture_output=True,
+        env={"LANG": "C", "PATH": "/usr/bin:/bin"},
+        start_new_session=True,
+        text=True,
+    )
+    return any(
+        len(fields := line.split()) == 2
+        and fields[0].isdigit()
+        and int(fields[0]) == process_group
+        and not fields[1].startswith("Z")
+        for line in result.stdout.splitlines()
+    )
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:
