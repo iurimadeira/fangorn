@@ -364,6 +364,28 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     assert drained == [child]
 
 
+def test_supervised_git_rejects_missing_child_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailedSupervisor:
+        returncode = 1
+
+        @staticmethod
+        def wait() -> int:
+            return 1
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FailedSupervisor())
+    liveness, writer = os.pipe()
+    try:
+        with pytest.raises(GitError, match="failed before child startup"):
+            git_worktree_adapter._run_git_process(
+                tmp_path, "show-ref", liveness_fd=liveness
+            )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+
 def test_successful_git_drains_term_ignoring_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

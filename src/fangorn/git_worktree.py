@@ -895,7 +895,9 @@ def _run_supervised_git(
                         int(child_pid_value) if child_pid_value.isdigit() else None
                     )
                     process.wait()
-                    if child_pid is not None and _process_group_running(child_pid):
+                    if child_pid is None:
+                        raise GitError("Git supervisor failed before child startup")
+                    if _process_group_running(child_pid):
                         _cancel_process_group(child_pid)
                 except BaseException:
                     with suppress(OSError):
