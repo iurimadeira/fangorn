@@ -613,6 +613,45 @@ def test_clone_retry_reconciles_uncommitted_cache_effect_while_origin_is_offline
     assert recovered.workspace.state == "ready"
 
 
+def test_clone_retry_reconciles_cache_published_before_registry_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=repository.as_uri(),
+        branch="published-cache",
+        path=tmp_path / "worktrees" / "published-cache",
+        request_id="published-cache",
+    )
+    real_replace = os.replace
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def interrupt_after_cache_publication(
+        source: str | Path, target: str | Path, **kwargs: int
+    ) -> None:
+        real_replace(source, target, **kwargs)
+        source_path = Path(source)
+        target_path = Path(target)
+        if (
+            not kwargs
+            and source_path.name == "repository.git"
+            and target_path.name.endswith(".git")
+        ):
+            raise SimulatedInterruption("after cache publication")
+
+    monkeypatch.setattr(os, "replace", interrupt_after_cache_publication)
+    with pytest.raises(SimulatedInterruption):
+        workspaces.create(request)
+    repository.rename(tmp_path / "origin-offline")
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    assert workspaces.create(request).workspace.state == "ready"
+
+
 def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
@@ -1750,6 +1789,9 @@ def test_create_rejects_unsupported_definition_before_state(
         ("schema_version = 2\n", "schema_version = 1"),
         ("schema_version = true\n", "schema_version = 1"),
         ("schema_version = 1.0\n", "schema_version = 1"),
+        ("schema_version = 1\nservices = []\n", "services must be a table"),
+        ("schema_version = 1\nservices = false\n", "services must be a table"),
+        ("schema_version = 1\nservices = ''\n", "services must be a table"),
         (
             "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
             "Service Resources are not available",

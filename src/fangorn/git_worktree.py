@@ -220,13 +220,26 @@ def materialize_cache(
         )
         if repository_generation(clone, create=True) is None:
             raise GitError("Repository cache generation marker is unavailable")
+        if preparation_id is not None:
+            _write_preparation_receipt(clone, preparation_id, refresh_default_head)
         try:
             os.replace(clone, cache_path)
-        except FileExistsError:
+        except FileExistsError as collision:
             _verify_bare_repository(cache_path, source.normalized)
+            if repository_generation(cache_path, create=False) is None:
+                raise GitError(
+                    "Repository cache generation marker is missing"
+                ) from collision
+            _refresh_bare_repository(
+                cache_path,
+                update_default=refresh_default_head,
+                liveness_fd=liveness_fd,
+            )
+            if preparation_id is not None:
+                _write_preparation_receipt(
+                    cache_path, preparation_id, refresh_default_head
+                )
         _fsync_directory(cache_path.parent, "Repository cache publication")
-        if preparation_id is not None:
-            _write_preparation_receipt(cache_path, preparation_id, refresh_default_head)
         return cache_path
     finally:
         if invocation.parent == cache_path.parent and invocation.name.startswith(
@@ -460,6 +473,7 @@ def create_worktree(
         str(staging),
         str(target),
         liveness_fd=liveness_fd,
+        finish_on_parent_exit=True,
     )
     if moved.returncode != 0:
         raise GitError(_git_error(moved))
@@ -623,17 +637,14 @@ def _run_git_process(
     *arguments: str,
     use_c: bool = False,
     liveness_fd: int | None = None,
+    finish_on_parent_exit: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     command = ["git"]
     if use_c:
         command.extend(("-C", str(path)))
     else:
-        location = (
-            ("--git-dir", str(path))
-            if path.is_dir() and path.name.endswith(".git")
-            else ("-C", str(path))
-        )
-        command.extend(location)
+        command.extend(("-C", str(path)))
+    command.extend(("-c", "core.hooksPath=/dev/null"))
     command.extend(arguments)
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
@@ -648,9 +659,10 @@ def _run_git_process(
         control_read, control_write = os.pipe()
         supervised = [
             sys.executable,
-            "-m",
-            "fangorn._git_supervisor",
+            "-I",
+            str(Path(__file__).with_name("_git_supervisor.py")),
             str(control_read),
+            "finish" if finish_on_parent_exit else "cancel",
             *command,
         ]
         inherited = (control_read, liveness_fd)

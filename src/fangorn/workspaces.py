@@ -769,7 +769,10 @@ def _configuration_value(content: bytes) -> dict[str, object]:
     value = tomllib.loads(content.decode("utf-8"))
     if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         raise WorkspaceError("fangorn.toml requires schema_version = 1")
-    if value.get("services"):
+    services = value.get("services")
+    if services is not None and not isinstance(services, dict):
+        raise WorkspaceError("fangorn.toml services must be a table")
+    if services:
         raise WorkspaceError("Service Resources are not available in this release")
     try:
         json.dumps(value, sort_keys=True, allow_nan=False)

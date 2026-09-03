@@ -63,6 +63,13 @@ def test_repository_source_preserves_ipv6_authority(
     assert normalize_repository_source(source).normalized == normalized
 
 
+def test_local_non_bare_repository_may_end_in_dot_git(tmp_path: Path) -> None:
+    source = tmp_path / "project.git"
+    repository(source)
+
+    assert normalize_repository_source(str(source)).path == source.resolve()
+
+
 @pytest.mark.parametrize(
     ("source", "message"),
     [
@@ -194,8 +201,12 @@ def test_interrupted_refresh_is_replayed_without_completion_receipt(
     assert fetches == 2
 
 
+@pytest.mark.parametrize(
+    ("finish_on_parent_exit", "expected"),
+    [(False, "terminated"), (True, "completed")],
+)
 def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
-    tmp_path: Path,
+    tmp_path: Path, finish_on_parent_exit: bool, expected: str
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -204,8 +215,10 @@ def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
     fake_git = fake_bin / "git"
     fake_git.write_text(
         "#!/bin/sh\n"
-        "trap 'sleep 0.5; printf stopped > \"$FANGORN_STOPPED\"; exit 0' TERM\n"
+        "trap 'sleep 0.5; printf terminated > \"$FANGORN_STOPPED\"; exit 0' TERM\n"
         'printf started > "$FANGORN_STARTED"\n'
+        'if [ "$FANGORN_FINISH" = 1 ]; then sleep 0.5; '
+        'printf completed > "$FANGORN_STOPPED"; exit 0; fi\n'
         "while :; do sleep 0.05; done\n",
         encoding="utf-8",
     )
@@ -213,6 +226,7 @@ def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
     database = tmp_path / "state" / "registry.sqlite3"
     script = """
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -229,7 +243,9 @@ epoch = registry.acquire_lease(scope_kind="repository", scope_key="source",
     operation_id=intent.operation_id, owner=owner, owner_status=w._owner_status)
 print(json.dumps(asdict(owner)), flush=True)
 try:
-    _run_git_process(Path.cwd(), "fetch", liveness_fd=w._invocation_descriptor(owner))
+    os.chdir(sys.argv[3])
+    _run_git_process(Path.cwd(), "fetch", liveness_fd=w._invocation_descriptor(owner),
+        finish_on_parent_exit=sys.argv[2] == "finish")
 finally:
     registry.release_lease(scope_kind="repository", scope_key="source",
         operation_id=intent.operation_id, lease_epoch=epoch)
@@ -239,8 +255,25 @@ finally:
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
     environment["FANGORN_STARTED"] = str(started)
     environment["FANGORN_STOPPED"] = str(stopped)
+    environment["FANGORN_FINISH"] = "1" if finish_on_parent_exit else "0"
+    hostile = tmp_path / "hostile"
+    hostile_package = hostile / "fangorn"
+    hostile_package.mkdir(parents=True)
+    hostile_marker = tmp_path / "hostile-imported"
+    (hostile_package / "__init__.py").write_text("", encoding="utf-8")
+    (hostile_package / "_git_supervisor.py").write_text(
+        f"from pathlib import Path\nPath({str(hostile_marker)!r}).write_text('bad')\n",
+        encoding="utf-8",
+    )
     child = subprocess.Popen(  # noqa: S603 -- fixed interpreter and test script
-        [sys.executable, "-c", script, str(database)],
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(database),
+            "finish" if finish_on_parent_exit else "cancel",
+            str(hostile),
+        ],
         stdout=subprocess.PIPE,
         text=True,
         env=environment,
@@ -265,7 +298,8 @@ finally:
         )
     child.wait(timeout=5)
 
-    assert stopped.read_text(encoding="utf-8") == "stopped"
+    assert stopped.read_text(encoding="utf-8") == expected
+    assert not hostile_marker.exists()
     assert checker._owner_status(owner) == "dead"
 
 
@@ -432,6 +466,27 @@ def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -
             expected_branch="topic",
             ownership_token=token,
         )
+
+
+def test_worktree_creation_disables_repository_hooks(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    invoked = tmp_path / "hook-invoked"
+    hook = source / ".git" / "hooks" / "post-checkout"
+    hook.parent.mkdir()
+    hook.write_text(f"#!/bin/sh\nprintf invoked > {invoked}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    create_worktree(
+        source,
+        target=tmp_path / "target",
+        branch="topic",
+        commit=commit,
+        ownership_token="d" * 64,
+        reconcile=False,
+    )
+
+    assert not invoked.exists()
 
 
 def test_worktree_adapter_rejects_markerless_matching_staging(tmp_path: Path) -> None:
