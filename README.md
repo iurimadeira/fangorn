@@ -24,9 +24,9 @@ selected in a later release. Configured services and third-party adapters will
 require their own tools. Repository-configured executable checkout filters and
 filesystem monitors and local configuration includes are rejected; Git hooks
 are disabled during creation. Local Git administrative directories and config
-files must be owned by the current account and not writable by another account;
-a user-private primary group is accepted. Click is Fangorn's only third-party
-runtime dependency.
+files must be owned by the current account or root, have no group/other write
+bits, and have no macOS extended ACL that allows writes. Click is Fangorn's only
+third-party runtime dependency.
 
 ## Install
 
@@ -53,11 +53,13 @@ fangorn workspace create --repo https://example.com/acme/repository.git \
 ```
 
 Create starts by default and succeeds as `ready` only after the Worktree
-Resource is observed at its immutable commit, branch, and ownership token.
-`--no-start` provisions the Worktree and returns `stopped`. Use `--base REF` to
-resolve another commit once, `--request-id KEY` for caller idempotency, and
-`--config PATH` to snapshot an explicit `fangorn.toml`. Configuration is capped
-at 1 MiB whether read from that path or from the resolved commit.
+Resource is observed at its resolved `created_from_sha`, requested branch, and
+immutable ownership token. Branch and HEAD can change after creation as normal
+operational Git facts. `--no-start` provisions the Worktree and returns
+`stopped`. Use `--base REF` to resolve another commit once, `--request-id KEY`
+for caller idempotency, and `--config PATH` to snapshot an explicit
+`fangorn.toml`. Configuration is capped at 1 MiB whether read from that path or
+from the resolved commit.
 
 Equivalent retries return the same Workspace ID, resolved `created_from_sha`,
 target path, and completed operation. Reusing a request ID or target path with

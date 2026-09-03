@@ -18,6 +18,7 @@ def test_readme_documents_public_facade_without_legacy_adopt_flow() -> None:
         "Create starts by default",
         "`--no-start` provisions",
         "Equivalent retries return the same Workspace ID",
+        "Branch and HEAD can change after creation",
         "recoverable fenced leases",
     ):
         assert marker in readme
