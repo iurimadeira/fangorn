@@ -386,6 +386,18 @@ def test_supervised_git_rejects_missing_child_handshake(
         os.close(writer)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [b"", b"0\n", b" 1\n", b"1", b"1\nextra", b"2147483648\n"],
+)
+def test_supervisor_pid_rejects_noncanonical_frames(value: bytes) -> None:
+    assert git_worktree_adapter._supervisor_pid(value) is None
+
+
+def test_supervisor_pid_accepts_canonical_positive_pid() -> None:
+    assert git_worktree_adapter._supervisor_pid(b"123\n") == 123
+
+
 def test_successful_git_drains_term_ignoring_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

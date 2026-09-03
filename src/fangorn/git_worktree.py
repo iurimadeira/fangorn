@@ -890,10 +890,7 @@ def _run_supervised_git(
                 os.close(status_write)
                 status_write = -1
                 try:
-                    child_pid_value = os.read(status_read, 32).strip()
-                    child_pid = (
-                        int(child_pid_value) if child_pid_value.isdigit() else None
-                    )
+                    child_pid = _supervisor_pid(os.read(status_read, 32))
                     process.wait()
                     if child_pid is None:
                         raise GitError("Git supervisor failed before child startup")
@@ -950,6 +947,13 @@ def _ignore_repeated_sigint(
     finally:
         if installed:
             signal.signal(signal.SIGINT, previous)
+
+
+def _supervisor_pid(value: bytes) -> int | None:
+    if not re.fullmatch(rb"[1-9][0-9]{0,9}\n", value):
+        return None
+    pid = int(value[:-1])
+    return pid if pid <= 2_147_483_647 else None
 
 
 def _cancel_process_group(process_group: int) -> None:
