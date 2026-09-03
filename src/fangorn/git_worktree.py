@@ -176,14 +176,16 @@ def create_worktree(
 def inspect_owned_worktree(
     target: Path,
     *,
-    expected_commit: str,
-    expected_branch: str,
+    expected_commit: str | None,
+    expected_branch: str | None,
     ownership_token: str | None = None,
 ) -> WorktreeObservation:
     if not target.exists():
         raise GitError(f"Worktree Resource is absent: {target}")
     observation = observe_worktree(target)
-    if observation.head != expected_commit or observation.branch != expected_branch:
+    if expected_commit is not None and observation.head != expected_commit:
+        raise GitError("Worktree Resource does not match its immutable definition")
+    if expected_branch is not None and observation.branch != expected_branch:
         raise GitError("Worktree Resource does not match its immutable definition")
     if (
         ownership_token is not None

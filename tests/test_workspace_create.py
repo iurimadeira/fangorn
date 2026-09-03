@@ -5,7 +5,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from git_helpers import git, initialize_repository
@@ -62,7 +64,7 @@ def test_create_root_headless_local_workspace(
         (resource.name, resource.kind, resource.adapter_id)
         for resource in result.workspace.definition.resources
     ] == [("worktree", "worktree", "fangorn.git-worktree")]
-    assert result.workspace.definition.resources[0].provisioning_status == "created"
+    assert result.workspace.resource_states[0].provisioning_status == "created"
     assert result.operation.status == "completed"
     assert git(target, "rev-parse", "HEAD") == created_from_sha
 
@@ -83,6 +85,9 @@ def test_equivalent_retry_reuses_resolved_values_and_completed_operation(
     )
 
     first = workspaces.create(request)
+    (target / "work.txt").write_text("work\n", encoding="utf-8")
+    git(target, "add", "work.txt")
+    git(target, "commit", "-m", "workspace work")
     (repository / "later.txt").write_text("later\n", encoding="utf-8")
     git(repository, "add", "later.txt")
     git(repository, "commit", "-m", "later")
@@ -245,6 +250,70 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     )
 
 
+def test_proven_dead_workspace_lease_takeover_fences_stale_result(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    intent, _ = registry.begin_create_intent(
+        request_key="workspace-request",
+        request_id="workspace-lease-test",
+        request_json=json.dumps({"request": "workspace-lease-test"}),
+        target_path=str(tmp_path / "workspace-target"),
+        workspace_id="workspace-2",
+        operation_id="operation-2",
+        prepare_cache=False,
+    )
+    registry.enrich_create_intent(
+        intent.operation_id,
+        resolved={"created_from_sha": "a" * 40},
+        steps=(("create", "worktree"),),
+    )
+    old_owner = ProcessIdentity("old", "boot", 1001, "start-old")
+    old_epoch = registry.acquire_lease(
+        scope_kind="workspace",
+        scope_key=intent.workspace_id,
+        operation_id=intent.operation_id,
+        owner=old_owner,
+        owner_status=lambda _owner: "live",
+    )
+    registry.start_operation_step(
+        intent.operation_id,
+        position=0,
+        scope_kind="workspace",
+        scope_key=intent.workspace_id,
+        lease_epoch=old_epoch,
+    )
+
+    new_epoch = registry.acquire_lease(
+        scope_kind="workspace",
+        scope_key=intent.workspace_id,
+        operation_id=intent.operation_id,
+        owner=ProcessIdentity("new", "boot", 1002, "start-new"),
+        owner_status=lambda owner: "dead" if owner == old_owner else "live",
+    )
+
+    assert new_epoch == old_epoch + 1
+    with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.finish_operation_step(
+            intent.operation_id,
+            position=0,
+            scope_kind="workspace",
+            scope_key=intent.workspace_id,
+            lease_epoch=old_epoch,
+            result={"observation": "ready"},
+        )
+    assert (
+        registry.start_operation_step(
+            intent.operation_id,
+            position=0,
+            scope_kind="workspace",
+            scope_key=intent.workspace_id,
+            lease_epoch=new_epoch,
+        )
+        == "unknown"
+    )
+
+
 def test_inconclusive_lease_owner_is_not_taken_over(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
@@ -320,6 +389,42 @@ def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     assert payload["workspace"]["definition"]["created_from_sha"] == created_from_sha
     assert payload["workspace"]["state"] == "ready"
     assert payload["operation"]["status"] == "completed"
+    resource = payload["workspace"]["definition"]["resources"][0]
+    assert "provisioning_status" not in resource
+    assert payload["workspace"]["resource_states"] == [
+        {"name": "worktree", "provisioning_status": "created"}
+    ]
+
+    stopped = subprocess.run(  # noqa: S603 -- test controls installed executable
+        [
+            executable,
+            "--json",
+            "workspace",
+            "create",
+            "--repo",
+            str(repository),
+            "--branch",
+            "cli-stopped",
+            "--path",
+            str(tmp_path / "worktrees" / "cli-stopped"),
+            "--headless",
+            "--no-start",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **dict(os.environ),
+            "XDG_STATE_HOME": str(state_home),
+            "XDG_DATA_HOME": str(data_home),
+            "XDG_CACHE_HOME": str(cache_home),
+        },
+    )
+    assert stopped.returncode == 0, stopped.stderr
+    stopped_payload = json.loads(stopped.stdout)
+    assert stopped_payload["workspace"]["state"] == "stopped"
+    assert stopped_payload["operation"]["status"] == "completed"
+    assert (tmp_path / "worktrees" / "cli-stopped").exists()
 
 
 def test_cli_workspace_create_human_retry_and_scope_error(tmp_path: Path) -> None:
@@ -395,7 +500,21 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
     with pytest.raises(WorkspaceError, match="simulated interruption"):
         workspaces.create(request)
 
-    recovered = workspaces.create(request)
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT status FROM workspace_create_intents WHERE request_id = ?",
+            (request.request_id,),
+        ).fetchone() == ("create_failed",)
+        assert connection.execute(
+            "SELECT status FROM operations WHERE id = ("
+            "SELECT operation_id FROM workspace_create_intents WHERE request_id = ?)",
+            (request.request_id,),
+        ).fetchone() == ("failed",)
+        assert connection.execute(
+            "SELECT active FROM mutation_leases WHERE scope_kind = 'workspace'"
+        ).fetchone() == (0,)
+
+    recovered = facade(tmp_path).create(request)
 
     assert recovered.created is False
     assert recovered.workspace.state == "ready"
@@ -403,6 +522,38 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         git(target, "rev-parse", "HEAD")
         == recovered.workspace.definition.created_from_sha
     )
+
+
+def test_same_facade_rejects_concurrent_create_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "worktrees" / "concurrent"
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="concurrent",
+        path=target,
+        request_id="concurrent-1",
+        headless=True,
+    )
+    effect_started = Event()
+    allow_effect = Event()
+
+    def block_effect(*args: object, **kwargs: object) -> object:
+        effect_started.set()
+        assert allow_effect.wait(timeout=5)
+        return real_create_worktree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", block_effect)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(workspaces.create, request)
+        assert effect_started.wait(timeout=5)
+        with pytest.raises(WorkspaceError, match="Workspace mutation is busy"):
+            workspaces.create(request)
+        allow_effect.set()
+        assert first.result(timeout=10).workspace.state == "ready"
 
 
 def test_default_configuration_is_snapshotted_from_resolved_commit(
@@ -502,6 +653,34 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
             "WHERE workspace_id = ?",
             (created.definition.id,),
         ).fetchone() == ("uncreated",)
+        with pytest.raises(sqlite3.IntegrityError, match="membership is immutable"):
+            connection.execute(
+                "INSERT INTO workspace_resources VALUES "
+                "(?, 1, 'extra', 'worktree', 'fangorn.git-worktree', 1, '{}', "
+                "NULL, ?, ?, 'created')",
+                (created.definition.id, str(tmp_path / "extra"), "f" * 64),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="create intent is immutable"):
+            connection.execute(
+                "UPDATE workspace_create_intents SET target_path = ? "
+                "WHERE workspace_id = ?",
+                (str(tmp_path / "retargeted"), created.definition.id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="create intent is immutable"):
+            connection.execute(
+                "UPDATE workspace_create_intents SET resolved_json = '{}' "
+                "WHERE workspace_id = ?",
+                (created.definition.id,),
+            )
+        connection.execute(
+            "INSERT INTO operations VALUES "
+            "('orphan-create', 'missing-workspace', 'create', 'running', NULL, ?, ?)",
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="requires one worktree"):
+            connection.execute(
+                "UPDATE operations SET status = 'completed' WHERE id = 'orphan-create'"
+            )
 
 
 @pytest.mark.parametrize(

@@ -301,6 +301,54 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 SELECT RAISE(ABORT, 'workspace resource membership is immutable');
             END
             """,
+            """
+            CREATE TRIGGER workspace_resource_membership_sealed
+            BEFORE INSERT ON workspace_resources
+            FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM workspaces
+                JOIN operations
+                    ON operations.id = workspaces.completed_operation_id
+                WHERE workspaces.id = NEW.workspace_id
+                    AND operations.status = 'completed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace resource membership is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_create_requires_one_worktree
+            BEFORE UPDATE OF status ON operations
+            FOR EACH ROW
+            WHEN NEW.kind = 'create' AND NEW.status = 'completed'
+                AND (
+                    SELECT COUNT(*) FROM workspace_resources
+                    WHERE workspace_id = NEW.workspace_id AND kind = 'worktree'
+                ) != 1
+            BEGIN
+                SELECT RAISE(ABORT, 'created workspace requires one worktree');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_create_intent_identity_immutable
+            BEFORE UPDATE OF operation_id, workspace_id, request_key, request_id,
+                request_json, target_path
+            ON workspace_create_intents
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace create intent is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_create_intent_resolution_immutable
+            BEFORE UPDATE OF resolved_json ON workspace_create_intents
+            FOR EACH ROW
+            WHEN OLD.resolved_json IS NOT NULL
+                AND NEW.resolved_json IS NOT OLD.resolved_json
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace create intent is immutable');
+            END
+            """,
         ),
     ),
 )
@@ -812,6 +860,19 @@ class Registry:
                                 scope_key,
                             ),
                         )
+                if scope_kind == "workspace":
+                    now = _timestamp()
+                    connection.execute(
+                        "UPDATE operations SET status = 'running', error = NULL, "
+                        "updated_at = ? WHERE id = ?",
+                        (now, operation_id),
+                    )
+                    connection.execute(
+                        "UPDATE workspace_create_intents "
+                        "SET status = 'creating', updated_at = ? "
+                        "WHERE operation_id = ?",
+                        (now, operation_id),
+                    )
                 connection.commit()
                 return epoch
             except (sqlite3.Error, RegistryError) as error:
@@ -934,6 +995,65 @@ class Registry:
                 if isinstance(error, RegistryError):
                     raise
                 raise _registry_error(error) from error
+
+    def fail_create_operation(
+        self,
+        *,
+        operation_id: str,
+        workspace_id: str,
+        lease_epoch: int,
+        error: str,
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind="workspace",
+                    scope_key=workspace_id,
+                    lease_epoch=lease_epoch,
+                )
+                now = _timestamp()
+                result_json = json.dumps(
+                    {"error": error, "outcome": "unknown"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                connection.execute(
+                    "UPDATE operation_steps SET status = 'unknown', result_json = ? "
+                    "WHERE operation_id = ? AND status = 'running'",
+                    (result_json, operation_id),
+                )
+                connection.execute(
+                    "UPDATE operations SET status = 'failed', error = ?, "
+                    "updated_at = ? "
+                    "WHERE id = ?",
+                    (error, now, operation_id),
+                )
+                connection.execute(
+                    "UPDATE workspace_create_intents "
+                    "SET status = 'create_failed', updated_at = ? "
+                    "WHERE operation_id = ?",
+                    (now, operation_id),
+                )
+                connection.execute(
+                    "UPDATE workspaces SET lifecycle_state = 'create_failed' "
+                    "WHERE id = ? AND origin = 'created'",
+                    (workspace_id,),
+                )
+                connection.execute(
+                    "UPDATE mutation_leases SET active = 0 "
+                    "WHERE scope_kind = 'workspace' AND scope_key = ?",
+                    (workspace_id,),
+                )
+                connection.commit()
+            except (sqlite3.Error, RegistryError) as failure:
+                connection.rollback()
+                if isinstance(failure, RegistryError):
+                    raise
+                raise _registry_error(failure) from failure
 
     def save_cache_entry(
         self,

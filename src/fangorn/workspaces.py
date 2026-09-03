@@ -7,6 +7,7 @@ import platform
 import secrets
 import subprocess
 import tomllib
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -93,6 +94,11 @@ class ResourceDefinition:
     external_reference: str | None
     locator: str
     ownership_token: str
+
+
+@dataclass(frozen=True)
+class ResourceState:
+    name: str
     provisioning_status: Literal["uncreated", "created"]
 
 
@@ -111,6 +117,7 @@ class WorkspaceDefinition:
 @dataclass(frozen=True)
 class WorkspaceAggregate:
     definition: WorkspaceDefinition
+    resource_states: tuple[ResourceState, ...]
     state: str
     version: int
     path: str
@@ -145,7 +152,7 @@ class Workspaces:
         self._registry = registry
         self._data_home = data_home or _xdg_home("XDG_DATA_HOME", ".local/share")
         self._cache_home = cache_home or _xdg_home("XDG_CACHE_HOME", ".cache")
-        self._process_identity = process_identity or _current_process_identity()
+        self._process_identity = process_identity
 
     @classmethod
     def from_environment(cls) -> Workspaces:
@@ -186,6 +193,8 @@ class Workspaces:
             raise WorkspaceError(str(error)) from error
 
     def create(self, request: CreateWorkspace) -> CreateWorkspaceResult:
+        intent: CreateIntentRecord | None = None
+        lease_epoch: int | None = None
         try:
             if not request.headless:
                 raise WorkspaceError(
@@ -195,6 +204,7 @@ class Workspaces:
                 raise WorkspaceError("A root Workspace requires a repository source")
             _validate_branch(request.branch)
             source = normalize_repository_source(request.repository)
+            owner = self._invocation_process_identity()
             target = _target_path(request, source, self._data_home)
             request_value = {
                 "base": request.base,
@@ -225,13 +235,13 @@ class Workspaces:
                 resource = aggregate.definition.resources[0]
                 inspect_owned_worktree(
                     Path(aggregate.path),
-                    expected_commit=aggregate.definition.created_from_sha,
-                    expected_branch=aggregate.branch,
+                    expected_commit=None,
+                    expected_branch=None,
                     ownership_token=resource.ownership_token,
                 )
                 return CreateWorkspaceResult(aggregate, operation, created=False)
 
-            repository = self._prepare_repository(source, intent)
+            repository = self._prepare_repository(source, intent, owner)
             if intent.resolved_json is None:
                 commit = resolve_commit(repository, request.base)
                 configuration = read_configuration(repository, commit, request.config)
@@ -265,7 +275,7 @@ class Workspaces:
                 scope_kind="workspace",
                 scope_key=intent.workspace_id,
                 operation_id=intent.operation_id,
-                owner=self._process_identity,
+                owner=owner,
                 owner_status=_owner_status,
             )
             lifecycle = plan_create(
@@ -338,6 +348,7 @@ class Workspaces:
                 state=state,
                 lease_epoch=lease_epoch,
             )
+            lease_epoch = None
             aggregate, operation = self._load_completed(intent.workspace_id)
             return CreateWorkspaceResult(aggregate, operation, created=created)
         except (
@@ -346,7 +357,18 @@ class Workspaces:
             OSError,
             ValueError,
             tomllib.TOMLDecodeError,
+            WorkspaceError,
         ) as error:
+            if intent is not None and lease_epoch is not None:
+                with suppress(RegistryError):
+                    self._registry.fail_create_operation(
+                        operation_id=intent.operation_id,
+                        workspace_id=intent.workspace_id,
+                        lease_epoch=lease_epoch,
+                        error=str(error),
+                    )
+            if isinstance(error, WorkspaceError):
+                raise
             raise WorkspaceError(str(error)) from error
 
     def list(self) -> list[Workspace]:
@@ -363,7 +385,10 @@ class Workspaces:
             raise WorkspaceError(str(error)) from error
 
     def _prepare_repository(
-        self, source: RepositorySource, intent: CreateIntentRecord
+        self,
+        source: RepositorySource,
+        intent: CreateIntentRecord,
+        owner: ProcessIdentity,
     ) -> Path:
         if source.clone_url is None:
             if source.path is None:
@@ -376,7 +401,7 @@ class Workspaces:
             scope_kind="repository",
             scope_key=source.normalized,
             operation_id=operation_id,
-            owner=self._process_identity,
+            owner=owner,
             owner_status=_owner_status,
         )
         try:
@@ -435,7 +460,6 @@ class Workspaces:
                 ),
                 locator=str(resource["locator"]),
                 ownership_token=str(resource["ownership_token"]),
-                provisioning_status=str(resource["provisioning_status"]),  # type: ignore[arg-type]
             )
             for resource in resource_rows
         )
@@ -450,6 +474,13 @@ class Workspaces:
                 configuration_digest=str(row["configuration_digest"]),
                 resources=resources,
             ),
+            resource_states=tuple(
+                ResourceState(
+                    name=str(resource["name"]),
+                    provisioning_status=str(resource["provisioning_status"]),  # type: ignore[arg-type]
+                )
+                for resource in resource_rows
+            ),
             state=str(row["lifecycle_state"]),
             version=int(row["aggregate_version"]),
             path=str(row["path"]),
@@ -459,6 +490,15 @@ class Workspaces:
             id=str(operation_row["id"]),
             kind=str(operation_row["kind"]),
             status=str(operation_row["status"]),
+        )
+
+    def _invocation_process_identity(self) -> ProcessIdentity:
+        identity = self._process_identity or _current_process_identity()
+        return ProcessIdentity(
+            process_instance_id=str(uuid4()),
+            boot_identity=identity.boot_identity,
+            pid=identity.pid,
+            process_start_identity=identity.process_start_identity,
         )
 
 

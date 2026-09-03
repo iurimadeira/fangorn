@@ -251,11 +251,17 @@ def _aggregate_schema(workspace: WorkspaceAggregate) -> dict[str, object]:
                     "external_reference": resource.external_reference,
                     "locator": resource.locator,
                     "ownership_token": resource.ownership_token,
-                    "provisioning_status": resource.provisioning_status,
                 }
                 for resource in definition.resources
             ],
         },
+        "resource_states": [
+            {
+                "name": resource.name,
+                "provisioning_status": resource.provisioning_status,
+            }
+            for resource in workspace.resource_states
+        ],
         "state": workspace.state,
         "version": workspace.version,
         "path": workspace.path,
