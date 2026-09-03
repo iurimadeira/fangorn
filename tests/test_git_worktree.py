@@ -27,6 +27,7 @@ from fangorn.git import (
     GitError,
     GitQuiescenceError,
     establish_worktree_generation,
+    observe_worktree,
     repository_generation,
 )
 from fangorn.git_worktree import (
@@ -1265,6 +1266,67 @@ def test_internal_git_helpers_do_not_inherit_coverage_instrumentation(
         not {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"} & value.keys()
         for value in environments
     )
+
+
+def test_worktree_observation_does_not_launch_effect_supervision_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    repository(source)
+    helpers: list[str] = []
+    real_popen = subprocess.Popen
+
+    def start(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        command = args[0]
+        if isinstance(command, list):
+            helpers.extend(
+                str(value)
+                for value in command
+                if str(value).endswith(
+                    ("_git_anchor.py", "_git_guardian.py", "_git_supervisor.py")
+                )
+            )
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", start)
+
+    assert observe_worktree(source).head is not None
+    assert helpers == []
+
+
+def test_read_only_git_query_has_a_process_group_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(git_worktree_adapter, "GIT_QUERY_TIMEOUT_SECONDS", 0.01)
+
+    result = git_worktree_adapter._run_git_query_process(tmp_path, "--version")
+
+    assert result.returncode == 124
+    assert result.stderr == b"Git query exceeded 30 seconds\n"
+
+
+def test_read_only_git_query_bounds_retained_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nprintf 1234567890\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(git_worktree_adapter, "GIT_CAPTURE_LIMIT", 4)
+
+    result = git_worktree_adapter._run_git_query_process(tmp_path, "--version")
+
+    assert result.returncode == 124
+    assert len(result.stdout) <= 4
+    assert result.stderr == b"Git diagnostic output exceeded 8 MiB\n"
 
 
 def test_parent_group_probe_rejects_malformed_ps(
