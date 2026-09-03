@@ -2538,12 +2538,13 @@ def test_worktree_receipt_is_atomically_published_and_directory_synced(
     target = tmp_path / "target"
     token = "1" * 64
     receipt = target.parent / f".fangorn-{token}.intent"
+    observe_worktree(source, create_repository_generation=True)
     original_write = os.write
     interrupted = False
 
     def interrupt_write(descriptor: int, value: bytes) -> int:
         nonlocal interrupted
-        if not interrupted:
+        if not interrupted and stat.S_ISREG(os.fstat(descriptor).st_mode):
             interrupted = True
             original_write(descriptor, value[:3])
             raise OSError("interrupted receipt write")
@@ -2591,8 +2592,7 @@ def test_worktree_recovery_never_claims_markerless_final_target(
     source = tmp_path / "source"
     commit = repository(source)
     unrelated = tmp_path / "unrelated"
-    git(tmp_path, "clone", str(source), str(unrelated))
-    git(unrelated, "checkout", "-b", "topic")
+    git(source, "worktree", "add", "-b", "topic", str(unrelated), commit)
 
     with pytest.raises(GitError, match="not owned"):
         create_worktree(
