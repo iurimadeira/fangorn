@@ -16,6 +16,8 @@ from fangorn.git import GitError, WorktreeObservation, observe_worktree
 BUSY_TIMEOUT_SECONDS = 2.0
 ADOPTION_TIMEOUT_SECONDS = 5.0
 ADOPTION_RETRY_DELAY_SECONDS = 0.01
+READ_INITIALIZATION_TIMEOUT_SECONDS = 1.0
+READ_INITIALIZATION_RETRY_DELAY_SECONDS = 0.01
 SCHEMA_VERSION = 1
 
 
@@ -530,19 +532,40 @@ class Registry:
         if not _database_file_exists(self.path):
             yield None
             return
+        deadline = time.monotonic() + READ_INITIALIZATION_TIMEOUT_SECONDS
+        connection: sqlite3.Connection
+        while True:
+            try:
+                connection = sqlite3.connect(
+                    f"{self.path.resolve(strict=True).as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=BUSY_TIMEOUT_SECONDS,
+                    isolation_level=None,
+                )
+            except (OSError, sqlite3.Error) as error:
+                raise RegistryError(
+                    f"Registry database unavailable: {error}"
+                ) from error
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                self._require_supported_schema(connection)
+            except sqlite3.Error as error:
+                connection.close()
+                if _schema_initialization_in_progress(error):
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(
+                            min(READ_INITIALIZATION_RETRY_DELAY_SECONDS, remaining)
+                        )
+                        continue
+                raise _registry_error(error) from error
+            except RegistryError:
+                connection.close()
+                raise
+            break
         try:
-            connection = sqlite3.connect(
-                f"{self.path.resolve(strict=True).as_uri()}?mode=ro",
-                uri=True,
-                timeout=BUSY_TIMEOUT_SECONDS,
-                isolation_level=None,
-            )
-        except (OSError, sqlite3.Error) as error:
-            raise RegistryError(f"Registry database unavailable: {error}") from error
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA query_only = ON")
-            self._require_supported_schema(connection)
             yield connection
         except sqlite3.Error as error:
             raise _registry_error(error) from error
@@ -651,6 +674,13 @@ def _observation_token(observation: WorktreeObservation) -> int:
     if token is None or token <= 0:
         raise RegistryError("Registry observation token is missing or invalid")
     return token
+
+
+def _schema_initialization_in_progress(error: sqlite3.Error) -> bool:
+    return (
+        isinstance(error, sqlite3.OperationalError)
+        and str(error) == "no such table: schema_migrations"
+    )
 
 
 def _reserve_observation(connection: sqlite3.Connection) -> int:

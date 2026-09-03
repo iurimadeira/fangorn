@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fangorn.git import GitError, observe_worktree
 from fangorn.registry import Registry, RegistryError
-from fangorn.registry import WorkspaceRecord as WorkspaceRecord
+from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
 
 ADOPTION_ATTEMPTS = 3
 
@@ -15,8 +15,34 @@ class WorkspaceError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class Binding:
+    id: str
+    repository_id: str
+    repository_common_dir: str
+    git_common_dir_generation: str
+    git_dir: str
+    git_dir_generation: str
+    adopted_head: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CurrentGitFacts:
+    path: str
+    branch: str | None
+    head: str | None
+    observed_at: str
+
+
+@dataclass(frozen=True)
+class Workspace:
+    binding: Binding
+    current_git_facts: CurrentGitFacts
+
+
+@dataclass(frozen=True)
 class AdoptionResult:
-    workspace: WorkspaceRecord
+    workspace: Workspace
     created: bool
 
 
@@ -56,23 +82,44 @@ class Workspaces:
                         create_worktree_generation=create_worktree_generation,
                         reserve_observation=self._registry.reserve_observation,
                     )
-                workspace, created = self._registry.adopt(observation)
-                return AdoptionResult(workspace=workspace, created=created)
+                record, created = self._registry.adopt(observation)
+                return AdoptionResult(workspace=_workspace(record), created=created)
             raise RegistryError(
                 "Concurrent equivalent adoption did not settle; retry the command"
             )
         except (GitError, RegistryError) as error:
             raise WorkspaceError(str(error)) from error
 
-    def list(self) -> list[WorkspaceRecord]:
+    def list(self) -> list[Workspace]:
         try:
-            return self._registry.list_workspaces()
+            return [_workspace(record) for record in self._registry.list_workspaces()]
         except RegistryError as error:
             raise WorkspaceError(str(error)) from error
 
-    def inspect(self, path: Path) -> WorkspaceRecord:
+    def inspect(self, path: Path) -> Workspace:
         try:
             observation = observe_worktree(path)
-            return self._registry.inspect_worktree(observation)
+            return _workspace(self._registry.inspect_worktree(observation))
         except (GitError, RegistryError) as error:
             raise WorkspaceError(str(error)) from error
+
+
+def _workspace(record: _WorkspaceRecord) -> Workspace:
+    return Workspace(
+        binding=Binding(
+            id=record.id,
+            repository_id=record.repository_id,
+            repository_common_dir=record.repository_common_dir,
+            git_common_dir_generation=record.git_common_dir_generation,
+            git_dir=record.git_dir,
+            git_dir_generation=record.git_dir_generation,
+            adopted_head=record.adopted_head,
+            created_at=record.created_at,
+        ),
+        current_git_facts=CurrentGitFacts(
+            path=record.path,
+            branch=record.branch,
+            head=record.head,
+            observed_at=record.last_observed_at,
+        ),
+    )

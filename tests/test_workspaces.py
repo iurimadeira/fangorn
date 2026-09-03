@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import sqlite3
 import stat
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from git_helpers import git, initialize_repository
 
-from fangorn.workspaces import AdoptionResult, WorkspaceError, Workspaces
+from fangorn.registry import Registry
+from fangorn.workspaces import (
+    AdoptionResult,
+    Binding,
+    CurrentGitFacts,
+    Workspace,
+    WorkspaceError,
+    Workspaces,
+)
 
 
 def create_repository(path: Path) -> str:
@@ -41,9 +52,14 @@ def test_workspaces_adopts_through_public_python_api(
 
     assert isinstance(result, AdoptionResult)
     assert result.created is True
-    assert result.workspace.path == str(repository.resolve())
-    assert result.workspace.branch == "main"
-    assert result.workspace.head == head
+    assert isinstance(result.workspace, Workspace)
+    assert isinstance(result.workspace.binding, Binding)
+    assert isinstance(result.workspace.current_git_facts, CurrentGitFacts)
+    assert result.workspace.binding.id
+    assert result.workspace.current_git_facts.path == str(repository.resolve())
+    assert result.workspace.current_git_facts.branch == "main"
+    assert result.workspace.current_git_facts.head == head
+    assert not hasattr(result.workspace, "last_observation_token")
 
 
 def test_workspaces_list_does_not_initialize_missing_state(
@@ -75,10 +91,12 @@ def test_workspaces_inspect_returns_current_facts_without_mutating_state_or_git(
 
     inspected = workspaces.inspect(nested)
 
-    assert inspected.id == adopted.id
-    assert inspected.path == str(repository.resolve())
-    assert inspected.branch == "topic"
-    assert inspected.last_observed_at != adopted.last_observed_at
+    assert inspected.binding == adopted.binding
+    assert inspected.current_git_facts.path == str(repository.resolve())
+    assert inspected.current_git_facts.branch == "topic"
+    assert (
+        inspected.current_git_facts.observed_at != adopted.current_git_facts.observed_at
+    )
     assert snapshot_tree(state_home) == state_before
     assert snapshot_tree(repository / ".git") == git_before
 
@@ -132,3 +150,69 @@ def test_workspaces_reads_reject_newer_registry_schema_without_migrating(
         )
     finally:
         connection.close()
+
+
+def test_workspaces_list_uses_one_snapshot_for_schema_and_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    workspaces = Workspaces.from_environment()
+    adopted = workspaces.adopt(repository).workspace
+    database = state_home / "fangorn" / "registry.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
+    finally:
+        connection.close()
+
+    schema_checked = Event()
+    writer_finished = Event()
+    original_check = Registry._require_supported_schema
+
+    def pause_after_schema_check(
+        registry: Registry, read_connection: sqlite3.Connection
+    ) -> None:
+        original_check(registry, read_connection)
+        schema_checked.set()
+        assert writer_finished.wait(2)
+
+    def delete_workspace_after_schema_check() -> None:
+        assert schema_checked.wait(2)
+        writer = sqlite3.connect(database)
+        try:
+            writer.execute("DELETE FROM workspaces")
+            writer.commit()
+        finally:
+            writer.close()
+            writer_finished.set()
+
+    monkeypatch.setattr(Registry, "_require_supported_schema", pause_after_schema_check)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        writer = executor.submit(delete_workspace_after_schema_check)
+        listed = workspaces.list()
+        writer.result()
+
+    assert listed == [adopted]
+
+
+def test_workspaces_list_waits_for_concurrent_first_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    database = state_home / "fangorn" / "registry.sqlite3"
+    database.parent.mkdir(parents=True)
+    database.touch(mode=0o600)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(Workspaces.from_environment().list)
+        time.sleep(0.05)
+        adopted = Workspaces.from_environment().adopt(repository).workspace
+        listed = reader.result()
+
+    assert listed in ([], [adopted])
