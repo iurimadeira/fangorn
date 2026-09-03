@@ -14,10 +14,17 @@ def main() -> int:
     control = int(sys.argv[1])
     status = int(sys.argv[2])
     liveness = int(sys.argv[3])
+    os.fstat(liveness)
     inherited = tuple(int(value) for value in sys.argv[4].split(",") if value)
-    finish_on_owner_exit = sys.argv[5] == "finish"
+    working_directory = int(sys.argv[5])
+    finish_on_owner_exit = sys.argv[6] == "finish"
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
-        sys.argv[6:], start_new_session=True, pass_fds=(liveness, *inherited)
+        sys.argv[7:],
+        start_new_session=True,
+        pass_fds=inherited,
+        preexec_fn=(
+            (lambda: os.fchdir(working_directory)) if working_directory >= 0 else None
+        ),
     )
     try:
         os.write(status, f"{child.pid}\n".encode("ascii"))

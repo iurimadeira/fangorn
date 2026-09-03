@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -222,7 +221,6 @@ def materialize_cache(
             "--",
             source.clone_url,
             str(clone),
-            use_c=True,
             liveness_fd=liveness_fd,
         )
         if result.returncode != 0:
@@ -456,14 +454,16 @@ def create_worktree(
                 raise GitError(_git_error(branch_exists))
             _require_target_parent(parent)
             added = _run_git_process(
-                repository,
+                _required_git_path(repository, "rev-parse", "--absolute-git-dir"),
                 "worktree",
                 "add",
                 "--detach",
-                _descriptor_entry(parent.descriptor, staging.name),
+                staging.name,
                 commit,
+                git_dir=True,
                 liveness_fd=liveness_fd,
                 extra_fds=(parent.descriptor,),
+                working_directory_fd=parent.descriptor,
             )
             if added.returncode != 0:
                 raise GitError(_git_error(added))
@@ -486,12 +486,21 @@ def create_worktree(
                 else ("checkout", "-b", branch, commit)
             )
             _require_target_parent(parent)
-            selected = _run_git_process(
-                Path(_descriptor_entry(parent.descriptor, staging.name)),
-                *checkout,
-                liveness_fd=liveness_fd,
-                extra_fds=(parent.descriptor,),
+            staging_descriptor = os.open(
+                staging.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent.descriptor,
             )
+            try:
+                selected = _run_git_process(
+                    Path("."),
+                    *checkout,
+                    liveness_fd=liveness_fd,
+                    extra_fds=(staging_descriptor,),
+                    working_directory_fd=staging_descriptor,
+                )
+            finally:
+                os.close(staging_descriptor)
             if selected.returncode != 0:
                 raise GitError(_git_error(selected))
             _require_target_parent(parent)
@@ -501,14 +510,16 @@ def create_worktree(
         _fsync_descriptor(parent.descriptor, "Workspace staging publication")
         _require_target_parent(parent)
         moved = _run_git_process(
-            repository,
+            _required_git_path(repository, "rev-parse", "--absolute-git-dir"),
             "worktree",
             "move",
-            _descriptor_entry(parent.descriptor, staging.name),
-            _descriptor_entry(parent.descriptor, target.name),
+            staging.name,
+            target.name,
+            git_dir=True,
             liveness_fd=liveness_fd,
             finish_on_parent_exit=True,
             extra_fds=(parent.descriptor,),
+            working_directory_fd=parent.descriptor,
         )
         if moved.returncode != 0:
             raise GitError(_git_error(moved))
@@ -701,18 +712,6 @@ def _entry_kind(parent_descriptor: int, name: str) -> str | None:
     return "symlink" if stat.S_ISLNK(metadata.st_mode) else "present"
 
 
-def _descriptor_entry(parent_descriptor: int, name: str) -> str:
-    proc_descriptor = Path(f"/proc/self/fd/{parent_descriptor}")
-    if proc_descriptor.is_dir():
-        return str(proc_descriptor / name)
-    if sys.platform == "darwin":
-        value = fcntl.fcntl(parent_descriptor, 50, b"\0" * 1024)
-        path = Path(os.fsdecode(value.split(b"\0", 1)[0]))
-        if path.is_absolute():
-            return str(path / name)
-    raise GitError("Workspace target parent descriptor is unavailable")
-
-
 def _fsync_descriptor(descriptor: int, label: str) -> None:
     try:
         os.fsync(descriptor)
@@ -803,14 +802,15 @@ def _run_git(path: Path, *arguments: str) -> str:
 def _run_git_process(
     path: Path,
     *arguments: str,
-    use_c: bool = False,
+    git_dir: bool = False,
     liveness_fd: int | None = None,
     finish_on_parent_exit: bool = False,
     extra_fds: tuple[int, ...] = (),
+    working_directory_fd: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = ["git"]
-    if use_c:
-        command.extend(("-C", str(path)))
+    if git_dir:
+        command.append(f"--git-dir={path}")
     else:
         command.extend(("-C", str(path)))
     command.extend(("-c", "core.hooksPath=/dev/null"))
@@ -830,6 +830,11 @@ def _run_git_process(
                 capture_output=True,
                 env=environment,
                 pass_fds=extra_fds,
+                preexec_fn=(
+                    (lambda: os.fchdir(working_directory_fd))
+                    if working_directory_fd is not None
+                    else None
+                ),
             )
         return _run_supervised_git(
             command,
@@ -837,6 +842,7 @@ def _run_git_process(
             liveness_fd=liveness_fd,
             finish_on_parent_exit=finish_on_parent_exit,
             extra_fds=extra_fds,
+            working_directory_fd=working_directory_fd,
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
@@ -851,6 +857,7 @@ def _run_supervised_git(
     liveness_fd: int,
     finish_on_parent_exit: bool,
     extra_fds: tuple[int, ...],
+    working_directory_fd: int | None,
 ) -> subprocess.CompletedProcess[bytes]:
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
@@ -862,6 +869,7 @@ def _run_supervised_git(
         str(status_write),
         str(liveness_fd),
         ",".join(str(descriptor) for descriptor in extra_fds),
+        str(working_directory_fd if working_directory_fd is not None else -1),
         "finish" if finish_on_parent_exit else "cancel",
         *command,
     ]

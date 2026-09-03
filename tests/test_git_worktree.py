@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import signal
@@ -349,8 +348,11 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     child = Child()
     drained: list[object] = []
     monkeypatch.setattr(
-        sys, "argv", ["supervisor", "10", "11", "12", "", "cancel", "git"]
+        sys,
+        "argv",
+        ["supervisor", "10", "11", "12", "", "-1", "cancel", "git"],
     )
+    monkeypatch.setattr(os, "fstat", lambda _descriptor: object())
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
     monkeypatch.setattr(
         os, "write", lambda *args: (_ for _ in ()).throw(BrokenPipeError())
@@ -571,24 +573,6 @@ def test_target_parent_helpers_fail_closed(
             git_worktree_adapter._fsync_descriptor(descriptor, "Target")
     finally:
         os.close(descriptor)
-
-
-def test_descriptor_entry_uses_darwin_directory_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(
-        fcntl,
-        "fcntl",
-        lambda *args: (
-            os.fsencode(tmp_path) + b"\0" * (1024 - len(os.fsencode(tmp_path)))
-        ),
-    )
-
-    assert git_worktree_adapter._descriptor_entry(10, "target") == str(
-        tmp_path / "target"
-    )
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:
