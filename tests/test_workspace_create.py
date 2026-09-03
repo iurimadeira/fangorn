@@ -83,11 +83,11 @@ def test_equivalent_retry_reuses_resolved_values_and_completed_operation(
         request_id="retry-1",
         headless=True,
     )
-
     first = workspaces.create(request)
     (target / "work.txt").write_text("work\n", encoding="utf-8")
     git(target, "add", "work.txt")
     git(target, "commit", "-m", "workspace work")
+    git(target, "branch", "-m", "renamed-topic")
     (repository / "later.txt").write_text("later\n", encoding="utf-8")
     git(repository, "add", "later.txt")
     git(repository, "commit", "-m", "later")
@@ -493,11 +493,11 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         observation = real_create_worktree(*args, **kwargs)  # type: ignore[arg-type]
         if not interrupted:
             interrupted = True
-            raise OSError("simulated interruption after Git effect")
+            raise RuntimeError("simulated interruption after Git effect")
         return observation
 
     monkeypatch.setattr("fangorn.workspaces.create_worktree", interrupt_after_effect)
-    with pytest.raises(WorkspaceError, match="simulated interruption"):
+    with pytest.raises(RuntimeError, match="simulated interruption"):
         workspaces.create(request)
 
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
@@ -513,6 +513,15 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         assert connection.execute(
             "SELECT active FROM mutation_leases WHERE scope_kind = 'workspace'"
         ).fetchone() == (0,)
+        aggregate_row = connection.execute(
+            "SELECT definition_json, lifecycle_state FROM workspace_aggregates "
+            "WHERE workspace_id = (SELECT workspace_id "
+            "FROM workspace_create_intents WHERE request_id = ?)",
+            (request.request_id,),
+        ).fetchone()
+        assert aggregate_row is not None
+        assert json.loads(aggregate_row[0])["created_from_sha"]
+        assert aggregate_row[1] == "create_failed"
 
     recovered = facade(tmp_path).create(request)
 
@@ -574,7 +583,6 @@ def test_default_configuration_is_snapshotted_from_resolved_commit(
         request_id="configured-1",
         headless=True,
     )
-
     first = workspaces.create(request)
     (repository / "fangorn.toml").write_text(
         "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
@@ -588,6 +596,37 @@ def test_default_configuration_is_snapshotted_from_resolved_commit(
         retried.workspace.definition.configuration_digest
         == first.workspace.definition.configuration_digest
     )
+
+
+def test_resolved_sha_survives_configuration_failure_and_ref_movement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    original_sha = create_repository(repository)
+    target = tmp_path / "worktrees" / "stable-sha"
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="stable-sha",
+        path=target,
+        request_id="stable-sha-1",
+        headless=True,
+    )
+
+    def fail_configuration(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("configuration unavailable")
+
+    monkeypatch.setattr("fangorn.workspaces.read_configuration", fail_configuration)
+    with pytest.raises(WorkspaceError, match="configuration unavailable"):
+        facade(tmp_path).create(request)
+    (repository / "later.txt").write_text("later\n", encoding="utf-8")
+    git(repository, "add", "later.txt")
+    git(repository, "commit", "-m", "move source ref")
+    monkeypatch.undo()
+
+    recovered = facade(tmp_path).create(request)
+
+    assert recovered.workspace.definition.created_from_sha == original_sha
+    assert git(target, "rev-parse", "HEAD") == original_sha
 
 
 def test_local_source_without_base_uses_that_checkout_head(tmp_path: Path) -> None:
@@ -638,6 +677,7 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
     database = tmp_path / "state" / "registry.sqlite3"
 
     with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
         with pytest.raises(sqlite3.IntegrityError, match="definition is immutable"):
             connection.execute(
                 "UPDATE workspaces SET created_from_sha = ? WHERE id = ?",
@@ -672,6 +712,11 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
                 "WHERE workspace_id = ?",
                 (created.definition.id,),
             )
+        with pytest.raises(sqlite3.IntegrityError, match="completion is immutable"):
+            connection.execute(
+                "UPDATE workspaces SET completed_operation_id = NULL WHERE id = ?",
+                (created.definition.id,),
+            )
         connection.execute(
             "INSERT INTO operations VALUES "
             "('orphan-create', 'missing-workspace', 'create', 'running', NULL, ?, ?)",
@@ -680,6 +725,13 @@ def test_schema_2_definition_is_immutable_but_provisioning_status_is_operational
         with pytest.raises(sqlite3.IntegrityError, match="requires one worktree"):
             connection.execute(
                 "UPDATE operations SET status = 'completed' WHERE id = 'orphan-create'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="requires one worktree"):
+            connection.execute(
+                "INSERT INTO operations VALUES "
+                "('completed-bypass', 'missing-workspace', 'create', 'completed', "
+                "NULL, ?, ?)",
+                ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
             )
 
 

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
 
@@ -75,6 +75,7 @@ class CreateIntentRecord:
     request_json: str
     request_id: str | None
     target_path: str
+    resolved_sha: str | None
     resolved_json: str | None
     status: str
 
@@ -195,6 +196,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 request_id TEXT UNIQUE,
                 request_json TEXT NOT NULL,
                 target_path TEXT NOT NULL UNIQUE,
+                resolved_sha TEXT,
                 resolved_json TEXT,
                 aggregate_version INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
@@ -266,6 +268,16 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             """
+            CREATE TABLE workspace_aggregates (
+                workspace_id TEXT PRIMARY KEY NOT NULL
+                    REFERENCES workspace_create_intents(workspace_id),
+                definition_json TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                aggregate_version INTEGER NOT NULL DEFAULT 0,
+                completed_operation_id TEXT REFERENCES operations(id)
+            )
+            """,
+            """
             CREATE TRIGGER workspace_aggregate_definition_immutable
             BEFORE UPDATE OF parent_id, repository_id, created_from_sha,
                 configuration, configuration_json, configuration_digest, origin
@@ -306,14 +318,25 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             BEFORE INSERT ON workspace_resources
             FOR EACH ROW
             WHEN EXISTS (
-                SELECT 1 FROM workspaces
-                JOIN operations
-                    ON operations.id = workspaces.completed_operation_id
-                WHERE workspaces.id = NEW.workspace_id
-                    AND operations.status = 'completed'
+                SELECT 1 FROM workspace_aggregates
+                WHERE workspace_id = NEW.workspace_id
+                    AND completed_operation_id IS NOT NULL
             )
             BEGIN
                 SELECT RAISE(ABORT, 'workspace resource membership is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_create_requires_one_worktree_on_insert
+            BEFORE INSERT ON operations
+            FOR EACH ROW
+            WHEN NEW.kind = 'create' AND NEW.status = 'completed'
+                AND (
+                    SELECT COUNT(*) FROM workspace_resources
+                    WHERE workspace_id = NEW.workspace_id AND kind = 'worktree'
+                ) != 1
+            BEGIN
+                SELECT RAISE(ABORT, 'created workspace requires one worktree');
             END
             """,
             """
@@ -347,6 +370,44 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 AND NEW.resolved_json IS NOT OLD.resolved_json
             BEGIN
                 SELECT RAISE(ABORT, 'workspace create intent is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_create_intent_sha_immutable
+            BEFORE UPDATE OF resolved_sha ON workspace_create_intents
+            FOR EACH ROW
+            WHEN OLD.resolved_sha IS NOT NULL
+                AND NEW.resolved_sha IS NOT OLD.resolved_sha
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace create intent is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_aggregate_definition_json_immutable
+            BEFORE UPDATE OF workspace_id, definition_json ON workspace_aggregates
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace definition is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_aggregate_completion_immutable
+            BEFORE UPDATE OF completed_operation_id ON workspace_aggregates
+            FOR EACH ROW
+            WHEN OLD.completed_operation_id IS NOT NULL
+                AND NEW.completed_operation_id IS NOT OLD.completed_operation_id
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_completion_immutable
+            BEFORE UPDATE OF completed_operation_id ON workspaces
+            FOR EACH ROW
+            WHEN OLD.completed_operation_id IS NOT NULL
+                AND NEW.completed_operation_id IS NOT OLD.completed_operation_id
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace completion is immutable');
             END
             """,
         ),
@@ -664,9 +725,9 @@ class Registry:
                     """
                     INSERT INTO workspace_create_intents (
                         operation_id, workspace_id, request_key, request_id,
-                        request_json, target_path, resolved_json, status,
+                        request_json, target_path, resolved_sha, resolved_json, status,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'preparing', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'preparing', ?, ?)
                     """,
                     (
                         operation_id,
@@ -704,9 +765,80 @@ class Registry:
                     request_json=request_json,
                     request_id=request_id,
                     target_path=target_path,
+                    resolved_sha=None,
                     resolved_json=None,
                     status="preparing",
                 ), True
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def persist_resolved_sha(self, operation_id: str, sha: str) -> str:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT resolved_sha FROM workspace_create_intents "
+                    "WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryError("Workspace create intent is unavailable")
+                if row["resolved_sha"] is not None:
+                    connection.commit()
+                    return str(row["resolved_sha"])
+                connection.execute(
+                    "UPDATE workspace_create_intents "
+                    "SET resolved_sha = ?, updated_at = ? WHERE operation_id = ?",
+                    (sha, _timestamp(), operation_id),
+                )
+                connection.commit()
+                return sha
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def repository_id_for_common_dir(self, common_dir: str) -> str:
+        with self._connection() as connection:
+            self._migrate(connection)
+            row = connection.execute(
+                "SELECT id FROM repositories WHERE git_common_dir = ?", (common_dir,)
+            ).fetchone()
+            if row is not None:
+                return str(row["id"])
+            return str(uuid5(NAMESPACE_URL, f"fangorn-repository:{common_dir}"))
+
+    def record_workspace_definition(
+        self,
+        *,
+        workspace_id: str,
+        definition: dict[str, object],
+    ) -> None:
+        encoded = json.dumps(definition, sort_keys=True, separators=(",", ":"))
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT definition_json FROM workspace_aggregates "
+                    "WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO workspace_aggregates "
+                        "(workspace_id, definition_json, lifecycle_state) "
+                        "VALUES (?, ?, 'creating')",
+                        (workspace_id, encoded),
+                    )
+                elif str(row["definition_json"]) != encoded:
+                    raise RegistryError("Workspace definition is immutable")
+                connection.commit()
             except (sqlite3.Error, RegistryError) as error:
                 connection.rollback()
                 if isinstance(error, RegistryError):
@@ -736,6 +868,17 @@ class Registry:
                         raise RegistryError("Stored create intent is malformed")
                     connection.commit()
                     return existing
+                resolved_sha = str(resolved["created_from_sha"])
+                if row["resolved_sha"] is None:
+                    connection.execute(
+                        "UPDATE workspace_create_intents SET resolved_sha = ? "
+                        "WHERE operation_id = ?",
+                        (resolved_sha, operation_id),
+                    )
+                elif str(row["resolved_sha"]) != resolved_sha:
+                    raise RegistryError(
+                        "Resolved Workspace create SHA does not match its intent"
+                    )
                 encoded = json.dumps(resolved, sort_keys=True, separators=(",", ":"))
                 now = _timestamp()
                 connection.execute(
@@ -872,6 +1015,11 @@ class Registry:
                         "SET status = 'creating', updated_at = ? "
                         "WHERE operation_id = ?",
                         (now, operation_id),
+                    )
+                    connection.execute(
+                        "UPDATE workspace_aggregates SET lifecycle_state = 'creating' "
+                        "WHERE workspace_id = ? AND completed_operation_id IS NULL",
+                        (scope_key,),
                     )
                 connection.commit()
                 return epoch
@@ -1044,6 +1192,11 @@ class Registry:
                     (workspace_id,),
                 )
                 connection.execute(
+                    "UPDATE workspace_aggregates "
+                    "SET lifecycle_state = 'create_failed' WHERE workspace_id = ?",
+                    (workspace_id,),
+                )
+                connection.execute(
                     "UPDATE mutation_leases SET active = 0 "
                     "WHERE scope_kind = 'workspace' AND scope_key = ?",
                     (workspace_id,),
@@ -1119,6 +1272,7 @@ class Registry:
         configuration: bytes,
         configuration_json: str,
         configuration_digest: str,
+        repository_id: str,
         state: str,
         lease_epoch: int,
     ) -> None:
@@ -1137,6 +1291,34 @@ class Registry:
                     raise RegistryError("Repository generation marker is unavailable")
                 if observation.git_dir_generation is None:
                     raise RegistryError("Worktree generation marker is unavailable")
+                aggregate = connection.execute(
+                    "SELECT definition_json FROM workspace_aggregates "
+                    "WHERE workspace_id = ?",
+                    (intent.workspace_id,),
+                ).fetchone()
+                if aggregate is None:
+                    raise RegistryError("Workspace definition is unavailable")
+                definition = json.loads(str(aggregate["definition_json"]))
+                resources = (
+                    definition.get("resources")
+                    if isinstance(definition, dict)
+                    else None
+                )
+                resource = (
+                    resources[0] if isinstance(resources, list) and resources else None
+                )
+                if (
+                    not isinstance(resource, dict)
+                    or definition.get("repository_id") != repository_id
+                    or definition.get("created_from_sha") != created_from_sha
+                    or definition.get("configuration") != configuration.hex()
+                    or definition.get("configuration_digest") != configuration_digest
+                    or resource.get("locator") != str(observation.path)
+                    or resource.get("ownership_token") != observation.git_dir_generation
+                ):
+                    raise RegistryError(
+                        "Workspace completion does not match its immutable definition"
+                    )
                 token = _reserve_observation(connection)
                 now = _timestamp()
                 repository = connection.execute(
@@ -1144,7 +1326,6 @@ class Registry:
                     (str(observation.repository_common_dir),),
                 ).fetchone()
                 if repository is None:
-                    repository_id = str(uuid4())
                     connection.execute(
                         """
                         INSERT INTO repositories (
@@ -1162,7 +1343,10 @@ class Registry:
                     )
                 else:
                     _validate_repository_binding(repository, observation)
-                    repository_id = str(repository["id"])
+                    if str(repository["id"]) != repository_id:
+                        raise RegistryError(
+                            "Repository identity changed during Workspace creation"
+                        )
                 connection.execute(
                     """
                     INSERT INTO workspaces (
@@ -1217,6 +1401,14 @@ class Registry:
                     "WHERE id = ?",
                     (now, intent.operation_id),
                 )
+                aggregate_changed = connection.execute(
+                    "UPDATE workspace_aggregates SET lifecycle_state = ?, "
+                    "aggregate_version = 1, completed_operation_id = ? "
+                    "WHERE workspace_id = ? AND completed_operation_id IS NULL",
+                    (state, intent.operation_id, intent.workspace_id),
+                ).rowcount
+                if aggregate_changed != 1:
+                    raise RegistryError("Workspace completion is already recorded")
                 connection.execute(
                     "UPDATE workspace_create_intents "
                     "SET status = 'completed', updated_at = ? WHERE operation_id = ?",
@@ -1581,6 +1773,9 @@ def _create_intent_from_row(row: sqlite3.Row) -> CreateIntentRecord:
         request_json=str(row["request_json"]),
         request_id=str(row["request_id"]) if row["request_id"] is not None else None,
         target_path=str(row["target_path"]),
+        resolved_sha=(
+            str(row["resolved_sha"]) if row["resolved_sha"] is not None else None
+        ),
         resolved_json=(
             str(row["resolved_json"]) if row["resolved_json"] is not None else None
         ),

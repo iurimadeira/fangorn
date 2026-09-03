@@ -243,10 +243,21 @@ class Workspaces:
 
             repository = self._prepare_repository(source, intent, owner)
             if intent.resolved_json is None:
-                commit = resolve_commit(repository, request.base)
+                commit = intent.resolved_sha
+                if commit is None:
+                    commit = self._registry.persist_resolved_sha(
+                        intent.operation_id,
+                        resolve_commit(repository, request.base),
+                    )
                 configuration = read_configuration(repository, commit, request.config)
                 configuration_value = _configuration_value(configuration)
                 resource_token = secrets.token_hex(32)
+                common_dir = (
+                    source.normalized
+                    if source.clone_url is None
+                    else str(repository.resolve())
+                )
+                repository_id = self._registry.repository_id_for_common_dir(common_dir)
                 lifecycle = plan_create(
                     (LifecycleResource("worktree", "worktree"),),
                     start=request.start,
@@ -257,6 +268,7 @@ class Workspaces:
                     "configuration_value": configuration_value,
                     "created_from_sha": commit,
                     "ownership_token": resource_token,
+                    "repository_id": repository_id,
                 }
                 resolved = self._registry.enrich_create_intent(
                     intent.operation_id,
@@ -270,6 +282,10 @@ class Workspaces:
                 if not isinstance(loaded, dict):
                     raise WorkspaceError("Stored Workspace create intent is malformed")
                 resolved = cast(dict[str, object], loaded)
+            self._registry.record_workspace_definition(
+                workspace_id=intent.workspace_id,
+                definition=_create_definition(intent, target, resolved),
+            )
 
             lease_epoch = self._registry.acquire_lease(
                 scope_kind="workspace",
@@ -345,20 +361,14 @@ class Workspaces:
                     separators=(",", ":"),
                 ),
                 configuration_digest=str(resolved["configuration_digest"]),
+                repository_id=str(resolved["repository_id"]),
                 state=state,
                 lease_epoch=lease_epoch,
             )
             lease_epoch = None
             aggregate, operation = self._load_completed(intent.workspace_id)
             return CreateWorkspaceResult(aggregate, operation, created=created)
-        except (
-            GitError,
-            RegistryError,
-            OSError,
-            ValueError,
-            tomllib.TOMLDecodeError,
-            WorkspaceError,
-        ) as error:
+        except BaseException as error:
             if intent is not None and lease_epoch is not None:
                 with suppress(RegistryError):
                     self._registry.fail_create_operation(
@@ -369,7 +379,18 @@ class Workspaces:
                     )
             if isinstance(error, WorkspaceError):
                 raise
-            raise WorkspaceError(str(error)) from error
+            if isinstance(
+                error,
+                (
+                    GitError,
+                    RegistryError,
+                    OSError,
+                    ValueError,
+                    tomllib.TOMLDecodeError,
+                ),
+            ):
+                raise WorkspaceError(str(error)) from error
+            raise
 
     def list(self) -> list[Workspace]:
         try:
@@ -500,6 +521,32 @@ class Workspaces:
             pid=identity.pid,
             process_start_identity=identity.process_start_identity,
         )
+
+
+def _create_definition(
+    intent: CreateIntentRecord, target: Path, resolved: dict[str, object]
+) -> dict[str, object]:
+    return {
+        "id": intent.workspace_id,
+        "parent_id": None,
+        "repository_id": str(resolved["repository_id"]),
+        "created_from_sha": str(resolved["created_from_sha"]),
+        "configuration": str(resolved["configuration"]),
+        "configuration_value": resolved["configuration_value"],
+        "configuration_digest": str(resolved["configuration_digest"]),
+        "resources": [
+            {
+                "name": "worktree",
+                "kind": "worktree",
+                "adapter_id": "fangorn.git-worktree",
+                "adapter_api_major": 1,
+                "configuration": {},
+                "external_reference": None,
+                "locator": str(target),
+                "ownership_token": str(resolved["ownership_token"]),
+            }
+        ],
+    }
 
 
 def _workspace(record: _WorkspaceRecord) -> Workspace:
