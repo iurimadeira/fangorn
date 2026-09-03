@@ -1268,30 +1268,23 @@ def test_internal_git_helpers_do_not_inherit_coverage_instrumentation(
     )
 
 
-def test_worktree_observation_does_not_launch_effect_supervision_helpers(
+def test_worktree_observation_batches_identity_queries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "repository"
     repository(source)
-    helpers: list[str] = []
-    real_popen = subprocess.Popen
+    calls: list[tuple[str, ...]] = []
+    real_run_git = git_adapter._run_git
 
-    def start(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
-        command = args[0]
-        if isinstance(command, list):
-            helpers.extend(
-                str(value)
-                for value in command
-                if str(value).endswith(
-                    ("_git_anchor.py", "_git_guardian.py", "_git_supervisor.py")
-                )
-            )
-        return real_popen(*args, **kwargs)
+    def run_git(path: Path, *arguments: str, **kwargs: Any) -> str | None:
+        calls.append(arguments)
+        return real_run_git(path, *arguments, **kwargs)
 
-    monkeypatch.setattr(subprocess, "Popen", start)
+    monkeypatch.setattr(git_adapter, "_run_git", run_git)
 
     assert observe_worktree(source).head is not None
-    assert helpers == []
+    assert len(calls) == 7
+    assert sum("--show-toplevel" in call for call in calls) == 2
 
 
 def test_read_only_git_query_has_a_process_group_deadline(

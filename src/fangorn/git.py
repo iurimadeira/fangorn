@@ -231,44 +231,24 @@ def _capture_snapshot(
         create_repository_generation = create_generation
     if create_worktree_generation is None:
         create_worktree_generation = create_generation
-    inside = _run_git(
+    identity = _run_git(
         requested_path,
         "rev-parse",
         "--is-inside-work-tree",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-common-dir",
+        "--git-dir",
         liveness_fd=liveness_fd,
     )
-    if inside != "true":
+    facts = identity.splitlines() if identity is not None else []
+    if not facts or facts[0] != "true":
         raise GitError(f"Path is not inside a Git worktree: {requested_path}")
-
-    worktree_path = _required_path(
-        _run_git(
-            requested_path,
-            "rev-parse",
-            "--show-toplevel",
-            liveness_fd=liveness_fd,
-        ),
-        "worktree path",
-    )
-    common_dir = _required_path(
-        _run_git(
-            requested_path,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            liveness_fd=liveness_fd,
-        ),
-        "Git common directory",
-    )
-    git_dir = _required_path(
-        _run_git(
-            requested_path,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            liveness_fd=liveness_fd,
-        ),
-        "Git administrative directory",
-    )
+    if len(facts) != 4:
+        raise GitError("Git returned malformed worktree identity")
+    worktree_path = _required_path(facts[1], "worktree path")
+    common_dir = _required_path(facts[2], "Git common directory")
+    git_dir = _required_path(facts[3], "Git administrative directory")
     common_directory_before = _directory_identity(common_dir)
     git_directory_before = _directory_identity(git_dir)
     repository_generation_before = _generation(
