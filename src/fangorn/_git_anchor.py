@@ -8,6 +8,7 @@ import time
 
 
 def main() -> int:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     control = int(sys.argv[1])
     liveness = int(sys.argv[2])
     timeout = int(sys.argv[3])

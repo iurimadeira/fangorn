@@ -111,27 +111,31 @@ def _supervise(
             continue
         command_byte = os.read(control, 1)
         if not command_byte:
-            (_finish if finish_on_owner_exit else _drain)(child, process_group)
-            if _finish_captures(captures, output_limit):
-                _replace_output("Git diagnostic output exceeded 8 MiB")
-                return 124
+            stopped = (_finish if finish_on_owner_exit else _drain)(
+                child, process_group
+            )
+            if failure := _completion_failure(
+                stopped, captures, output_limit, deadline
+            ):
+                return failure
             return child.returncode
         if command_byte == b"c":
-            _drain(child, process_group)
-            if _finish_captures(captures, output_limit):
-                _replace_output("Git diagnostic output exceeded 8 MiB")
-                return 124
+            stopped = _drain(child, process_group)
+            if failure := _completion_failure(
+                stopped, captures, output_limit, deadline
+            ):
+                return failure
             return child.returncode
         if command_byte == b"f":
-            _finish(child, process_group)
-            if _finish_captures(captures, output_limit):
-                _replace_output("Git diagnostic output exceeded 8 MiB")
-                return 124
+            stopped = _finish(child, process_group)
+            if failure := _completion_failure(
+                stopped, captures, output_limit, deadline
+            ):
+                return failure
             return child.returncode
-    _drain(child, process_group)
-    if _finish_captures(captures, output_limit):
-        _replace_output("Git diagnostic output exceeded 8 MiB")
-        return 124
+    stopped = _drain(child, process_group)
+    if failure := _completion_failure(stopped, captures, output_limit, deadline):
+        return failure
     if time.monotonic() >= deadline:
         _replace_output("Git operation exceeded one hour")
         return 124
@@ -158,12 +162,44 @@ def _forward_captures(
     return exceeded
 
 
-def _finish_captures(captures: dict[int, list[int]], limit: int) -> bool:
+def _finish_captures(
+    captures: dict[int, list[int]], limit: int, deadline: float
+) -> str:
     exceeded = False
     while captures:
-        readable, _, _ = select.select(tuple(captures), (), ())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _close_captures(captures)
+            return "timeout"
+        readable, _, _ = select.select(tuple(captures), (), (), remaining)
+        if not readable:
+            _close_captures(captures)
+            return "timeout"
         exceeded |= _forward_captures(readable, captures, limit)
-    return exceeded
+    return "exceeded" if exceeded else "ok"
+
+
+def _completion_failure(
+    stopped: bool,
+    captures: dict[int, list[int]],
+    output_limit: int,
+    deadline: float,
+) -> int | None:
+    if not stopped:
+        _close_captures(captures)
+        _replace_output("Git process-group termination could not be confirmed")
+        return 125
+    capture = _finish_captures(
+        captures, output_limit, min(deadline, time.monotonic() + 2)
+    )
+    if capture == "ok":
+        return None
+    _replace_output(
+        "Git diagnostic output exceeded 8 MiB"
+        if capture == "exceeded"
+        else "Git diagnostic capture did not close"
+    )
+    return 124
 
 
 def _close_captures(captures: dict[int, list[int]]) -> None:
@@ -179,26 +215,29 @@ def _replace_output(message: str) -> None:
     os.write(2, f"{message}\n".encode())
 
 
-def _finish(child: subprocess.Popen[bytes], process_group: int) -> None:
+def _finish(child: subprocess.Popen[bytes], process_group: int) -> bool:
     deadline = time.monotonic() + 2
     while _child_running(child) and time.monotonic() < deadline:
         time.sleep(0.01)
-    _drain(child, process_group)
+    return _drain(child, process_group)
 
 
-def _drain(child: subprocess.Popen[bytes], process_group: int) -> None:
+def _drain(child: subprocess.Popen[bytes], process_group: int) -> bool:
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGTERM)
     deadline = time.monotonic() + 2
     if not _wait_for_group_state(process_group, deadline=deadline):
         child.wait()
-        return
+        return True
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGKILL)
     deadline = time.monotonic() + 2
-    _wait_for_group_state(process_group, deadline=deadline)
-    with suppress(subprocess.TimeoutExpired):
+    running = _wait_for_group_state(process_group, deadline=deadline)
+    try:
         child.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    return not running
 
 
 def _wait_for_group_state(process_group: int, *, deadline: float | None = None) -> bool:
@@ -206,7 +245,11 @@ def _wait_for_group_state(process_group: int, *, deadline: float | None = None) 
         deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         try:
-            if not _process_group_running(process_group):
+            if not _process_group_running(
+                process_group,
+                ignore_pid=process_group,
+                timeout=max(0.01, min(1, deadline - time.monotonic())),
+            ):
                 return False
         except (OSError, subprocess.SubprocessError):
             pass
@@ -225,7 +268,9 @@ def _child_running(child: subprocess.Popen[bytes]) -> bool:
     )
 
 
-def _process_group_running(process_group: int) -> bool:
+def _process_group_running(
+    process_group: int, *, ignore_pid: int | None = None, timeout: float = 1
+) -> bool:
     proc = Path("/proc")
     if proc.is_dir():
         parsed = False
@@ -241,7 +286,11 @@ def _process_group_running(process_group: int) -> bool:
                     .split()
                 )
                 parsed = True
-                if int(fields[2]) == process_group and fields[0] != "Z":
+                if (
+                    int(entry.name) != ignore_pid
+                    and int(fields[2]) == process_group
+                    and fields[0] != "Z"
+                ):
                     return True
             except FileNotFoundError:
                 pass
@@ -256,14 +305,18 @@ def _process_group_running(process_group: int) -> bool:
         env={"LANG": "C", "PATH": "/usr/bin:/bin"},
         start_new_session=True,
         text=True,
-        timeout=1,
+        timeout=timeout,
     )
     running = False
     for line in result.stdout.splitlines():
         fields = line.split()
         if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             raise OSError("Cannot parse process-group state")
-        if int(fields[1]) == process_group and not fields[2].startswith("Z"):
+        if (
+            int(fields[0]) != ignore_pid
+            and int(fields[1]) == process_group
+            and not fields[2].startswith("Z")
+        ):
             running = True
     return running
 

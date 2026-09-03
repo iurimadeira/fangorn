@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -2088,18 +2089,32 @@ def test_resource_definition_recursively_freezes_configuration() -> None:
         kind="worktree",
         adapter_id="fangorn.git-worktree",
         adapter_api_major=1,
-        configuration={"nested": {"values": [1]}},
+        configuration=UserDict({"nested": ({"values": [1]},)}),
         external_reference=None,
         locator=str(Path.cwd() / "worktree"),
         ownership_token="a" * 64,
     )
-    nested = cast(Any, resource.configuration["nested"])
+    nested = cast(Any, resource.configuration["nested"])[0]
 
     with pytest.raises(TypeError):
         nested["changed"] = True
     assert nested["values"] == (1,)
     with pytest.raises(AttributeError):
         nested["values"].append(2)
+
+
+def test_resource_definition_rejects_values_it_cannot_freeze() -> None:
+    with pytest.raises(TypeError, match="unsupported value"):
+        ResourceDefinition(
+            name="worktree",
+            kind="worktree",
+            adapter_id="fangorn.git-worktree",
+            adapter_api_major=1,
+            configuration={"mutable": {1}},
+            external_reference=None,
+            locator=str(Path.cwd() / "worktree"),
+            ownership_token="a" * 64,
+        )
 
 
 @pytest.mark.parametrize(

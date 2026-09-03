@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from git_helpers import git, initialize_repository
 
+import fangorn._git_anchor as git_anchor
 import fangorn._git_supervisor as git_supervisor
 import fangorn.git_worktree as git_worktree_adapter
 from fangorn.git import GitError, establish_worktree_generation, repository_generation
@@ -360,6 +361,11 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
 
     child = Child()
     drained: list[object] = []
+
+    def drain(value: object, _process_group: int) -> bool:
+        drained.append(value)
+        return True
+
     monkeypatch.setattr(
         sys,
         "argv",
@@ -385,11 +391,9 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
         os, "write", lambda *args: (_ for _ in ()).throw(BrokenPipeError())
     )
     monkeypatch.setattr(os, "close", lambda _descriptor: None)
-    monkeypatch.setattr(
-        git_supervisor, "_drain", lambda value, _process_group: drained.append(value)
-    )
+    monkeypatch.setattr(git_supervisor, "_drain", drain)
     monkeypatch.setattr(git_supervisor, "_child_running", lambda _child: False)
-    monkeypatch.setattr(git_supervisor, "_finish_captures", lambda *_args: False)
+    monkeypatch.setattr(git_supervisor, "_finish_captures", lambda *_args: "ok")
 
     assert git_supervisor.main() == 0
     assert drained == [child]
@@ -458,7 +462,7 @@ def test_supervisor_does_not_reap_before_group_cleanup(
     )
     monkeypatch.setattr(os, "killpg", lambda *_args: None)
 
-    git_supervisor._drain(child, 123)  # type: ignore[arg-type]
+    assert git_supervisor._drain(child, 123) is True  # type: ignore[arg-type]
 
     assert child.waited is True
 
@@ -660,6 +664,21 @@ def test_group_probe_falls_back_when_proc_scan_is_incomplete(
     assert git_supervisor._process_group_running(77) is True
 
 
+def test_supervisor_group_probe_ignores_watchdog_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "77 77 S\n", ""
+        ),
+    )
+
+    assert git_supervisor._process_group_running(77, ignore_pid=77) is False
+
+
 def test_group_cleanup_retries_failed_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -667,7 +686,7 @@ def test_group_cleanup_retries_failed_observation(
         (subprocess.SubprocessError(), False)
     )
 
-    def observe(_process_group: int) -> bool:
+    def observe(_process_group: int, **_kwargs: float) -> bool:
         result = next(observations)
         if isinstance(result, BaseException):
             raise result
@@ -700,10 +719,66 @@ def test_supervisor_group_cleanup_forces_kill_after_probe_deadline(
     monkeypatch.setattr(os, "killpg", lambda _pid, sent: signals.append(sent))
 
     child = Child()
-    git_supervisor._drain(child, 77)  # type: ignore[arg-type]
+    assert git_supervisor._drain(child, 77) is False  # type: ignore[arg-type]
 
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert len(child.waits) == 1
+
+
+def test_supervisor_rejects_completion_without_proven_group_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostics: list[str] = []
+    monkeypatch.setattr(git_supervisor, "_replace_output", diagnostics.append)
+    monkeypatch.setattr(
+        git_supervisor,
+        "_finish_captures",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must close immediately")),
+    )
+
+    assert git_supervisor._completion_failure(False, {}, 1, time.monotonic()) == 125
+    assert diagnostics == ["Git process-group termination could not be confirmed"]
+
+
+def test_supervisor_capture_finish_stops_at_deadline() -> None:
+    reader, writer = os.pipe()
+    captures = {reader: [1, 0]}
+    try:
+        assert (
+            git_supervisor._finish_captures(captures, 1, time.monotonic()) == "timeout"
+        )
+        assert captures == {}
+    finally:
+        os.close(writer)
+
+
+def test_anchor_survives_group_termination_before_arming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control_reader, control_writer = os.pipe()
+    liveness_reader, liveness_writer = os.pipe()
+    handlers: list[tuple[int, Any]] = []
+    os.write(control_writer, b"x")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["anchor", str(control_reader), str(liveness_reader), "1"],
+    )
+    monkeypatch.setattr(
+        signal, "signal", lambda number, handler: handlers.append((number, handler))
+    )
+    try:
+        assert git_anchor.main() == 1
+    finally:
+        for descriptor in (
+            control_reader,
+            control_writer,
+            liveness_reader,
+            liveness_writer,
+        ):
+            os.close(descriptor)
+
+    assert handlers == [(signal.SIGTERM, signal.SIG_IGN)]
 
 
 def test_parent_group_probe_rejects_malformed_ps(

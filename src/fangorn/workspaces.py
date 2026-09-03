@@ -879,15 +879,19 @@ def _configuration_value(content: bytes | None) -> dict[str, object]:
 
 
 def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
+    if any(not isinstance(key, str) for key in value):
+        raise TypeError("configuration keys must be strings")
     return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
 
 
 def _freeze_value(value: object) -> object:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return _freeze_mapping(value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze_value(item) for item in value)
-    return value
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError("configuration contains an unsupported value")
 
 
 def _current_process_identity() -> ProcessIdentity:
