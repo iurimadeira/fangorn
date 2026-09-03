@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from fangorn.git import (
@@ -17,6 +21,9 @@ from fangorn.git import (
     observe_worktree,
     require_supported_git,
 )
+
+if TYPE_CHECKING:
+    from fangorn.registry import ProcessIdentity
 
 SUPPORTED_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
 
@@ -104,17 +111,39 @@ def read_configuration(repository: Path, commit: str, explicit: Path | None) -> 
     raise GitError(_git_error(result))
 
 
-def materialize_cache(source: RepositorySource, cache_path: Path) -> Path:
+def materialize_cache(
+    source: RepositorySource,
+    cache_path: Path,
+    *,
+    owner: ProcessIdentity | None = None,
+    owner_status: Callable[[ProcessIdentity], str] | None = None,
+) -> Path:
     if source.clone_url is None:
         if source.path is None:
             raise GitError("Local repository path is unavailable")
         return source.path
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if owner is not None and owner_status is not None:
+        _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
         _verify_bare_repository(cache_path, source.normalized)
         return cache_path
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
     require_supported_git(cache_path.parent)
-    invocation = Path(tempfile.mkdtemp(prefix="clone-", dir=cache_path.parent))
+    prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
+    invocation = Path(tempfile.mkdtemp(prefix=prefix, dir=cache_path.parent))
+    if owner is not None:
+        (invocation / "owner.json").write_text(
+            json.dumps(
+                {
+                    "boot_identity": owner.boot_identity,
+                    "pid": owner.pid,
+                    "process_instance_id": owner.process_instance_id,
+                    "process_start_identity": owner.process_start_identity,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
     clone = invocation / "repository.git"
     try:
         result = _run_git_process(
@@ -141,6 +170,42 @@ def materialize_cache(source: RepositorySource, cache_path: Path) -> Path:
             shutil.rmtree(invocation, ignore_errors=True)
 
 
+def _cleanup_abandoned_clones(
+    parent: Path, owner_status: Callable[[ProcessIdentity], str]
+) -> None:
+    from fangorn.registry import ProcessIdentity
+
+    resolved_parent = parent.resolve(strict=True)
+    for candidate in parent.iterdir():
+        if not candidate.name.startswith("clone-"):
+            continue
+        try:
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != resolved_parent:
+                continue
+            metadata = resolved / "owner.json"
+            metadata_stat = metadata.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata_stat.st_mode)
+                or metadata_stat.st_size > 4096
+                or metadata.is_symlink()
+            ):
+                continue
+            value = json.loads(metadata.read_text(encoding="utf-8"))
+            owner = ProcessIdentity(
+                process_instance_id=str(value["process_instance_id"]),
+                boot_identity=str(value["boot_identity"]),
+                pid=int(value["pid"]),
+                process_start_identity=str(value["process_start_identity"]),
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if owner_status(owner) == "dead":
+            shutil.rmtree(resolved)
+
+
 def create_worktree(
     repository: Path,
     *,
@@ -154,23 +219,41 @@ def create_worktree(
         if not reconcile:
             raise GitError(f"Workspace target path already exists: {target}")
         observation = observe_worktree(target)
+        if observation.git_dir_generation != ownership_token:
+            raise GitError("Existing target is not owned by this Workspace create")
         if observation.head != commit or observation.branch != branch:
             raise GitError("Existing target does not match the interrupted create")
+        return observe_worktree(
+            target,
+            create_repository_generation=True,
+            create_worktree_generation=False,
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.parent / f".fangorn-{ownership_token}"
+    if staging.exists():
+        observation = observe_worktree(staging)
+        if observation.git_dir_generation not in {None, ownership_token}:
+            raise GitError("Staged Worktree belongs to another Workspace create")
+        if observation.head != commit or observation.branch != branch:
+            raise GitError("Staged Worktree does not match the interrupted create")
     else:
-        target.parent.mkdir(parents=True, exist_ok=True)
         result = _run_git_process(
             repository,
             "worktree",
             "add",
             "-b",
             branch,
-            str(target),
+            str(staging),
             commit,
         )
         if result.returncode != 0:
             raise GitError(_git_error(result))
-        observation = observe_worktree(target)
+        observation = observe_worktree(staging)
     establish_worktree_generation(observation.git_dir, ownership_token)
+    moved = _run_git_process(repository, "worktree", "move", str(staging), str(target))
+    if moved.returncode != 0:
+        raise GitError(_git_error(moved))
     return observe_worktree(
         target,
         create_repository_generation=True,

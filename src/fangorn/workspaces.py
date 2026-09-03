@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import secrets
+import stat
 import subprocess
 import tomllib
 from contextlib import suppress
@@ -249,7 +250,7 @@ class Workspaces:
                     owner_status=self._owner_status,
                 )
             except CreateAlreadyCompleted:
-                return self._completed_create(intent.workspace_id)
+                return self._completed_create(intent.workspace_id, created=created)
 
             repository = self._prepare_repository(source, intent, owner)
             if intent.resolved_json is None:
@@ -441,7 +442,12 @@ class Workspaces:
             )
             entry = self._registry.cache_entry(source.normalized)
             selected = Path(entry[0]) if entry is not None else cache_path
-            repository = materialize_cache(source, selected)
+            repository = materialize_cache(
+                source,
+                selected,
+                owner=owner,
+                owner_status=self._owner_status,
+            )
             if previous != "completed" or entry is None:
                 self._registry.save_cache_entry(
                     source.normalized,
@@ -519,7 +525,9 @@ class Workspaces:
             status=str(operation_row["status"]),
         )
 
-    def _completed_create(self, workspace_id: str) -> CreateWorkspaceResult:
+    def _completed_create(
+        self, workspace_id: str, *, created: bool = False
+    ) -> CreateWorkspaceResult:
         aggregate, operation = self._load_completed(workspace_id)
         inspect_owned_worktree(
             Path(aggregate.path),
@@ -527,7 +535,7 @@ class Workspaces:
             expected_branch=None,
             ownership_token=aggregate.definition.resources[0].ownership_token,
         )
-        return CreateWorkspaceResult(aggregate, operation, created=False)
+        return CreateWorkspaceResult(aggregate, operation, created=created)
 
     def _invocation_process_identity(self) -> ProcessIdentity:
         identity = self._process_identity or _current_process_identity()
@@ -580,7 +588,7 @@ class Workspaces:
 
     def _owner_status(self, owner: ProcessIdentity) -> str:
         status = _process_owner_status(owner)
-        if status != "live":
+        if status == "inconclusive":
             return status
         marker = self._invocation_root / owner.process_instance_id
         try:
@@ -593,7 +601,19 @@ class Workspaces:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return "live"
+                return "live" if status == "live" else "inconclusive"
+            opened = os.fstat(descriptor)
+            try:
+                current = marker.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                return "dead"
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or opened.st_dev != current.st_dev
+                or opened.st_ino != current.st_ino
+            ):
+                return "inconclusive"
+            marker.unlink()
             return "dead"
         finally:
             os.close(descriptor)
@@ -659,8 +679,11 @@ def _xdg_home(variable: str, fallback: str) -> Path:
 def _target_path(
     request: CreateWorkspace, source: RepositorySource, data_home: Path
 ) -> Path:
-    if request.path is not None:
-        return request.path.expanduser().resolve(strict=False)
+    try:
+        if request.path is not None:
+            return _canonical_target(request.path.expanduser())
+    except (OSError, RuntimeError) as error:
+        raise WorkspaceError("Workspace target path cannot be canonicalized") from error
     material = json.dumps(
         {
             "base": request.base,
@@ -673,9 +696,26 @@ def _target_path(
     )
     suffix = hashlib.sha256(material.encode()).hexdigest()[:12]
     safe_branch = re_sub_path(request.branch)
-    return (
-        data_home / "fangorn" / "worktrees" / source.name / f"{safe_branch}-{suffix}"
-    ).resolve(strict=False)
+    try:
+        return _canonical_target(
+            data_home
+            / "fangorn"
+            / "worktrees"
+            / source.name
+            / f"{safe_branch}-{suffix}"
+        )
+    except (OSError, RuntimeError) as error:
+        raise WorkspaceError("Workspace target path cannot be canonicalized") from error
+
+
+def _canonical_target(path: Path) -> Path:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            current.resolve(strict=True)
+    return absolute.resolve(strict=False)
 
 
 def re_sub_path(value: str) -> str:

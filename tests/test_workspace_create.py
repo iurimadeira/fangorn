@@ -12,6 +12,7 @@ from threading import Event
 import pytest
 from git_helpers import git, initialize_repository
 
+from fangorn.git import observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
 from fangorn.workspaces import CreateWorkspace, WorkspaceError, Workspaces
@@ -248,6 +249,15 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
 
     assert new_epoch == old_epoch + 1
     with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.save_cache_entry(
+            "source",
+            path="/stale-cache",
+            repository_generation=None,
+            operation_id=intent.operation_id,
+            lease_epoch=old_epoch,
+        )
+    assert registry.cache_entry("source") is None
+    with pytest.raises(RegistryError, match="Stale operation result"):
         registry.finish_operation_step(
             intent.operation_id,
             position=0,
@@ -271,6 +281,8 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
 def test_proven_dead_workspace_lease_takeover_fences_stale_result(
     tmp_path: Path,
 ) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(
         request_key="workspace-request",
@@ -320,6 +332,20 @@ def test_proven_dead_workspace_lease_takeover_fences_stale_result(
             lease_epoch=old_epoch,
             result={"observation": "ready"},
         )
+    with pytest.raises(RegistryError, match="Stale operation result"):
+        registry.complete_workspace_create(
+            intent=intent,
+            observation=observe_worktree(repository),
+            created_from_sha="a" * 40,
+            configuration=b"",
+            configuration_json="{}",
+            configuration_digest="b" * 64,
+            repository_id="repository",
+            state="ready",
+            lease_epoch=old_epoch,
+        )
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workspaces").fetchone() == (0,)
     assert (
         registry.start_operation_step(
             intent.operation_id,
@@ -433,6 +459,32 @@ sys.stdin.readline()
         child.wait(timeout=5)
 
 
+def test_dead_process_invocation_marker_is_removed(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "registry.sqlite3"
+    script = """
+import json
+import sys
+from pathlib import Path
+from dataclasses import asdict
+from fangorn.registry import Registry
+from fangorn.workspaces import Workspaces
+w = Workspaces(Registry(Path(sys.argv[1])))
+print(json.dumps(asdict(w._invocation_process_identity())))
+"""
+    completed = subprocess.run(  # noqa: S603 -- fixed interpreter and test script
+        [sys.executable, "-c", script, str(database)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    owner = ProcessIdentity(**json.loads(completed.stdout))
+    marker = database.parent / "invocations" / owner.process_instance_id
+    assert marker.exists()
+
+    assert facade(tmp_path)._owner_status(owner) == "dead"
+    assert not marker.exists()
+
+
 def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     created_from_sha = create_repository(repository)
@@ -479,6 +531,54 @@ def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     assert payload["workspace"]["resource_states"] == [
         {"name": "worktree", "provisioning_status": "created"}
     ]
+    payload["workspace"]["definition"]["id"] = "<workspace-id>"
+    payload["workspace"]["definition"]["repository_id"] = "<repository-id>"
+    payload["workspace"]["definition"]["resources"][0]["ownership_token"] = (
+        "<ownership-token>"  # noqa: S105 -- normalized non-secret test placeholder
+    )
+    payload["operation"]["id"] = "<operation-id>"
+    assert payload == {
+        "schema_version": 2,
+        "created": True,
+        "workspace": {
+            "definition": {
+                "id": "<workspace-id>",
+                "parent_id": None,
+                "repository_id": "<repository-id>",
+                "created_from_sha": created_from_sha,
+                "configuration": {
+                    "bytes_base64": "",
+                    "value": {"schema_version": 1},
+                    "digest": (
+                        "e3b0c44298fc1c149afbf4c8996fb924"
+                        "27ae41e4649b934ca495991b7852b855"
+                    ),
+                },
+                "resources": [
+                    {
+                        "name": "worktree",
+                        "kind": "worktree",
+                        "adapter_id": "fangorn.git-worktree",
+                        "adapter_api_major": 1,
+                        "configuration": {},
+                        "external_reference": None,
+                        "locator": str(target.resolve()),
+                        "ownership_token": "<ownership-token>",
+                    }
+                ],
+            },
+            "resource_states": [{"name": "worktree", "provisioning_status": "created"}],
+            "state": "ready",
+            "version": 1,
+            "path": str(target.resolve()),
+            "branch": "cli-topic",
+        },
+        "operation": {
+            "id": "<operation-id>",
+            "kind": "create",
+            "status": "completed",
+        },
+    }
 
     stopped = subprocess.run(  # noqa: S603 -- test controls installed executable
         [
@@ -714,7 +814,8 @@ def test_create_finishing_between_intent_read_and_lease_is_idempotent(
         retried = delayed.result(timeout=10)
 
     assert completed.workspace.state == "ready"
-    assert retried.created is False
+    assert completed.created is False
+    assert retried.created is True
     assert retried.workspace.definition.id == completed.workspace.definition.id
     assert retried.operation.id == completed.operation.id
 
@@ -874,6 +975,28 @@ def test_explicit_target_is_canonicalized_before_definition(tmp_path: Path) -> N
 
     assert created.workspace.path == str((real_parent / "topic").resolve())
     assert retried.workspace.definition.id == created.workspace.definition.id
+
+
+def test_symlink_loop_target_fails_as_workspace_error_before_state(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    first = tmp_path / "loop-a"
+    second = tmp_path / "loop-b"
+    first.symlink_to(second)
+    second.symlink_to(first)
+
+    with pytest.raises(WorkspaceError, match="cannot be canonicalized"):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(repository),
+                branch="loop-target",
+                path=first / "target",
+                headless=True,
+            )
+        )
+    assert not (tmp_path / "state").exists()
 
 
 def test_invalid_git_branch_does_not_poison_target(tmp_path: Path) -> None:

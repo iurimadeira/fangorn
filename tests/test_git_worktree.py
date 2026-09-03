@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from git_helpers import git, initialize_repository
 
-from fangorn.git import GitError
+from fangorn.git import GitError, establish_worktree_generation
 from fangorn.git_worktree import (
     RepositorySource,
     create_worktree,
@@ -15,6 +16,7 @@ from fangorn.git_worktree import (
     read_configuration,
     resolve_commit,
 )
+from fangorn.registry import ProcessIdentity
 
 
 def repository(path: Path) -> str:
@@ -109,6 +111,36 @@ def test_clone_cache_reuses_only_matching_bare_repository(tmp_path: Path) -> Non
         materialize_cache(source, invalid_cache)
 
 
+def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:
+    source_repository = tmp_path / "source"
+    repository(source_repository)
+    cache = tmp_path / "cache" / "repository.git"
+    abandoned = cache.parent / "clone-dead-private"
+    abandoned.mkdir(parents=True)
+    dead = ProcessIdentity("dead", "boot", 1001, "start")
+    (abandoned / "owner.json").write_text(
+        json.dumps(
+            {
+                "process_instance_id": dead.process_instance_id,
+                "boot_identity": dead.boot_identity,
+                "pid": dead.pid,
+                "process_start_identity": dead.process_start_identity,
+            }
+        ),
+        encoding="utf-8",
+    )
+    live = ProcessIdentity("live", "boot", 1002, "start")
+
+    materialize_cache(
+        normalize_repository_source(source_repository.as_uri()),
+        cache,
+        owner=live,
+        owner_status=lambda owner: "dead" if owner == dead else "live",
+    )
+
+    assert not abandoned.exists()
+
+
 def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
@@ -176,6 +208,69 @@ def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -
             expected_branch="topic",
             ownership_token=token,
         )
+
+
+def test_worktree_recovery_never_claims_markerless_final_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    commit = repository(source)
+    unrelated = tmp_path / "unrelated"
+    git(tmp_path, "clone", str(source), str(unrelated))
+    git(unrelated, "checkout", "-b", "topic")
+
+    with pytest.raises(GitError, match="not owned"):
+        create_worktree(
+            source,
+            target=unrelated,
+            branch="topic",
+            commit=commit,
+            ownership_token="d" * 64,
+            reconcile=True,
+        )
+
+
+def test_worktree_recovery_publishes_staged_target_after_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fangorn.git_worktree as adapter
+
+    source = tmp_path / "source"
+    commit = repository(source)
+    target = tmp_path / "target"
+    token = "e" * 64
+    interrupted = False
+
+    def interrupt_once(directory: Path, ownership_token: str) -> str:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise OSError("interrupted before ownership marker")
+        return establish_worktree_generation(directory, ownership_token)
+
+    monkeypatch.setattr(adapter, "establish_worktree_generation", interrupt_once)
+    with pytest.raises(OSError, match="before ownership marker"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit=commit,
+            ownership_token=token,
+            reconcile=False,
+        )
+    assert not target.exists()
+
+    recovered = create_worktree(
+        source,
+        target=target,
+        branch="topic",
+        commit=commit,
+        ownership_token=token,
+        reconcile=True,
+    )
+
+    assert recovered.path == target.resolve()
+    assert recovered.git_dir_generation == token
     with pytest.raises(GitError, match="is absent"):
         inspect_owned_worktree(
             tmp_path / "absent",
