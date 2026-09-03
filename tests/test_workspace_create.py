@@ -1112,6 +1112,25 @@ print(json.dumps(asdict(w._invocation_process_identity())))
     assert not marker.exists()
 
 
+def test_invocation_marker_cleanup_failure_is_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspaces = facade(tmp_path)
+    owner = workspaces._invocation_process_identity()
+    marker = workspaces._invocation_root / owner.process_instance_id
+    original_unlink = Path.unlink
+
+    def fail_marker(path: Path, *args: object, **kwargs: object) -> None:
+        if path == marker:
+            raise OSError("cleanup failed")
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", fail_marker)
+
+    with pytest.raises(WorkspaceError, match="Cannot clean Workspace invocation"):
+        workspaces._finish_invocation(owner)
+
+
 def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     created_from_sha = create_repository(repository)

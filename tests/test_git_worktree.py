@@ -16,7 +16,7 @@ from git_helpers import git, initialize_repository
 
 import fangorn._git_supervisor as git_supervisor
 import fangorn.git_worktree as git_worktree_adapter
-from fangorn.git import GitError, establish_worktree_generation
+from fangorn.git import GitError, establish_worktree_generation, repository_generation
 from fangorn.git_worktree import (
     RepositorySource,
     create_worktree,
@@ -366,6 +366,8 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
             "11",
             "12",
             "13",
+            "14",
+            "123",
             "",
             "-1",
             "cancel",
@@ -436,6 +438,12 @@ def test_supervised_git_rejects_missing_child_handshake(
             return 1
 
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FailedSupervisor())
+    write = os.write
+    monkeypatch.setattr(
+        os,
+        "write",
+        lambda descriptor, value: 1 if value == b"a" else write(descriptor, value),
+    )
     liveness, writer = os.pipe()
     try:
         with pytest.raises(GitError, match="failed before child startup"):
@@ -973,6 +981,29 @@ def test_receipt_staging_cleanup_failure_is_visible(
             git_worktree_adapter._create_staging_receipt(receipt, "a" * 64, descriptor)
     finally:
         os.close(descriptor)
+
+
+def test_preparation_receipt_preserves_write_and_cleanup_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert repository_generation(tmp_path, create=True)
+    monkeypatch.setattr(
+        os, "write", lambda *_args: (_ for _ in ()).throw(OSError("write failed"))
+    )
+    monkeypatch.setattr(
+        Path,
+        "unlink",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+
+    with pytest.raises(
+        GitError,
+        match=(
+            "Repository preparation receipt is unavailable; "
+            "failed to clean receipt staging: cleanup failed"
+        ),
+    ):
+        git_worktree_adapter._write_preparation_receipt(tmp_path, "operation", False)
 
 
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:

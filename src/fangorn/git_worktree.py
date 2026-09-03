@@ -90,14 +90,24 @@ def normalize_repository_source(value: str) -> RepositorySource:
     return RepositorySource(str(common), resolved, None, name or "repository")
 
 
-def resolve_commit(repository: Path, ref: str | None, *, remote: bool = False) -> str:
+def resolve_commit(
+    repository: Path,
+    ref: str | None,
+    *,
+    remote: bool = False,
+    liveness_fd: int | None = None,
+) -> str:
     selected = ref or "HEAD"
     candidates = _remote_ref_candidates(ref) if remote else (selected,)
     error: GitError | None = None
     for candidate in candidates:
         try:
             value = _run_git(
-                repository, "rev-parse", "--verify", f"{candidate}^{{commit}}"
+                repository,
+                "rev-parse",
+                "--verify",
+                f"{candidate}^{{commit}}",
+                liveness_fd=liveness_fd,
             )
         except GitError as candidate_error:
             error = candidate_error
@@ -127,7 +137,11 @@ def validate_branch_name(branch: str) -> None:
 
 
 def read_configuration(
-    repository: Path, commit: str, explicit: Path | None
+    repository: Path,
+    commit: str,
+    explicit: Path | None,
+    *,
+    liveness_fd: int | None = None,
 ) -> bytes | None:
     if explicit is not None:
         try:
@@ -150,7 +164,9 @@ def read_configuration(
                     "Configuration must be a regular non-symlink file"
                 ) from error
             raise GitError(f"Configuration is unavailable: {explicit}") from error
-    result = _run_git_process(repository, "show", f"{commit}:fangorn.toml")
+    result = _run_git_process(
+        repository, "show", f"{commit}:fangorn.toml", liveness_fd=liveness_fd
+    )
     if result.returncode == 0:
         return result.stdout
     if (
@@ -180,7 +196,7 @@ def materialize_cache(
     if owner is not None and owner_status is not None:
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
-        _verify_bare_repository(cache_path, source.normalized)
+        _verify_bare_repository(cache_path, source.normalized, liveness_fd=liveness_fd)
         if repository_generation(cache_path, create=False) is None:
             raise GitError("Repository cache generation marker is missing")
         prepared = preparation_id is not None and _preparation_receipt_matches(
@@ -198,7 +214,7 @@ def materialize_cache(
                 )
         _fsync_directory(cache_path.parent, "Repository cache publication")
         return cache_path
-    require_supported_git(cache_path.parent)
+    require_supported_git(cache_path.parent, liveness_fd=liveness_fd)
     prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
     invocation = Path(tempfile.mkdtemp(prefix=prefix, dir=cache_path.parent))
     clone = invocation / "repository.git"
@@ -228,7 +244,7 @@ def materialize_cache(
         )
         if result.returncode != 0:
             raise GitError(_git_error(result))
-        _verify_bare_repository(clone, source.normalized)
+        _verify_bare_repository(clone, source.normalized, liveness_fd=liveness_fd)
         _refresh_bare_repository(
             clone,
             update_default=refresh_default_head,
@@ -241,7 +257,9 @@ def materialize_cache(
         try:
             os.replace(clone, cache_path)
         except FileExistsError as collision:
-            _verify_bare_repository(cache_path, source.normalized)
+            _verify_bare_repository(
+                cache_path, source.normalized, liveness_fd=liveness_fd
+            )
             if repository_generation(cache_path, create=False) is None:
                 raise GitError(
                     "Repository cache generation marker is missing"
@@ -377,6 +395,7 @@ def _write_preparation_receipt(
     ).encode()
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{receipt.name}.", dir=path)
     temporary = Path(temporary_name)
+    primary_error: GitError | None = None
     try:
         written = 0
         while written < len(payload):
@@ -390,11 +409,26 @@ def _write_preparation_receipt(
         os.replace(temporary, receipt)
         _fsync_directory(path, "Repository preparation receipt")
     except OSError as error:
-        raise GitError("Repository preparation receipt is unavailable") from error
+        primary_error = GitError("Repository preparation receipt is unavailable")
+        raise primary_error from error
     finally:
+        cleanup_errors: list[OSError] = []
         if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            detail = "; ".join(str(error) for error in cleanup_errors)
+            if primary_error is not None:
+                raise GitError(
+                    f"{primary_error}; failed to clean receipt staging: {detail}"
+                ) from primary_error
+            raise GitError("Failed to clean receipt staging") from cleanup_errors[0]
 
 
 def create_worktree(
@@ -415,7 +449,7 @@ def create_worktree(
         if target_kind is not None:
             if target_kind == "symlink" or not reconcile:
                 raise GitError(f"Workspace target path already exists: {target}")
-            observation = observe_worktree(target)
+            observation = observe_worktree(target, liveness_fd=liveness_fd)
             if observation.git_dir_generation != ownership_token:
                 raise GitError("Existing target is not owned by this Workspace create")
             if observation.head != commit or observation.branch != branch:
@@ -424,6 +458,7 @@ def create_worktree(
                 target,
                 create_repository_generation=True,
                 create_worktree_generation=False,
+                liveness_fd=liveness_fd,
             )
             _remove_staging_receipt(receipt, ownership_token, parent.descriptor)
             return result
@@ -445,12 +480,12 @@ def create_worktree(
                     "Workspace staging path already exists without ownership receipt"
                 )
             _create_staging_receipt(receipt, ownership_token, parent.descriptor)
-        _reject_executable_checkout_configuration(repository)
+        _reject_executable_checkout_configuration(repository, liveness_fd=liveness_fd)
         _require_target_parent(parent)
         if staging_kind is not None:
             if staging_kind == "symlink":
                 raise GitError("Workspace staging path is unsafe")
-            observation = observe_worktree(staging)
+            observation = observe_worktree(staging, liveness_fd=liveness_fd)
             if observation.git_dir_generation not in {None, ownership_token}:
                 raise GitError("Staged Worktree belongs to another Workspace create")
             if observation.head != commit or observation.branch not in {None, branch}:
@@ -470,7 +505,12 @@ def create_worktree(
                 raise GitError(_git_error(branch_exists))
             _require_target_parent(parent)
             added = _run_git_process(
-                _required_git_path(repository, "rev-parse", "--absolute-git-dir"),
+                _required_git_path(
+                    repository,
+                    "rev-parse",
+                    "--absolute-git-dir",
+                    liveness_fd=liveness_fd,
+                ),
                 "worktree",
                 "add",
                 "--detach",
@@ -484,9 +524,9 @@ def create_worktree(
             if added.returncode != 0:
                 raise GitError(_git_error(added))
             _require_target_parent(parent)
-            observation = observe_worktree(staging)
+            observation = observe_worktree(staging, liveness_fd=liveness_fd)
         establish_worktree_generation(observation.git_dir, ownership_token)
-        observation = observe_worktree(staging)
+        observation = observe_worktree(staging, liveness_fd=liveness_fd)
         if observation.head != commit or observation.branch != branch:
             branch_exists = _run_git_process(
                 repository,
@@ -520,13 +560,18 @@ def create_worktree(
             if selected.returncode != 0:
                 raise GitError(_git_error(selected))
             _require_target_parent(parent)
-            observation = observe_worktree(staging)
+            observation = observe_worktree(staging, liveness_fd=liveness_fd)
             if observation.head != commit or observation.branch != branch:
                 raise GitError("Staged Worktree does not match the interrupted create")
         _fsync_descriptor(parent.descriptor, "Workspace staging publication")
         _require_target_parent(parent)
         moved = _run_git_process(
-            _required_git_path(repository, "rev-parse", "--absolute-git-dir"),
+            _required_git_path(
+                repository,
+                "rev-parse",
+                "--absolute-git-dir",
+                liveness_fd=liveness_fd,
+            ),
             "worktree",
             "move",
             staging.name,
@@ -545,6 +590,7 @@ def create_worktree(
             target,
             create_repository_generation=True,
             create_worktree_generation=False,
+            liveness_fd=liveness_fd,
         )
         _remove_staging_receipt(receipt, ownership_token, parent.descriptor)
         return result
@@ -552,7 +598,9 @@ def create_worktree(
         os.close(parent.descriptor)
 
 
-def _reject_executable_checkout_configuration(repository: Path) -> None:
+def _reject_executable_checkout_configuration(
+    repository: Path, *, liveness_fd: int | None = None
+) -> None:
     configured = _run_git_process(
         repository,
         "config",
@@ -560,6 +608,7 @@ def _reject_executable_checkout_configuration(repository: Path) -> None:
         "--local",
         "--name-only",
         "--list",
+        liveness_fd=liveness_fd,
     )
     if configured.returncode != 0:
         raise GitError(_git_error(configured))
@@ -775,10 +824,11 @@ def inspect_owned_worktree(
     expected_commit: str | None,
     expected_branch: str | None,
     ownership_token: str | None = None,
+    liveness_fd: int | None = None,
 ) -> WorktreeObservation:
     if not target.exists():
         raise GitError(f"Worktree Resource is absent: {target}")
-    observation = observe_worktree(target)
+    observation = observe_worktree(target, liveness_fd=liveness_fd)
     if expected_commit is not None and observation.head != expected_commit:
         raise GitError("Worktree Resource does not match its immutable definition")
     if expected_branch is not None and observation.branch != expected_branch:
@@ -791,16 +841,20 @@ def inspect_owned_worktree(
     return observation
 
 
-def _verify_bare_repository(path: Path, normalized_source: str) -> None:
+def _verify_bare_repository(
+    path: Path, normalized_source: str, *, liveness_fd: int | None = None
+) -> None:
     try:
-        bare = _run_git(path, "rev-parse", "--is-bare-repository")
+        bare = _run_git(
+            path, "rev-parse", "--is-bare-repository", liveness_fd=liveness_fd
+        )
     except GitError as error:
         raise GitError(
             f"Repository cache entry is not a bare repository: {path}"
         ) from error
     if bare != "true":
         raise GitError(f"Repository cache entry is not a bare repository: {path}")
-    origin = _run_git(path, "remote", "get-url", "origin")
+    origin = _run_git(path, "remote", "get-url", "origin", liveness_fd=liveness_fd)
     try:
         observed = normalize_repository_source(origin).normalized
     except GitError as error:
@@ -809,16 +863,18 @@ def _verify_bare_repository(path: Path, normalized_source: str) -> None:
         raise GitError("Repository cache entry belongs to another source")
 
 
-def _required_git_path(path: Path, *arguments: str) -> Path:
-    value = _run_git(path, *arguments)
+def _required_git_path(
+    path: Path, *arguments: str, liveness_fd: int | None = None
+) -> Path:
+    value = _run_git(path, *arguments, liveness_fd=liveness_fd)
     try:
         return Path(value).resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise GitError("Git reported an unavailable repository path") from error
 
 
-def _run_git(path: Path, *arguments: str) -> str:
-    result = _run_git_process(path, *arguments)
+def _run_git(path: Path, *arguments: str, liveness_fd: int | None = None) -> str:
+    result = _run_git_process(path, *arguments, liveness_fd=liveness_fd)
     if result.returncode != 0:
         raise GitError(_git_error(result))
     return result.stdout.decode("utf-8", errors="replace").strip()
@@ -885,6 +941,8 @@ def _run_supervised_git(
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
     completion_read, completion_write = os.pipe()
+    anchor_control_read, anchor_control_write = os.pipe()
+    anchor: subprocess.Popen[bytes] | None = None
     process: subprocess.Popen[bytes] | None = None
     process_group: int | None = None
     settled = False
@@ -897,6 +955,24 @@ def _run_supervised_git(
                         signal.SIG_BLOCK, {signal.SIGINT}
                     )
                     try:
+                        anchor = subprocess.Popen(  # noqa: S603 -- fixed watchdog argv
+                            [
+                                sys.executable,
+                                "-I",
+                                str(Path(__file__).with_name("_git_anchor.py")),
+                                str(anchor_control_read),
+                                str(liveness_fd),
+                                str(GIT_EFFECT_TIMEOUT_SECONDS),
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            pass_fds=(anchor_control_read, liveness_fd),
+                            process_group=0,
+                        )
+                        os.close(anchor_control_read)
+                        anchor_control_read = -1
+                        os.write(anchor_control_write, b"a")
                         supervisor = [
                             sys.executable,
                             "-I",
@@ -905,6 +981,8 @@ def _run_supervised_git(
                             str(status_write),
                             str(completion_write),
                             str(liveness_fd),
+                            str(anchor_control_write),
+                            str(anchor.pid),
                             ",".join(str(descriptor) for descriptor in extra_fds),
                             str(
                                 working_directory_fd
@@ -926,29 +1004,34 @@ def _run_supervised_git(
                                 status_write,
                                 completion_write,
                                 liveness_fd,
+                                anchor_control_write,
                                 *extra_fds,
                             ),
                             process_group=0,
                         )
+                        process_group = anchor.pid
                         os.close(control_read)
                         control_read = -1
                         os.close(status_write)
                         status_write = -1
                         os.close(completion_write)
                         completion_write = -1
+                        os.close(anchor_control_write)
+                        anchor_control_write = -1
                     finally:
                         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                     child_pid = _read_supervisor_pid(status_read)
                     if child_pid is None:
                         raise GitError("Git supervisor failed before child startup")
-                    process_group = child_pid
                     returncode = _read_supervisor_completion(completion_read)
                     if returncode is None:
                         _cancel_process_group(process_group)
                         process.wait()
+                        anchor.wait()
                         settled = True
                         raise GitError("Git supervisor failed before completion")
                     process.wait()
+                    anchor.wait()
                     settled = True
                 except BaseException:
                     for descriptor in (control_read, status_write, completion_write):
@@ -962,6 +1045,11 @@ def _run_supervised_git(
                         if completion is None and process_group is not None:
                             _cancel_process_group(process_group)
                         process.wait()
+                    if anchor is not None and not settled:
+                        with suppress(OSError):
+                            os.close(anchor_control_write)
+                        _cancel_process_group(anchor.pid)
+                        anchor.wait()
                     raise
             stdout.seek(0)
             stderr.seek(0)
@@ -979,6 +1067,8 @@ def _run_supervised_git(
             status_write,
             completion_read,
             completion_write,
+            anchor_control_read,
+            anchor_control_write,
         ):
             if descriptor >= 0:
                 with suppress(OSError):

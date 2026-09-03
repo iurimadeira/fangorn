@@ -16,28 +16,32 @@ def main() -> int:
     status = int(sys.argv[2])
     completion = int(sys.argv[3])
     liveness = int(sys.argv[4])
+    anchor_control = int(sys.argv[5])
     os.fstat(liveness)
-    inherited = tuple(int(value) for value in sys.argv[5].split(",") if value)
-    working_directory = int(sys.argv[6])
-    finish_on_owner_exit = sys.argv[7] == "finish"
-    timeout = int(sys.argv[8])
-    output_limit = int(sys.argv[9])
+    process_group = int(sys.argv[6])
+    inherited = tuple(int(value) for value in sys.argv[7].split(",") if value)
+    working_directory = int(sys.argv[8])
+    finish_on_owner_exit = sys.argv[9] == "finish"
+    timeout = int(sys.argv[10])
+    output_limit = int(sys.argv[11])
     try:
         result = _supervise(
             control,
             status,
             liveness,
+            process_group,
             inherited,
             working_directory,
             finish_on_owner_exit,
             timeout,
             output_limit,
-            sys.argv[10:],
+            sys.argv[12:],
         )
         with suppress(BrokenPipeError):
             os.write(completion, f"{result}\n".encode("ascii"))
         return result
     finally:
+        os.close(anchor_control)
         os.close(completion)
 
 
@@ -45,6 +49,7 @@ def _supervise(
     control: int,
     status: int,
     liveness: int,
+    process_group: int,
     inherited: tuple[int, ...],
     working_directory: int,
     finish_on_owner_exit: bool,
@@ -55,7 +60,7 @@ def _supervise(
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
         command,
         pass_fds=(liveness, *inherited),
-        process_group=0,
+        process_group=process_group,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         preexec_fn=(
@@ -68,7 +73,6 @@ def _supervise(
         pass
     finally:
         os.close(status)
-    process_group = child.pid
     if child.stdout is None or child.stderr is None:
         raise RuntimeError("Git capture pipes are unavailable")
     captures = {

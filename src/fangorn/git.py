@@ -5,7 +5,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -72,9 +71,9 @@ GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
 
-def require_supported_git(path: Path) -> None:
+def require_supported_git(path: Path, *, liveness_fd: int | None = None) -> None:
     """Reject mutation when the process Git does not meet Fangorn's minimum."""
-    _require_supported_git(path)
+    _require_supported_git(path, liveness_fd=liveness_fd)
 
 
 def establish_worktree_generation(directory: Path, ownership_token: str) -> str:
@@ -99,27 +98,11 @@ def _run_git(
     path: Path,
     *arguments: str,
     allowed_exit_codes: frozenset[int] = frozenset(),
+    liveness_fd: int | None = None,
 ) -> str | None:
-    environment = os.environ.copy()
-    for name in REPOSITORY_LOCAL_ENVIRONMENT:
-        environment.pop(name, None)
-    try:
-        result = subprocess.run(  # noqa: S603 -- fixed Git argv, no shell
-            [  # noqa: S607 -- Git lookup intentionally follows process PATH
-                "git",
-                "-C",
-                str(path),
-                *arguments,
-            ],
-            check=False,
-            capture_output=True,
-            env=environment,
-        )
-    except FileNotFoundError as error:
-        raise GitError("Git executable was not found") from error
-    except OSError as error:
-        detail = error.strerror or str(error)
-        raise GitError(f"Cannot run Git: {detail}") from error
+    from fangorn.git_worktree import _run_git_process
+
+    result = _run_git_process(path, *arguments, liveness_fd=liveness_fd)
 
     if result.returncode in allowed_exit_codes:
         return None
@@ -138,6 +121,7 @@ def observe_worktree(
     create_repository_generation: bool | None = None,
     create_worktree_generation: bool | None = None,
     reserve_observation: Callable[[], int] | None = None,
+    liveness_fd: int | None = None,
 ) -> WorktreeObservation:
     requested_path = _resolve_requested_path(path)
     last_failure: GitError | None = None
@@ -152,18 +136,21 @@ def observe_worktree(
             and create_worktree_generation == create_generation
         ):
             return _capture_snapshot(
-                requested_path, create_generation=create_generation
+                requested_path,
+                create_generation=create_generation,
+                liveness_fd=liveness_fd,
             )
         return _capture_snapshot(
             requested_path,
             create_repository_generation=create_repository_generation,
             create_worktree_generation=create_worktree_generation,
+            liveness_fd=liveness_fd,
         )
 
     for _ in range(OBSERVATION_ATTEMPTS):
         observed_at = _timestamp()
         try:
-            _require_supported_git(requested_path)
+            _require_supported_git(requested_path, liveness_fd=liveness_fd)
             first = capture()
             observation_token = (
                 reserve_observation() if reserve_observation is not None else None
@@ -216,17 +203,28 @@ def _capture_snapshot(
     create_generation: bool = False,
     create_repository_generation: bool | None = None,
     create_worktree_generation: bool | None = None,
+    liveness_fd: int | None = None,
 ) -> _Snapshot:
     if create_repository_generation is None:
         create_repository_generation = create_generation
     if create_worktree_generation is None:
         create_worktree_generation = create_generation
-    inside = _run_git(requested_path, "rev-parse", "--is-inside-work-tree")
+    inside = _run_git(
+        requested_path,
+        "rev-parse",
+        "--is-inside-work-tree",
+        liveness_fd=liveness_fd,
+    )
     if inside != "true":
         raise GitError(f"Path is not inside a Git worktree: {requested_path}")
 
     worktree_path = _required_path(
-        _run_git(requested_path, "rev-parse", "--show-toplevel"),
+        _run_git(
+            requested_path,
+            "rev-parse",
+            "--show-toplevel",
+            liveness_fd=liveness_fd,
+        ),
         "worktree path",
     )
     common_dir = _required_path(
@@ -235,6 +233,7 @@ def _capture_snapshot(
             "rev-parse",
             "--path-format=absolute",
             "--git-common-dir",
+            liveness_fd=liveness_fd,
         ),
         "Git common directory",
     )
@@ -244,6 +243,7 @@ def _capture_snapshot(
             "rev-parse",
             "--path-format=absolute",
             "--git-dir",
+            liveness_fd=liveness_fd,
         ),
         "Git administrative directory",
     )
@@ -268,6 +268,7 @@ def _capture_snapshot(
         "--short",
         "HEAD",
         allowed_exit_codes=frozenset({1}),
+        liveness_fd=liveness_fd,
     )
     head = _run_git(
         requested_path,
@@ -276,6 +277,7 @@ def _capture_snapshot(
         "--quiet",
         "HEAD",
         allowed_exit_codes=frozenset({1}),
+        liveness_fd=liveness_fd,
     )
     repository_generation_after = _generation(
         common_dir,
@@ -326,8 +328,8 @@ def _required_path(value: str | None, label: str) -> Path:
         raise GitError(f"Git reported an invalid {label}: {value}") from error
 
 
-def _require_supported_git(path: Path) -> None:
-    reported = _run_git(path, "--version")
+def _require_supported_git(path: Path, *, liveness_fd: int | None = None) -> None:
+    reported = _run_git(path, "--version", liveness_fd=liveness_fd)
     if reported is None:
         raise GitError("Cannot determine Git version; Git 2.31 or newer is required")
     match = re.match(r"git version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", reported)

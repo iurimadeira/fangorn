@@ -8,6 +8,7 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import tomllib
 from contextlib import suppress
 from dataclasses import dataclass
@@ -274,11 +275,17 @@ class Workspaces:
                             repository,
                             request.base,
                             remote=source.clone_url is not None,
+                            liveness_fd=self._invocation_descriptor(owner),
                         ),
                         workspace_id=intent.workspace_id,
                         lease_epoch=lease_epoch,
                     )
-                loaded_configuration = read_configuration(repository, commit, config)
+                loaded_configuration = read_configuration(
+                    repository,
+                    commit,
+                    config,
+                    liveness_fd=self._invocation_descriptor(owner),
+                )
                 configuration_value = _configuration_value(loaded_configuration)
                 configuration = loaded_configuration or b""
                 resource_token = secrets.token_hex(32)
@@ -368,6 +375,7 @@ class Workspaces:
                 expected_commit=commit,
                 expected_branch=request.branch,
                 ownership_token=ownership_token,
+                liveness_fd=self._invocation_descriptor(owner),
             )
             state = finish_create(
                 (LifecycleResource("worktree", "worktree"),),
@@ -426,7 +434,13 @@ class Workspaces:
             raise
         finally:
             if owner is not None:
-                self._finish_invocation(owner)
+                try:
+                    self._finish_invocation(owner)
+                except WorkspaceError as cleanup_error:
+                    active = sys.exception()
+                    if active is not None and active is not cleanup_error:
+                        raise WorkspaceError(f"{active}; {cleanup_error}") from active
+                    raise
 
     def list(self) -> list[Workspace]:
         try:
@@ -634,22 +648,42 @@ class Workspaces:
         if held is None:
             return
         descriptor, marker = held
-        with suppress(OSError):
+        errors: list[OSError] = []
+        try:
             os.close(descriptor)
+        except OSError as error:
+            errors.append(error)
         try:
             cleanup = os.open(marker, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
-        except OSError:
+        except FileNotFoundError:
+            if errors:
+                raise WorkspaceError(
+                    "Cannot close Workspace invocation marker"
+                ) from errors[0]
             return
+        except OSError as error:
+            raise WorkspaceError("Cannot clean Workspace invocation marker") from error
         try:
             try:
                 fcntl.flock(cleanup, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                if errors:
+                    raise WorkspaceError(
+                        "Cannot close Workspace invocation marker"
+                    ) from errors[0]
                 return
             marker.unlink()
-        except OSError:
-            pass
+        except OSError as error:
+            errors.append(error)
         finally:
-            os.close(cleanup)
+            try:
+                os.close(cleanup)
+            except OSError as error:
+                errors.append(error)
+        if errors:
+            raise WorkspaceError(
+                "Cannot clean Workspace invocation marker"
+            ) from errors[0]
 
     @staticmethod
     def _invocation_descriptor(owner: ProcessIdentity) -> int:
