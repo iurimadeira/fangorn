@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import pwd
 import select
 import shutil
 import signal
@@ -234,6 +233,34 @@ def test_interrupted_refresh_is_replayed_without_completion_receipt(
     materialize_cache(source, cache, preparation_id="retry")
 
     assert fetches == 2
+
+
+def test_repository_refresh_disables_automatic_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def run(_path: Path, *arguments: str, **_kwargs: object) -> object:
+        calls.append(arguments)
+        return subprocess.CompletedProcess([], 0, b"", b"")
+
+    monkeypatch.setattr(git_worktree_adapter, "_run_git_process", run)
+
+    git_worktree_adapter._refresh_bare_repository(
+        tmp_path, update_default=False, liveness_fd=None
+    )
+
+    assert calls == [
+        (
+            "fetch",
+            "--no-auto-maintenance",
+            "--prune",
+            "--prune-tags",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+            "+refs/tags/*:refs/tags/*",
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2404,19 +2431,13 @@ def test_worktree_creation_rejects_shared_repository_configuration(
     assert not (tmp_path / "target").exists()
 
 
-def test_worktree_creation_rejects_configuration_writable_by_shared_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_worktree_creation_rejects_group_writable_configuration(
+    tmp_path: Path,
 ) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
     configured = source / ".git" / "config"
     configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
-
-    class OtherAccount:
-        pw_uid = os.geteuid() + 1
-        pw_gid = configured.stat().st_gid
-
-    monkeypatch.setattr(pwd, "getpwall", lambda: [OtherAccount()])
 
     with pytest.raises(GitError, match="checkout configuration is unsafe"):
         create_worktree(

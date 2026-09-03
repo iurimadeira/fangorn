@@ -598,6 +598,7 @@ def _refresh_bare_repository(
     fetched = _run_git_process(
         path,
         "fetch",
+        "--no-auto-maintenance",
         "--prune",
         "--prune-tags",
         "origin",
