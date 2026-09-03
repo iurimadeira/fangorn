@@ -6,6 +6,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from fangorn.git import (
     WorktreeObservation,
     establish_worktree_generation,
     observe_worktree,
+    repository_generation,
     require_supported_git,
 )
 
@@ -188,16 +190,18 @@ def materialize_cache(
         if result.returncode != 0:
             raise GitError(_git_error(result))
         _verify_bare_repository(clone, source.normalized)
+        _refresh_bare_repository(
+            clone,
+            update_default=refresh_default_head,
+            liveness_fd=liveness_fd,
+        )
+        if repository_generation(clone, create=True) is None:
+            raise GitError("Repository cache generation marker is unavailable")
         try:
             os.replace(clone, cache_path)
         except FileExistsError:
             _verify_bare_repository(cache_path, source.normalized)
         _fsync_directory(cache_path.parent, "Repository cache publication")
-        _refresh_bare_repository(
-            cache_path,
-            update_default=refresh_default_head,
-            liveness_fd=liveness_fd,
-        )
         return cache_path
     finally:
         if invocation.parent == cache_path.parent and invocation.name.startswith(
@@ -555,18 +559,37 @@ def _run_git_process(
     environment["LANG"] = "C"
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
+    control_read: int | None = None
+    control_write: int | None = None
+    supervised = command
+    inherited: tuple[int, ...] = ()
+    if liveness_fd is not None:
+        control_read, control_write = os.pipe()
+        supervised = [
+            sys.executable,
+            "-m",
+            "fangorn._git_supervisor",
+            str(control_read),
+            *command,
+        ]
+        inherited = (control_read, liveness_fd)
     try:
         return subprocess.run(  # noqa: S603
-            command,
+            supervised,
             check=False,
             capture_output=True,
             env=environment,
-            pass_fds=(liveness_fd,) if liveness_fd is not None else (),
+            pass_fds=inherited,
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
     except OSError as error:
         raise GitError(f"Cannot run Git: {error}") from error
+    finally:
+        if control_read is not None:
+            os.close(control_read)
+        if control_write is not None:
+            os.close(control_write)
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:

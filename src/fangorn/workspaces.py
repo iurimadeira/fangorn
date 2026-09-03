@@ -256,7 +256,8 @@ class Workspaces:
                 source,
                 intent,
                 owner,
-                refresh_default_head=request.base is None,
+                refresh_default_head=request.base
+                in {None, "HEAD", "origin/HEAD", "refs/remotes/origin/HEAD"},
             )
             if intent.resolved_json is None:
                 commit = intent.resolved_sha
@@ -770,8 +771,8 @@ def _configuration_value(content: bytes) -> dict[str, object]:
     if value.get("services"):
         raise WorkspaceError("Service Resources are not available in this release")
     try:
-        json.dumps(value, sort_keys=True)
-    except TypeError as error:
+        json.dumps(value, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as error:
         raise WorkspaceError(
             "fangorn.toml contains a value unsupported by schema-2 JSON"
         ) from error

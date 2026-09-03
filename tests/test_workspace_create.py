@@ -434,6 +434,23 @@ def test_clone_create_resolves_remote_branch_spellings_without_remote_head(
     assert result.workspace.definition.created_from_sha == expected
 
 
+@pytest.mark.parametrize("base", ["HEAD", "origin/HEAD", "refs/remotes/origin/HEAD"])
+def test_clone_create_resolves_remote_head_spellings(tmp_path: Path, base: str) -> None:
+    repository = tmp_path / "repository"
+    expected = create_repository(repository)
+
+    result = facade(tmp_path).create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch=base.replace("/", "-").lower(),
+            base=base,
+            path=tmp_path / "worktrees" / base.replace("/", "-"),
+        )
+    )
+
+    assert result.workspace.definition.created_from_sha == expected
+
+
 def test_clone_create_refreshes_moved_and_deleted_tags(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     first_sha = create_repository(repository)
@@ -669,6 +686,55 @@ def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
         )
         == "unknown"
     )
+
+
+def test_cache_entry_and_step_completion_roll_back_together(tmp_path: Path) -> None:
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    intent, _ = registry.begin_create_intent(
+        request_key="atomic-cache",
+        request_id=None,
+        request_json="{}",
+        target_path=str(tmp_path / "target"),
+        workspace_id="workspace",
+        operation_id="operation",
+        prepare_cache=True,
+    )
+    epoch = registry.acquire_lease(
+        scope_kind="repository",
+        scope_key="source",
+        operation_id=intent.operation_id,
+        owner=ProcessIdentity("owner", "boot", 1001, "start"),
+        owner_status=lambda _owner: "live",
+    )
+    registry.start_operation_step(
+        intent.operation_id,
+        position=0,
+        scope_kind="repository",
+        scope_key="source",
+        lease_epoch=epoch,
+    )
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_cache_step BEFORE UPDATE ON operation_steps "
+            "BEGIN SELECT RAISE(ABORT, 'injected step failure'); END"
+        )
+
+    with pytest.raises(RegistryError, match="injected step failure"):
+        registry.finish_cache_preparation(
+            "source",
+            path="/cache",
+            repository_generation="a" * 64,
+            operation_id=intent.operation_id,
+            lease_epoch=epoch,
+        )
+
+    assert registry.cache_entry("source") is None
+    with sqlite3.connect(registry.path) as connection:
+        assert connection.execute(
+            "SELECT status FROM operation_steps "
+            "WHERE operation_id = ? AND position = 0",
+            (intent.operation_id,),
+        ).fetchone() == ("running",)
 
 
 def test_proven_dead_workspace_lease_takeover_fences_stale_result(
@@ -1690,6 +1756,8 @@ def test_create_rejects_unsupported_definition_before_state(
             "schema_version = 1\nrelease_date = 2026-09-02\n",
             "unsupported by schema-2 JSON",
         ),
+        ("schema_version = 1\nlimit = inf\n", "unsupported by schema-2 JSON"),
+        ("schema_version = 1\nlimit = nan\n", "unsupported by schema-2 JSON"),
     ],
 )
 def test_create_rejects_configuration_outside_f2_scope(
