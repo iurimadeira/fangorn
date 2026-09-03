@@ -102,7 +102,13 @@ def _run_git(
 ) -> str | None:
     from fangorn.git_worktree import _run_git_process
 
-    result = _run_git_process(path, *arguments, liveness_fd=liveness_fd)
+    result = _run_git_process(
+        path,
+        *arguments,
+        liveness_fd=liveness_fd,
+        disable_hooks=False,
+        isolate_config=False,
+    )
 
     if result.returncode in allowed_exit_codes:
         return None
@@ -135,10 +141,20 @@ def observe_worktree(
             create_repository_generation == create_generation
             and create_worktree_generation == create_generation
         ):
+            if liveness_fd is None:
+                return _capture_snapshot(
+                    requested_path, create_generation=create_generation
+                )
             return _capture_snapshot(
                 requested_path,
                 create_generation=create_generation,
                 liveness_fd=liveness_fd,
+            )
+        if liveness_fd is None:
+            return _capture_snapshot(
+                requested_path,
+                create_repository_generation=create_repository_generation,
+                create_worktree_generation=create_worktree_generation,
             )
         return _capture_snapshot(
             requested_path,

@@ -476,6 +476,19 @@ def test_supervisor_pid_reader_completes_short_pipe_reads(
     assert git_worktree_adapter._read_supervisor_pid(10) == 123
 
 
+def test_supervisor_pid_reader_returns_without_waiting_for_pipe_close() -> None:
+    read, write = os.pipe()
+    try:
+        os.write(write, b"123\n")
+        started = time.monotonic()
+
+        assert git_worktree_adapter._read_supervisor_pid(read) == 123
+        assert time.monotonic() - started < 0.1
+    finally:
+        os.close(read)
+        os.close(write)
+
+
 def test_supervisor_pid_reader_rejects_eof_before_newline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

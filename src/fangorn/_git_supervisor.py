@@ -25,18 +25,23 @@ def main() -> int:
     timeout = int(sys.argv[10])
     output_limit = int(sys.argv[11])
     try:
-        result = _supervise(
-            control,
-            status,
-            liveness,
-            process_group,
-            inherited,
-            working_directory,
-            finish_on_owner_exit,
-            timeout,
-            output_limit,
-            sys.argv[12:],
-        )
+        try:
+            result = _supervise(
+                control,
+                status,
+                liveness,
+                process_group,
+                inherited,
+                working_directory,
+                finish_on_owner_exit,
+                timeout,
+                output_limit,
+                sys.argv[12:],
+            )
+        except OSError as error:
+            with suppress(OSError):
+                os.write(status, f"!{error.errno}\n".encode("ascii"))
+            return 127
         with suppress(BrokenPipeError):
             os.write(completion, f"{result}\n".encode("ascii"))
         return result

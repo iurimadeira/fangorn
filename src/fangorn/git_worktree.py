@@ -888,21 +888,25 @@ def _run_git_process(
     finish_on_parent_exit: bool = False,
     extra_fds: tuple[int, ...] = (),
     working_directory_fd: int | None = None,
+    disable_hooks: bool = True,
+    isolate_config: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
     command = ["git"]
     if git_dir:
         command.append(f"--git-dir={path}")
     else:
         command.extend(("-C", str(path)))
-    command.extend(("-c", "core.hooksPath=/dev/null"))
+    if disable_hooks:
+        command.extend(("-c", "core.hooksPath=/dev/null"))
     command.extend(arguments)
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
     environment["LANG"] = "C"
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    if isolate_config:
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = os.devnull
     owned_liveness: tuple[int, int] | None = None
     try:
         if liveness_fd is None:
@@ -919,7 +923,7 @@ def _run_git_process(
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
     except OSError as error:
-        raise GitError(f"Cannot run Git: {error}") from error
+        raise GitError(f"Cannot run Git: {error.strerror or error}") from error
     finally:
         if owned_liveness is not None:
             for descriptor in owned_liveness:
@@ -1116,7 +1120,11 @@ def _supervisor_pid(value: bytes) -> int | None:
 
 
 def _read_supervisor_pid(descriptor: int) -> int | None:
-    return _supervisor_pid(_read_pipe_frame(descriptor, 11))
+    value = _read_pipe_frame(descriptor, 11)
+    if match := re.fullmatch(rb"!([0-9]{1,3})\n", value):
+        number = int(match[1])
+        raise OSError(number, os.strerror(number))
+    return _supervisor_pid(value)
 
 
 def _read_supervisor_completion(descriptor: int) -> int | None:
@@ -1129,11 +1137,27 @@ def _read_supervisor_completion(descriptor: int) -> int | None:
 
 def _read_pipe_frame(descriptor: int, limit: int) -> bytes:
     value = bytearray()
-    while len(value) <= limit:
+    reached_eof = False
+    while len(value) <= limit and b"\n" not in value:
         chunk = os.read(descriptor, limit + 1 - len(value))
         if not chunk:
+            reached_eof = True
             break
         value.extend(chunk)
+    if reached_eof:
+        return bytes(value)
+    blocking: bool | None = None
+    try:
+        blocking = os.get_blocking(descriptor)
+        os.set_blocking(descriptor, False)
+    except OSError:
+        pass
+    try:
+        with suppress(BlockingIOError):
+            value.extend(os.read(descriptor, limit + 1 - len(value)))
+    finally:
+        if blocking:
+            os.set_blocking(descriptor, True)
     return bytes(value)
 
 
