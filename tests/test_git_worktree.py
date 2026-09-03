@@ -202,11 +202,16 @@ def test_interrupted_refresh_is_replayed_without_completion_receipt(
 
 
 @pytest.mark.parametrize(
-    ("finish_on_parent_exit", "expected"),
-    [(False, "terminated"), (True, "completed")],
+    ("finish_on_parent_exit", "kill_target", "expected"),
+    [
+        (False, "owner", "terminated"),
+        (True, "owner", "completed"),
+        (False, "supervisor", "terminated"),
+        (True, "supervisor", "completed"),
+    ],
 )
 def test_interrupted_owner_waits_for_supervised_git_before_releasing_lease(
-    tmp_path: Path, finish_on_parent_exit: bool, expected: str
+    tmp_path: Path, finish_on_parent_exit: bool, kill_target: str, expected: str
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -285,7 +290,18 @@ finally:
         time.sleep(0.01)
     assert started.exists()
 
-    child.send_signal(signal.SIGINT)
+    if kill_target == "owner":
+        child.send_signal(signal.SIGINT)
+    else:
+        children = Path(f"/proc/{child.pid}/task/{child.pid}/children")
+        deadline = time.monotonic() + 5
+        supervisor_pid = ""
+        while not supervisor_pid and time.monotonic() < deadline:
+            supervisor_pid = children.read_text(encoding="ascii").strip()
+            if not supervisor_pid:
+                time.sleep(0.01)
+        assert supervisor_pid
+        os.kill(int(supervisor_pid), signal.SIGKILL)
     registry = Registry(database)
     checker = Workspaces(registry)
     with pytest.raises(RegistryError, match="mutation is busy"):

@@ -6,14 +6,18 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from threading import Thread
+from typing import TYPE_CHECKING, BinaryIO, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from fangorn.git import (
@@ -653,19 +657,24 @@ def _run_git_process(
         environment.pop(name, None)
     control_read: int | None = None
     control_write: int | None = None
+    status_read: int | None = None
+    status_write: int | None = None
     supervised = command
     inherited: tuple[int, ...] = ()
     if liveness_fd is not None:
         control_read, control_write = os.pipe()
+        status_read, status_write = os.pipe()
         supervised = [
             sys.executable,
             "-I",
             str(Path(__file__).with_name("_git_supervisor.py")),
             str(control_read),
             "finish" if finish_on_parent_exit else "cancel",
+            str(status_write),
+            str(liveness_fd),
             *command,
         ]
-        inherited = (control_read, liveness_fd)
+        inherited = (control_read, status_write, liveness_fd)
     try:
         if liveness_fd is None:
             return subprocess.run(  # noqa: S603
@@ -682,16 +691,44 @@ def _run_git_process(
             pass_fds=inherited,
             start_new_session=liveness_fd is not None,
         )
+        if status_write is not None:
+            os.close(status_write)
+            status_write = None
+        if status_read is None:
+            raise GitError("Git supervisor status pipe is unavailable")
+        child_pid_value = os.read(status_read, 32).strip()
+        child_pid = int(child_pid_value) if child_pid_value.isdigit() else None
+        stdout_parts: list[bytes] = []
+        stderr_parts: list[bytes] = []
+        stdout_pipe = cast(BinaryIO, process.stdout)
+        stderr_pipe = cast(BinaryIO, process.stderr)
+        readers = (
+            Thread(target=_read_pipe, args=(stdout_pipe, stdout_parts)),
+            Thread(target=_read_pipe, args=(stderr_pipe, stderr_parts)),
+        )
+        for reader in readers:
+            reader.start()
         try:
-            stdout, stderr = process.communicate()
+            process.wait()
         except BaseException:
             if control_write is not None:
                 os.close(control_write)
                 control_write = None
-            process.communicate()
+            process.wait()
+            if process.returncode < 0 and child_pid is not None:
+                _settle_orphaned_git(child_pid, finish=finish_on_parent_exit)
+            for reader in readers:
+                reader.join()
             raise
+        if process.returncode < 0 and child_pid is not None:
+            _settle_orphaned_git(child_pid, finish=finish_on_parent_exit)
+        for reader in readers:
+            reader.join()
         return subprocess.CompletedProcess(
-            supervised, process.returncode, stdout, stderr
+            supervised,
+            process.returncode,
+            b"".join(stdout_parts),
+            b"".join(stderr_parts),
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
@@ -702,6 +739,43 @@ def _run_git_process(
             os.close(control_read)
         if control_write is not None:
             os.close(control_write)
+        if status_read is not None:
+            os.close(status_read)
+        if status_write is not None:
+            os.close(status_write)
+
+
+def _settle_orphaned_git(process_group: int, *, finish: bool) -> None:
+    if not finish:
+        with suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if not _process_group_leader_running(process_group):
+                return
+            time.sleep(0.01)
+        with suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+    while True:
+        if not _process_group_leader_running(process_group):
+            return
+        time.sleep(0.01)
+
+
+def _read_pipe(pipe: BinaryIO, output: list[bytes]) -> None:
+    output.append(pipe.read())
+
+
+def _process_group_leader_running(process_group: int) -> bool:
+    try:
+        fields = Path(f"/proc/{process_group}/stat").read_text(encoding="ascii").split()
+    except (FileNotFoundError, OSError):
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    return len(fields) > 2 and fields[2] != "Z"
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:

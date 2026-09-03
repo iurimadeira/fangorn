@@ -1793,15 +1793,19 @@ def test_create_rejects_unsupported_definition_before_state(
         ("schema_version = 1\nservices = false\n", "services must be a table"),
         ("schema_version = 1\nservices = ''\n", "services must be a table"),
         (
+            "schema_version = 1\n[servcies.app]\nadapter = 'fangorn.command'\n",
+            "unsupported top-level key: servcies",
+        ),
+        (
             "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
             "Service Resources are not available",
         ),
         (
             "schema_version = 1\nrelease_date = 2026-09-02\n",
-            "unsupported by schema-2 JSON",
+            "unsupported top-level key: release_date",
         ),
-        ("schema_version = 1\nlimit = inf\n", "unsupported by schema-2 JSON"),
-        ("schema_version = 1\nlimit = nan\n", "unsupported by schema-2 JSON"),
+        ("schema_version = 1\nlimit = inf\n", "unsupported top-level key: limit"),
+        ("schema_version = 1\nlimit = nan\n", "unsupported top-level key: limit"),
     ],
 )
 def test_create_rejects_configuration_outside_f2_scope(
@@ -1862,4 +1866,4 @@ def test_cli_rejects_temporal_configuration_with_domain_error(tmp_path: Path) ->
     )
 
     assert completed.returncode != 0
-    assert "unsupported by schema-2 JSON" in completed.stderr
+    assert "unsupported top-level key: release_date" in completed.stderr

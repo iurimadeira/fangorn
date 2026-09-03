@@ -609,11 +609,21 @@ class Workspaces:
             return
         descriptor, marker = held
         with suppress(OSError):
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        with suppress(OSError):
             os.close(descriptor)
-        with suppress(OSError):
+        try:
+            cleanup = os.open(marker, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except OSError:
+            return
+        try:
+            try:
+                fcntl.flock(cleanup, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
             marker.unlink()
+        except OSError:
+            pass
+        finally:
+            os.close(cleanup)
 
     @staticmethod
     def _invocation_descriptor(owner: ProcessIdentity) -> int:
@@ -767,6 +777,11 @@ def _configuration_value(content: bytes) -> dict[str, object]:
     if not content:
         return {"schema_version": 1}
     value = tomllib.loads(content.decode("utf-8"))
+    unknown = value.keys() - {"schema_version", "services"}
+    if unknown:
+        raise WorkspaceError(
+            f"fangorn.toml contains unsupported top-level key: {min(unknown)}"
+        )
     if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         raise WorkspaceError("fangorn.toml requires schema_version = 1")
     services = value.get("services")

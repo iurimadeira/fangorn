@@ -11,9 +11,13 @@ from contextlib import suppress
 def main() -> int:
     control = int(sys.argv[1])
     finish_on_parent_exit = sys.argv[2] == "finish"
+    status = int(sys.argv[3])
+    liveness = int(sys.argv[4])
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
-        sys.argv[3:], start_new_session=True
+        sys.argv[5:], start_new_session=True, pass_fds=(liveness,)
     )
+    os.write(status, f"{child.pid}\n".encode("ascii"))
+    os.close(status)
     while child.poll() is None:
         if control < 0:
             return child.wait()
