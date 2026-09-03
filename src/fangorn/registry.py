@@ -12,6 +12,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from fangorn._permissions import (
+    descriptor_has_writable_acl as _darwin_acl_allows_write,
+)
 from fangorn.git import GitError, WorktreeObservation, observe_worktree
 
 BUSY_TIMEOUT_SECONDS = 2.0
@@ -2199,6 +2202,7 @@ def _timestamp() -> str:
 
 
 def _prepare_state_directory(path: Path) -> None:
+    descriptor: int | None = None
     try:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         metadata = path.lstat()
@@ -2215,7 +2219,20 @@ def _prepare_state_directory(path: Path) -> None:
                 "Registry state directory unavailable: not owned by current user: "
                 f"{path}"
             )
-        path.chmod(0o700)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            raise RegistryError(
+                f"Registry state directory unavailable: identity changed: {path}"
+            )
+        os.fchmod(descriptor, 0o700)
+        if _darwin_acl_allows_write(descriptor):
+            raise RegistryError(
+                f"Registry state directory unavailable: writable ACL: {path}"
+            )
     except RegistryError:
         raise
     except OSError as error:
@@ -2223,9 +2240,13 @@ def _prepare_state_directory(path: Path) -> None:
         raise RegistryError(
             f"Registry state directory unavailable: {path}: {detail}"
         ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _state_directory_exists(path: Path) -> bool:
+    descriptor: int | None = None
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -2247,7 +2268,31 @@ def _state_directory_exists(path: Path) -> bool:
         raise RegistryError(
             f"Registry state directory unavailable: not owned by current user: {path}"
         )
-    return True
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            raise RegistryError(
+                f"Registry state directory unavailable: identity changed: {path}"
+            )
+        if _darwin_acl_allows_write(descriptor):
+            raise RegistryError(
+                f"Registry state directory unavailable: writable ACL: {path}"
+            )
+        return True
+    except RegistryError:
+        raise
+    except OSError as error:
+        detail = error.strerror or str(error)
+        raise RegistryError(
+            f"Registry state directory unavailable: {path}: {detail}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _prepare_database_file(path: Path) -> None:
@@ -2267,6 +2312,8 @@ def _prepare_database_file(path: Path) -> None:
                 f"Registry database unavailable: not owned by current user: {path}"
             )
         os.fchmod(descriptor, 0o600)
+        if _darwin_acl_allows_write(descriptor):
+            raise RegistryError(f"Registry database unavailable: writable ACL: {path}")
     except RegistryError:
         raise
     except OSError as error:
@@ -2295,6 +2342,8 @@ def _database_file_exists(path: Path) -> bool:
             raise RegistryError(
                 f"Registry database unavailable: not owned by current user: {path}"
             )
+        if _darwin_acl_allows_write(descriptor):
+            raise RegistryError(f"Registry database unavailable: writable ACL: {path}")
     except FileNotFoundError:
         return False
     except RegistryError:

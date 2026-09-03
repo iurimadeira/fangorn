@@ -24,6 +24,9 @@ from uuid import uuid4
 
 from fangorn._lifecycle import Observation, finish_create, plan_create
 from fangorn._lifecycle import Resource as LifecycleResource
+from fangorn._permissions import (
+    descriptor_has_writable_acl as _darwin_acl_allows_write,
+)
 from fangorn.git import (
     GitError,
     GitQuiescenceError,
@@ -749,24 +752,41 @@ class Workspaces:
             raise WorkspaceError("Cannot create Workspace invocation marker") from error
         if self._invocation_root.is_symlink() or not self._invocation_root.is_dir():
             raise WorkspaceError("Workspace invocation marker directory is unsafe")
-        process_instance_id = str(uuid4())
-        marker = self._invocation_root / process_instance_id
-        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
         try:
-            descriptor = os.open(marker, flags, 0o600)
+            root_descriptor = os.open(
+                self._invocation_root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
         except OSError as error:
             raise WorkspaceError(
-                "Cannot establish Workspace invocation marker"
+                "Workspace invocation marker directory is unsafe"
             ) from error
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            os.close(descriptor)
-            with suppress(OSError):
-                marker.unlink()
-            raise WorkspaceError(
-                "Cannot establish Workspace invocation marker"
-            ) from error
+            os.fchmod(root_descriptor, 0o700)
+            if not _safe_invocation_descriptor(root_descriptor, directory=True):
+                raise WorkspaceError("Workspace invocation marker directory is unsafe")
+            process_instance_id = str(uuid4())
+            marker = self._invocation_root / process_instance_id
+            flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    process_instance_id, flags, 0o600, dir_fd=root_descriptor
+                )
+                os.fchmod(descriptor, 0o600)
+                if not _safe_invocation_descriptor(descriptor, directory=False):
+                    raise OSError("Workspace invocation marker ACL is unsafe")
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if descriptor is not None:
+                    os.close(descriptor)
+                with suppress(OSError):
+                    os.unlink(process_instance_id, dir_fd=root_descriptor)
+                raise WorkspaceError(
+                    "Cannot establish Workspace invocation marker"
+                ) from error
+        finally:
+            os.close(root_descriptor)
         invocation = ProcessIdentity(
             process_instance_id=process_instance_id,
             boot_identity=identity.boot_identity,
@@ -800,6 +820,8 @@ class Workspaces:
             raise WorkspaceError("Cannot clean Workspace invocation marker") from error
         try:
             try:
+                if not _safe_invocation_descriptor(cleanup, directory=False):
+                    raise WorkspaceError("Cannot clean Workspace invocation marker")
                 fcntl.flock(cleanup, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 if errors:
@@ -845,38 +867,74 @@ class Workspaces:
         status = _process_owner_status(owner, boot_identity=boot_identity)
         if status != "dead":
             return status
-        marker = self._invocation_root / owner.process_instance_id
         try:
-            descriptor = os.open(marker, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+            root_descriptor = os.open(
+                self._invocation_root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
         except FileNotFoundError:
             return "dead"
         except OSError:
             return "inconclusive"
         try:
+            if not _safe_invocation_descriptor(root_descriptor, directory=True):
+                return "inconclusive"
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return "live" if status == "live" else "inconclusive"
-            opened = os.fstat(descriptor)
-            try:
-                current = marker.stat(follow_symlinks=False)
+                descriptor = os.open(
+                    owner.process_instance_id,
+                    os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=root_descriptor,
+                )
             except FileNotFoundError:
                 return "dead"
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or opened.st_dev != current.st_dev
-                or opened.st_ino != current.st_ino
-            ):
-                return "inconclusive"
-            try:
-                if os.pread(descriptor, 1, 0):
-                    return "inconclusive"
             except OSError:
                 return "inconclusive"
-            marker.unlink()
-            return "dead"
+            try:
+                if not _safe_invocation_descriptor(descriptor, directory=False):
+                    return "inconclusive"
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return "live" if status == "live" else "inconclusive"
+                opened = os.fstat(descriptor)
+                try:
+                    current = os.stat(
+                        owner.process_instance_id,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return "dead"
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or opened.st_dev != current.st_dev
+                    or opened.st_ino != current.st_ino
+                ):
+                    return "inconclusive"
+                try:
+                    if os.pread(descriptor, 1, 0):
+                        return "inconclusive"
+                except OSError:
+                    return "inconclusive"
+                os.unlink(owner.process_instance_id, dir_fd=root_descriptor)
+                return "dead"
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(descriptor)
+            os.close(root_descriptor)
+
+
+def _safe_invocation_descriptor(descriptor: int, *, directory: bool) -> bool:
+    try:
+        metadata = os.fstat(descriptor)
+        expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+        return (
+            expected_kind(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and not _darwin_acl_allows_write(descriptor)
+        )
+    except OSError:
+        return False
 
 
 def _create_definition(

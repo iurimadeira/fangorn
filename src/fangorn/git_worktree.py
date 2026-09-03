@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import ctypes
 import errno
 import grp
 import hashlib
@@ -26,6 +25,7 @@ from types import FrameType
 from typing import TYPE_CHECKING, BinaryIO, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
+from fangorn._permissions import descriptor_has_writable_acl
 from fangorn.git import (
     REPOSITORY_LOCAL_ENVIRONMENT,
     GitError,
@@ -45,9 +45,6 @@ GIT_EFFECT_TIMEOUT_SECONDS = 3600
 GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
 CONFIGURATION_LIMIT = 1024 * 1024
 UNPROVEN_GROUP_TERMINATION = 256
-_DARWIN_ACL_TYPE_EXTENDED = 0x100
-_DARWIN_ACL_EXTENDED_ALLOW = 1
-_DARWIN_ACL_WRITE = 4 | 16 | 32 | 64 | 256 | 1024 | 4096 | 8192
 
 
 @dataclass(frozen=True)
@@ -285,6 +282,7 @@ def _materialize_remote_cache(
     clone = invocation / "repository.git"
     primary_error: BaseException | None = None
     try:
+        _require_owned_cache_path(invocation)
         if owner is not None:
             _write_clone_owner(invocation, owner)
         _require_cache_parent(cache_parent)
@@ -300,7 +298,7 @@ def _materialize_remote_cache(
         if result.returncode != 0:
             raise GitError(_git_error(result))
         os.chmod(clone, 0o700, follow_symlinks=False)
-        _require_owned_cache_directory(clone.stat(follow_symlinks=False))
+        _require_owned_cache_path(clone)
         _verify_bare_repository(clone, source.normalized, liveness_fd=liveness_fd)
         _refresh_bare_repository(
             clone,
@@ -378,15 +376,15 @@ def _prepare_cache_parent(namespace_root: Path, parent: Path) -> _CacheParent:
     descriptor = os.open(namespace_root.anchor, flags)
     current = Path(namespace_root.anchor)
     try:
-        _require_safe_directory(os.fstat(descriptor))
+        _require_safe_directory(os.fstat(descriptor), descriptor)
         for part in namespace_root.parts[1:]:
             child = _open_cache_directory(descriptor, part, flags)
             current /= part
             try:
                 if current == namespace_root:
-                    _require_private_cache_directory(os.fstat(child))
+                    _require_private_cache_directory(os.fstat(child), child)
                 else:
-                    _require_safe_directory(os.fstat(child))
+                    _require_safe_directory(os.fstat(child), child)
             except BaseException:
                 os.close(child)
                 raise
@@ -395,7 +393,7 @@ def _prepare_cache_parent(namespace_root: Path, parent: Path) -> _CacheParent:
         for part in relative.parts:
             child = _open_cache_directory(descriptor, part, flags)
             try:
-                _require_private_cache_directory(os.fstat(child))
+                _require_private_cache_directory(os.fstat(child), child)
             except BaseException:
                 os.close(child)
                 raise
@@ -425,28 +423,40 @@ def _open_cache_directory(parent: int, name: str, flags: int) -> int:
         return os.open(name, flags, dir_fd=parent)
 
 
-def _require_private_cache_directory(metadata: os.stat_result) -> None:
+def _require_private_cache_directory(metadata: os.stat_result, descriptor: int) -> None:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
         or metadata.st_mode & 0o077
+        or _darwin_acl_allows_write(descriptor)
     ):
         raise GitError("Repository cache namespace is unsafe")
 
 
-def _require_owned_cache_directory(metadata: os.stat_result) -> None:
+def _require_owned_cache_directory(metadata: os.stat_result, descriptor: int) -> None:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
         or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or _darwin_acl_allows_write(descriptor)
     ):
         raise GitError("Repository cache entry is unsafe")
+
+
+def _require_owned_cache_path(path: Path) -> None:
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        _require_owned_cache_directory(os.fstat(descriptor), descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _require_cache_parent(parent: _CacheParent) -> None:
     try:
         metadata = parent.path.stat(follow_symlinks=False)
-        _require_private_cache_directory(metadata)
+        _require_private_cache_directory(os.fstat(parent.descriptor), parent.descriptor)
     except (OSError, GitError) as error:
         raise GitError("Repository cache namespace changed during operation") from error
     if metadata.st_dev != parent.device or metadata.st_ino != parent.inode:
@@ -456,11 +466,20 @@ def _require_cache_parent(parent: _CacheParent) -> None:
 def _cache_entry_exists(parent: _CacheParent, name: str) -> bool:
     _require_cache_parent(parent)
     try:
-        metadata = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent.descriptor,
+        )
     except FileNotFoundError:
         return False
-    _require_owned_cache_directory(metadata)
-    return True
+    except OSError as error:
+        raise GitError("Repository cache entry is unsafe") from error
+    try:
+        _require_owned_cache_directory(os.fstat(descriptor), descriptor)
+        return True
+    finally:
+        os.close(descriptor)
 
 
 def _cleanup_abandoned_clones(
@@ -1018,7 +1037,9 @@ def _secure_staging_directory(parent: int, name: str) -> None:
                 raise GitError("Workspace staging path is unsafe")
             os.fchmod(descriptor, 0o700)
             os.fsync(descriptor)
-            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+            if stat.S_IMODE(
+                os.fstat(descriptor).st_mode
+            ) != 0o700 or _darwin_acl_allows_write(descriptor):
                 raise GitError("Workspace staging path is unsafe")
         finally:
             os.close(descriptor)
@@ -1146,51 +1167,9 @@ def _linux_has_named_acl(descriptor: int) -> bool:
 
 def _darwin_acl_allows_write(descriptor: int) -> bool:
     try:
-        library = ctypes.CDLL(None, use_errno=True)
-        get_acl = library.acl_get_fd_np
-        get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
-        get_acl.restype = ctypes.c_void_p
-        get_entry = library.acl_get_entry
-        get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
-        get_entry.restype = ctypes.c_int
-        get_tag = library.acl_get_tag_type
-        get_tag.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-        get_tag.restype = ctypes.c_int
-        get_permissions = library.acl_get_permset_mask_np
-        get_permissions.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-        get_permissions.restype = ctypes.c_int
-        free_acl = library.acl_free
-        free_acl.argtypes = (ctypes.c_void_p,)
-        free_acl.restype = ctypes.c_int
-    except (AttributeError, OSError) as error:
+        return descriptor_has_writable_acl(descriptor)
+    except OSError as error:
         raise GitError("Repository checkout configuration ACL is unsafe") from error
-
-    ctypes.set_errno(0)
-    acl = get_acl(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
-    if not acl:
-        if ctypes.get_errno() in {errno.ENOENT, errno.EOPNOTSUPP}:
-            return False
-        raise GitError("Repository checkout configuration ACL is unsafe")
-    try:
-        entry = ctypes.c_void_p()
-        status = get_entry(acl, 0, ctypes.byref(entry))
-        while status == 0:
-            tag = ctypes.c_int()
-            permissions = ctypes.c_uint64()
-            if get_tag(entry, ctypes.byref(tag)) != 0:
-                raise GitError("Repository checkout configuration ACL is unsafe")
-            if tag.value == _DARWIN_ACL_EXTENDED_ALLOW:
-                if get_permissions(entry, ctypes.byref(permissions)) != 0:
-                    raise GitError("Repository checkout configuration ACL is unsafe")
-                if permissions.value & _DARWIN_ACL_WRITE:
-                    return True
-            status = get_entry(acl, 1, ctypes.byref(entry))
-        if status != 1:
-            raise GitError("Repository checkout configuration ACL is unsafe")
-        return False
-    finally:
-        if free_acl(acl) != 0:
-            raise GitError("Repository checkout configuration ACL is unsafe")
 
 
 def _create_staging_receipt(
@@ -1204,6 +1183,9 @@ def _create_staging_receipt(
             prefix=f".{path.name}.", dir=path.parent
         )
         temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        if _darwin_acl_allows_write(descriptor):
+            raise OSError("Workspace staging ownership ACL is unsafe")
         payload = ownership_token.encode()
         written = 0
         while written < len(payload):
@@ -1250,6 +1232,8 @@ def _require_staging_receipt(
         descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
         try:
             metadata = os.fstat(descriptor)
+            if _darwin_acl_allows_write(descriptor):
+                raise OSError("Workspace staging ownership ACL is unsafe")
             value = os.read(descriptor, 129)
         finally:
             os.close(descriptor)
@@ -1298,7 +1282,7 @@ def _walk_target_parent(path: Path, *, create: bool) -> int | None:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     descriptor = os.open(path.anchor, flags)
     try:
-        _require_safe_directory(os.fstat(descriptor))
+        _require_safe_directory(os.fstat(descriptor), descriptor)
         for part in path.parts[1:]:
             try:
                 child = os.open(part, flags, dir_fd=descriptor)
@@ -1312,7 +1296,7 @@ def _walk_target_parent(path: Path, *, create: bool) -> int | None:
                     pass
                 child = os.open(part, flags, dir_fd=descriptor)
             try:
-                _require_safe_directory(os.fstat(child))
+                _require_safe_directory(os.fstat(child), child)
             except BaseException:
                 os.close(child)
                 raise
@@ -1329,17 +1313,20 @@ def _walk_target_parent(path: Path, *, create: bool) -> int | None:
                 os.close(descriptor)
 
 
-def _require_safe_directory(metadata: os.stat_result) -> None:
+def _require_safe_directory(metadata: os.stat_result, descriptor: int) -> None:
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in {0, os.geteuid()}:
         raise GitError("Workspace target parent is unsafe")
     writable = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    if writable and not metadata.st_mode & stat.S_ISVTX:
+    if (writable or _darwin_acl_allows_write(descriptor)) and not (
+        metadata.st_mode & stat.S_ISVTX
+    ):
         raise GitError("Workspace target parent is unsafe")
 
 
 def _require_target_parent(parent: _TargetParent) -> None:
     try:
         metadata = parent.path.stat(follow_symlinks=False)
+        _require_safe_directory(os.fstat(parent.descriptor), parent.descriptor)
     except OSError as error:
         raise GitError("Workspace target parent changed during creation") from error
     if (
@@ -1507,6 +1494,7 @@ def _run_git_process(
     environment["LANG"] = "C"
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     if isolate_config:
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_SYSTEM"] = os.devnull

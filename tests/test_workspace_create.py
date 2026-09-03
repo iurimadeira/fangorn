@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -1414,6 +1415,46 @@ def test_unknown_quiescence_marker_keeps_dead_owner_inconclusive(
     workspaces._invocation_root.mkdir(parents=True)
     marker = workspaces._invocation_root / owner.process_instance_id
     marker.write_bytes(b"quiescence-unknown\n")
+
+    assert workspaces._owner_status(owner) == "inconclusive"
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["directory", "marker"])
+def test_invocation_rejects_writable_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_kind: str
+) -> None:
+    def writable(descriptor: int) -> bool:
+        mode = os.fstat(descriptor).st_mode
+        return stat.S_ISDIR(mode) if unsafe_kind == "directory" else stat.S_ISREG(mode)
+
+    monkeypatch.setattr(
+        workspaces_module, "_darwin_acl_allows_write", writable, raising=False
+    )
+    workspaces = facade(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="invocation marker"):
+        workspaces._invocation_process_identity()
+
+    if workspaces._invocation_root.exists():
+        assert list(workspaces._invocation_root.iterdir()) == []
+
+
+def test_owner_status_preserves_writable_acl_marker_as_inconclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspaces_module, "_boot_identity", lambda: "same-boot")
+    workspaces = facade(tmp_path)
+    owner = ProcessIdentity("unsafe-marker", "same-boot", 2**30, "start")
+    workspaces._invocation_root.mkdir(parents=True)
+    marker = workspaces._invocation_root / owner.process_instance_id
+    marker.touch(mode=0o600)
+    monkeypatch.setattr(
+        workspaces_module,
+        "_darwin_acl_allows_write",
+        lambda descriptor: stat.S_ISREG(os.fstat(descriptor).st_mode),
+        raising=False,
+    )
 
     assert workspaces._owner_status(owner) == "inconclusive"
     assert marker.exists()

@@ -2626,3 +2626,37 @@ def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> 
     assert "Registry state directory unavailable" in symlink_failure.stderr
     assert "symlink" in symlink_failure.stderr
     assert "Traceback" not in symlink_failure.stderr
+
+
+def test_registry_write_rejects_writable_state_directory_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        registry_adapter,
+        "_darwin_acl_allows_write",
+        lambda descriptor: stat.S_ISDIR(os.fstat(descriptor).st_mode),
+        raising=False,
+    )
+
+    with (
+        pytest.raises(RegistryError, match="Registry state directory unavailable"),
+        Registry(tmp_path / "state" / "registry.sqlite3")._connection(),
+    ):
+        pass
+
+
+def test_registry_write_rejects_writable_database_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        registry_adapter,
+        "_darwin_acl_allows_write",
+        lambda descriptor: stat.S_ISREG(os.fstat(descriptor).st_mode),
+        raising=False,
+    )
+
+    with (
+        pytest.raises(RegistryError, match="Registry database unavailable"),
+        Registry(tmp_path / "state" / "registry.sqlite3")._connection(),
+    ):
+        pass

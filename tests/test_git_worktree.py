@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import grp
 import json
 import os
@@ -128,6 +129,33 @@ def test_commit_and_configuration_reads_are_immutable(tmp_path: Path) -> None:
         read_configuration(source, commit, symlink)
     with pytest.raises(GitError, match="Configuration is unavailable"):
         read_configuration(source, commit, tmp_path / "missing.toml")
+
+
+def test_replace_refs_cannot_change_configuration_or_checkout(tmp_path: Path) -> None:
+    source = tmp_path / "repository"
+    original = repository(source)
+    (source / "README.md").write_text("replacement\n", encoding="utf-8")
+    (source / "fangorn.toml").write_text("schema_version = 2\n", encoding="utf-8")
+    git(source, "add", "README.md", "fangorn.toml")
+    tree = git(source, "write-tree")
+    replacement = git(source, "commit-tree", tree, "-m", "replacement")
+    git(source, "reset", "--hard", original)
+    git(source, "replace", original, replacement)
+
+    assert read_configuration(source, original, None) is None
+    target = tmp_path / "target"
+    created = create_worktree(
+        source,
+        target=target,
+        branch="topic",
+        commit=original,
+        ownership_token="a" * 64,
+        reconcile=False,
+    )
+
+    assert created.head == original
+    assert (target / "README.md").read_text(encoding="utf-8") == "root\n"
+    assert not (target / "fangorn.toml").exists()
 
 
 def test_explicit_configuration_is_read_from_validated_descriptor(
@@ -1727,8 +1755,12 @@ def test_target_parent_helpers_fail_closed(
 ) -> None:
     metadata = tmp_path.stat()
     monkeypatch.setattr(os, "geteuid", lambda: metadata.st_uid + 1)
-    with pytest.raises(GitError, match="unsafe"):
-        git_worktree_adapter._require_safe_directory(metadata)
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(GitError, match="unsafe"):
+            git_worktree_adapter._require_safe_directory(metadata, descriptor)
+    finally:
+        os.close(descriptor)
 
     monkeypatch.undo()
     parent = tmp_path / "parent"
@@ -2173,6 +2205,7 @@ def test_clone_cache_fsyncs_publication_directory(
 def test_git_adapter_forces_stable_diagnostics_locale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
     captured: dict[str, str] = {}
 
     def run(
@@ -2190,6 +2223,7 @@ def test_git_adapter_forces_stable_diagnostics_locale(
     assert captured["GIT_CONFIG_SYSTEM"] == os.devnull
     assert captured["GIT_CONFIG_GLOBAL"] == os.devnull
     assert captured["GIT_ATTR_NOSYSTEM"] == "1"
+    assert captured["GIT_NO_REPLACE_OBJECTS"] == "1"
 
 
 def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -> None:
@@ -2506,8 +2540,22 @@ def test_linux_named_acl_is_not_treated_as_a_private_group(
         )
 
 
-def test_darwin_writable_acl_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    entries = iter((0, 1))
+@pytest.mark.parametrize(
+    ("permissions", "terminal_errno", "expected", "raises"),
+    [
+        (0, errno.EINVAL, False, False),
+        (4, 0, True, False),
+        (0, errno.EPERM, False, True),
+    ],
+)
+def test_darwin_acl_uses_native_iteration_and_einval_termination(
+    monkeypatch: pytest.MonkeyPatch,
+    permissions: int,
+    terminal_errno: int,
+    expected: bool,
+    raises: bool,
+) -> None:
+    calls: list[int] = []
     freed: list[int] = []
 
     class Function:
@@ -2525,8 +2573,18 @@ def test_darwin_writable_acl_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
         return 0
 
     def set_permissions(_entry: object, target: Any) -> int:
-        ctypes.cast(target, ctypes.POINTER(ctypes.c_uint64)).contents.value = 4
+        ctypes.cast(
+            target, ctypes.POINTER(ctypes.c_uint64)
+        ).contents.value = permissions
         return 0
+
+    def get_entry(_acl: object, which: int, _entry: object) -> int:
+        calls.append(which)
+        if len(calls) <= 2:
+            ctypes.set_errno(0)
+            return 0
+        ctypes.set_errno(terminal_errno)
+        return -1
 
     def free_acl(acl: int) -> int:
         freed.append(acl)
@@ -2534,15 +2592,54 @@ def test_darwin_writable_acl_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
 
     class Library:
         acl_get_fd_np = Function(lambda _fd, _kind: 123)
-        acl_get_entry = Function(lambda _acl, _which, _entry: next(entries))
+        acl_get_entry = Function(get_entry)
         acl_get_tag_type = Function(set_tag)
         acl_get_permset_mask_np = Function(set_permissions)
         acl_free = Function(free_acl)
 
+    monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: Library())
 
-    assert git_worktree_adapter._darwin_acl_allows_write(10) is True
+    if raises:
+        with pytest.raises(GitError, match="ACL is unsafe"):
+            git_worktree_adapter._darwin_acl_allows_write(10)
+    else:
+        assert git_worktree_adapter._darwin_acl_allows_write(10) is expected
+    assert calls == ([0] if expected else [0, -1, -1])
     assert freed == [123]
+
+
+def test_cache_namespace_rejects_writable_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_darwin_acl_allows_write",
+        lambda _descriptor: True,
+    )
+
+    with pytest.raises(GitError, match="cache namespace is unsafe"):
+        git_worktree_adapter._prepare_cache_parent(
+            tmp_path / "cache", tmp_path / "cache" / "repositories"
+        )
+
+
+def test_staging_rejects_writable_acl_after_fchmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_darwin_acl_allows_write",
+        lambda _descriptor: True,
+    )
+    try:
+        with pytest.raises(GitError, match="Workspace staging path is unsafe"):
+            git_worktree_adapter._secure_staging_directory(parent, staging.name)
+    finally:
+        os.close(parent)
 
 
 def test_worktree_creation_rejects_symlinked_repository_configuration(
