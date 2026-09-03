@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 from types import FrameType
 from typing import TYPE_CHECKING, BinaryIO, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -113,6 +114,8 @@ def resolve_commit(
                 f"{candidate}^{{commit}}",
                 liveness_fd=liveness_fd,
             )
+        except GitQuiescenceError:
+            raise
         except GitError as candidate_error:
             error = candidate_error
             continue
@@ -272,8 +275,10 @@ def materialize_cache(
         primary_error = error
         raise
     finally:
-        if invocation.parent == cache_path.parent and invocation.name.startswith(
-            "clone-"
+        if (
+            not isinstance(primary_error, GitQuiescenceError)
+            and invocation.parent == cache_path.parent
+            and invocation.name.startswith("clone-")
         ):
             try:
                 shutil.rmtree(invocation)
@@ -938,6 +943,8 @@ def _verify_bare_repository(
         bare = _run_git(
             path, "rev-parse", "--is-bare-repository", liveness_fd=liveness_fd
         )
+    except GitQuiescenceError:
+        raise
     except GitError as error:
         raise GitError(
             f"Repository cache entry is not a bare repository: {path}"
@@ -1143,6 +1150,9 @@ def _run_supervised_git(
                                 deadline=min(deadline, time.monotonic() + 5),
                             )
                         except GitError as error:
+                            _retain_quiescence_guardian(
+                                process_group, liveness_fd=liveness_fd
+                            )
                             raise GitQuiescenceError(
                                 "Cannot confirm Git process-group termination"
                             ) from error
@@ -1272,6 +1282,13 @@ def _read_pipe_frame(
         if not chunk:
             break
         value.extend(chunk)
+        if b"\n" in value:
+            if value.index(b"\n") != len(value) - 1:
+                return bytes(value)
+            readable, _, _ = select.select((descriptor,), (), (), 0)
+            if readable:
+                value.extend(os.read(descriptor, 1))
+            return bytes(value)
     return bytes(value)
 
 
@@ -1290,7 +1307,44 @@ def _settle_process(process: subprocess.Popen[bytes]) -> None:
         pass
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=2)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        raise GitQuiescenceError("Cannot confirm Git supervisor termination") from error
+
+
+def _retain_quiescence_guardian(process_group: int, *, liveness_fd: int) -> None:
+    ready_read, ready_write = os.pipe()
+    guardian: subprocess.Popen[bytes] | None = None
+    blocked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        guardian = subprocess.Popen(  # noqa: S603 -- fixed guardian argv
+            [
+                sys.executable,
+                "-I",
+                str(Path(__file__).with_name("_git_guardian.py")),
+                str(process_group),
+                str(liveness_fd),
+                str(ready_write),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(liveness_fd, ready_write),
+            process_group=0,
+        )
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        os.close(ready_write)
+    try:
+        ready = _read_pipe_frame(ready_read, 2, deadline=time.monotonic() + 5)
+    finally:
+        os.close(ready_read)
+    if ready != b"r\n":
+        _settle_process(guardian)
+        raise GitQuiescenceError("Cannot establish Git quiescence guardian")
+    Thread(target=guardian.wait, daemon=True).start()
 
 
 def _read_capture(stream: BinaryIO, limit: int) -> bytes:

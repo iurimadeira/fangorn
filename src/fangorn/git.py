@@ -176,6 +176,8 @@ def observe_worktree(
                 reserve_observation() if reserve_observation is not None else None
             )
             second = capture()
+        except GitQuiescenceError:
+            raise
         except GitError as error:
             last_failure = error
             continue

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import signal
 import stat
@@ -19,6 +20,7 @@ from git_helpers import git, initialize_repository
 
 import fangorn._git_anchor as git_anchor
 import fangorn._git_supervisor as git_supervisor
+import fangorn.git as git_adapter
 import fangorn.git_worktree as git_worktree_adapter
 from fangorn.git import (
     GitError,
@@ -532,6 +534,7 @@ def test_supervisor_pid_reader_completes_short_pipe_reads(
 ) -> None:
     chunks = iter((b"12", b"3\n", b""))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+    monkeypatch.setattr(select, "select", lambda *_args: ([], [], []))
 
     assert git_worktree_adapter._read_supervisor_pid(10) == 123
 
@@ -550,16 +553,16 @@ def test_supervisor_pid_reader_completes_when_frame_writer_closes() -> None:
             os.close(write)
 
 
-def test_supervisor_pid_reader_deadline_rejects_unclosed_frame() -> None:
+def test_supervisor_pid_reader_completes_with_frame_writer_open() -> None:
     read, write = os.pipe()
     try:
         os.write(write, b"123\n")
 
         assert (
             git_worktree_adapter._read_supervisor_pid(
-                read, deadline=time.monotonic() + 0.05
+                read, deadline=time.monotonic() + 1
             )
-            is None
+            == 123
         )
     finally:
         os.close(read)
@@ -578,8 +581,9 @@ def test_supervisor_pid_reader_rejects_eof_before_newline(
 def test_supervisor_pid_reader_rejects_split_trailing_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    chunks = iter((b"123\n", b"extra", b""))
+    chunks = iter((b"123\n", b"e"))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+    monkeypatch.setattr(select, "select", lambda *_args: ([10], [], []))
 
     assert git_worktree_adapter._read_supervisor_pid(10) is None
 
@@ -589,6 +593,8 @@ def test_supervisor_completion_reader_requires_one_complete_frame(
 ) -> None:
     chunks = iter((b"-1", b"5\n", b""))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+    checks = iter(([], [], [10]))
+    monkeypatch.setattr(select, "select", lambda *_args: (next(checks), [], []))
     assert git_worktree_adapter._read_supervisor_completion(10) == -15
 
     chunks = iter((b"256\n", b""))
@@ -596,6 +602,33 @@ def test_supervisor_completion_reader_requires_one_complete_frame(
 
     chunks = iter((b"0\n", b"extra", b""))
     assert git_worktree_adapter._read_supervisor_completion(10) is None
+
+
+def test_quiescence_errors_are_not_retried_or_wrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = 0
+
+    def fail(*_args: object, **_kwargs: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise GitQuiescenceError("unproven")
+
+    monkeypatch.setattr(git_adapter, "_require_supported_git", fail)
+    with pytest.raises(GitQuiescenceError, match="unproven"):
+        git_adapter.observe_worktree(tmp_path)
+    assert attempts == 1
+
+    attempts = 0
+    monkeypatch.setattr(git_worktree_adapter, "_run_git", fail)
+    with pytest.raises(GitQuiescenceError, match="unproven"):
+        git_worktree_adapter.resolve_commit(tmp_path, "topic", remote=True)
+    assert attempts == 1
+
+    attempts = 0
+    with pytest.raises(GitQuiescenceError, match="unproven"):
+        git_worktree_adapter._verify_bare_repository(tmp_path, "source")
+    assert attempts == 1
 
 
 def test_parent_kills_a_supervisor_that_will_not_settle(
@@ -617,6 +650,22 @@ def test_parent_kills_a_supervisor_that_will_not_settle(
     git_worktree_adapter._settle_process(HungSupervisor())  # type: ignore[arg-type]
 
     assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_parent_preserves_unproven_supervisor_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HungSupervisor:
+        pid = 123
+
+        @staticmethod
+        def wait(*, timeout: float) -> int:
+            raise subprocess.TimeoutExpired(["supervisor"], timeout)
+
+    monkeypatch.setattr(os, "killpg", lambda *_args: None)
+
+    with pytest.raises(GitQuiescenceError, match="supervisor termination"):
+        git_worktree_adapter._settle_process(HungSupervisor())  # type: ignore[arg-type]
 
 
 def test_portable_group_probe_ignores_zombie_leader(
@@ -1303,6 +1352,100 @@ def test_cache_staging_cleanup_failure_is_visible(
 
     with pytest.raises(GitError, match="Failed to clean clone staging"):
         materialize_cache(source, tmp_path / "cache" / "repository.git")
+
+
+def test_cache_staging_survives_unproven_git_quiescence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache" / "repository.git"
+    owner = ProcessIdentity("owner", "boot", 1001, "start")
+    source = RepositorySource("url", None, "https://example.invalid/repo.git", "source")
+    monkeypatch.setattr(
+        git_worktree_adapter, "require_supported_git", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        git_worktree_adapter,
+        "_run_git_process",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GitQuiescenceError("unproven")),
+    )
+
+    with pytest.raises(GitQuiescenceError, match="unproven"):
+        materialize_cache(source, cache, owner=owner)
+
+    staging = list(cache.parent.glob("clone-*"))
+    assert len(staging) == 1
+    assert (staging[0] / "owner.json").is_file()
+
+    git_worktree_adapter._cleanup_abandoned_clones(
+        cache.parent, lambda candidate: "dead" if candidate == owner else "live"
+    )
+    assert not staging[0].exists()
+
+
+def test_quiescence_guardian_holds_invocation_until_group_is_absent(
+    tmp_path: Path,
+) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], process_group=0
+    )
+    owner = ProcessIdentity("guardian-owner", "boot", 2**30, "start")
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    workspaces = Workspaces(
+        registry,
+        process_identity=owner,
+    )
+    invocation = workspaces._invocation_process_identity()
+    intent, _ = registry.begin_create_intent(
+        request_key="guardian",
+        request_id=None,
+        request_json="{}",
+        target_path=str(tmp_path / "target"),
+        workspace_id="workspace",
+        operation_id="operation",
+        prepare_cache=False,
+    )
+    epoch = registry.acquire_lease(
+        scope_kind="workspace",
+        scope_key=intent.workspace_id,
+        operation_id=intent.operation_id,
+        owner=invocation,
+        owner_status=workspaces._owner_status,
+    )
+    successor = ProcessIdentity("successor", "boot", 2**30 - 1, "start")
+    try:
+        git_worktree_adapter._retain_quiescence_guardian(
+            process.pid,
+            liveness_fd=workspaces._invocation_descriptor(invocation),
+        )
+        workspaces._finish_invocation(invocation)
+        assert workspaces._owner_status(invocation) == "inconclusive"
+        with pytest.raises(RegistryError, match="Workspace mutation is busy"):
+            registry.acquire_lease(
+                scope_kind="workspace",
+                scope_key=intent.workspace_id,
+                operation_id=intent.operation_id,
+                owner=successor,
+                owner_status=workspaces._owner_status,
+            )
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=2)
+
+    deadline = time.monotonic() + 2
+    while workspaces._owner_status(invocation) != "dead":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert (
+        registry.acquire_lease(
+            scope_kind="workspace",
+            scope_key=intent.workspace_id,
+            operation_id=intent.operation_id,
+            owner=successor,
+            owner_status=workspaces._owner_status,
+        )
+        == epoch + 1
+    )
 
 
 def test_receipt_staging_cleanup_failure_is_visible(
