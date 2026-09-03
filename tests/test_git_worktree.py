@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import select
@@ -2448,6 +2449,45 @@ def test_worktree_creation_rejects_group_writable_configuration(
             ownership_token="f" * 64,
             reconcile=False,
         )
+
+
+def test_darwin_writable_acl_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    entries = iter((0, 1))
+    freed: list[int] = []
+
+    class Function:
+        argtypes: object = None
+        restype: object = None
+
+        def __init__(self, callback: Callable[..., int]) -> None:
+            self.callback = callback
+
+        def __call__(self, *arguments: Any) -> int:
+            return self.callback(*arguments)
+
+    def set_tag(_entry: object, target: Any) -> int:
+        ctypes.cast(target, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        return 0
+
+    def set_permissions(_entry: object, target: Any) -> int:
+        ctypes.cast(target, ctypes.POINTER(ctypes.c_uint64)).contents.value = 4
+        return 0
+
+    def free_acl(acl: int) -> int:
+        freed.append(acl)
+        return 0
+
+    class Library:
+        acl_get_fd_np = Function(lambda _fd, _kind: 123)
+        acl_get_entry = Function(lambda _acl, _which, _entry: next(entries))
+        acl_get_tag_type = Function(set_tag)
+        acl_get_permset_mask_np = Function(set_permissions)
+        acl_free = Function(free_acl)
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: Library())
+
+    assert git_worktree_adapter._darwin_acl_allows_write(10) is True
+    assert freed == [123]
 
 
 def test_worktree_creation_rejects_symlinked_repository_configuration(

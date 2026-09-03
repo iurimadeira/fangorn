@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import errno
-import grp
 import hashlib
 import json
 import os
-import pwd
 import re
 import select
 import shutil
@@ -44,6 +43,9 @@ GIT_EFFECT_TIMEOUT_SECONDS = 3600
 GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
 CONFIGURATION_LIMIT = 1024 * 1024
 UNPROVEN_GROUP_TERMINATION = 256
+_DARWIN_ACL_TYPE_EXTENDED = 0x100
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_WRITE = 4 | 16 | 32 | 64 | 256 | 1024 | 4096 | 8192
 
 
 @dataclass(frozen=True)
@@ -1051,16 +1053,15 @@ def _open_trusted_checkout_directory(path: Path) -> int:
     descriptor = os.open(path.anchor, flags)
     current = Path(path.anchor)
     try:
-        _require_trusted_checkout_component(os.fstat(descriptor), final=False)
+        _require_trusted_checkout_component(descriptor, final=False)
         for part in path.parts[1:]:
             child = os.open(part, flags, dir_fd=descriptor)
             current /= part
             try:
-                metadata = os.fstat(child)
                 if current == path:
-                    _require_trusted_checkout_component(metadata, final=True)
+                    _require_trusted_checkout_component(child, final=True)
                 else:
-                    _require_trusted_checkout_component(metadata, final=False)
+                    _require_trusted_checkout_component(child, final=False)
             except BaseException:
                 os.close(child)
                 raise
@@ -1090,43 +1091,79 @@ def _open_trusted_checkout_file(directory: int, name: str) -> int | None:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid not in {0, os.geteuid()}
-        or _writable_by_another_principal(metadata)
+        or _writable_by_another_principal(metadata, descriptor)
     ):
         os.close(descriptor)
         raise GitError("Repository checkout configuration is unsafe")
     return descriptor
 
 
-def _require_trusted_checkout_component(
-    metadata: os.stat_result, *, final: bool
-) -> None:
+def _require_trusted_checkout_component(descriptor: int, *, final: bool) -> None:
+    metadata = os.fstat(descriptor)
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in {
         0,
         os.geteuid(),
     }:
         raise GitError("Repository checkout configuration is unsafe")
-    if _writable_by_another_principal(metadata) and not (
+    if _writable_by_another_principal(metadata, descriptor) and not (
         not final and metadata.st_mode & stat.S_ISVTX
     ):
         raise GitError("Repository checkout configuration is unsafe")
 
 
-def _writable_by_another_principal(metadata: os.stat_result) -> bool:
-    if metadata.st_mode & stat.S_IWOTH:
-        return True
-    if not metadata.st_mode & stat.S_IWGRP:
-        return False
+def _writable_by_another_principal(metadata: os.stat_result, descriptor: int) -> bool:
+    return bool(metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) or (
+        sys.platform == "darwin" and _darwin_acl_allows_write(descriptor)
+    )
+
+
+def _darwin_acl_allows_write(descriptor: int) -> bool:
     try:
-        group = grp.getgrgid(metadata.st_gid)
-        member_uids = {pwd.getpwnam(name).pw_uid for name in group.gr_mem}
-        member_uids.update(
-            account.pw_uid
-            for account in pwd.getpwall()
-            if account.pw_gid == metadata.st_gid
-        )
-    except (KeyError, OSError):
-        return True
-    return bool(member_uids - {os.geteuid()})
+        library = ctypes.CDLL(None, use_errno=True)
+        get_acl = library.acl_get_fd_np
+        get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+        get_acl.restype = ctypes.c_void_p
+        get_entry = library.acl_get_entry
+        get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+        get_entry.restype = ctypes.c_int
+        get_tag = library.acl_get_tag_type
+        get_tag.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        get_tag.restype = ctypes.c_int
+        get_permissions = library.acl_get_permset_mask_np
+        get_permissions.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        get_permissions.restype = ctypes.c_int
+        free_acl = library.acl_free
+        free_acl.argtypes = (ctypes.c_void_p,)
+        free_acl.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise GitError("Repository checkout configuration ACL is unsafe") from error
+
+    ctypes.set_errno(0)
+    acl = get_acl(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        if ctypes.get_errno() in {errno.ENOENT, errno.EOPNOTSUPP}:
+            return False
+        raise GitError("Repository checkout configuration ACL is unsafe")
+    try:
+        entry = ctypes.c_void_p()
+        status = get_entry(acl, 0, ctypes.byref(entry))
+        while status == 0:
+            tag = ctypes.c_int()
+            permissions = ctypes.c_uint64()
+            if get_tag(entry, ctypes.byref(tag)) != 0:
+                raise GitError("Repository checkout configuration ACL is unsafe")
+            if tag.value == _DARWIN_ACL_EXTENDED_ALLOW:
+                if get_permissions(entry, ctypes.byref(permissions)) != 0:
+                    raise GitError("Repository checkout configuration ACL is unsafe")
+                if permissions.value & _DARWIN_ACL_WRITE:
+                    return True
+            status = get_entry(acl, 1, ctypes.byref(entry))
+        if status != 1:
+            raise GitError("Repository checkout configuration ACL is unsafe")
+        return False
+    finally:
+        if free_acl(acl) != 0:
+            raise GitError("Repository checkout configuration ACL is unsafe")
 
 
 def _create_staging_receipt(
