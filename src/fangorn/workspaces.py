@@ -281,8 +281,11 @@ class Workspaces:
             if request.path is None and data_home is None:
                 data_home = _xdg_home("XDG_DATA_HOME", ".local/share")
             target = _target_path(request, source, data_home)
-            config = _configuration_path(request.config) if request.config else None
-            config_identity = str(config) if config is not None else None
+            config_identity = (
+                str(_configuration_identity(request.config))
+                if request.config is not None
+                else None
+            )
             request_value = {
                 "base": request.base,
                 "branch": request.branch,
@@ -321,6 +324,11 @@ class Workspaces:
             except CreateAlreadyCompleted:
                 return self._completed_create(intent.workspace_id, created=created)
 
+            config = (
+                _configuration_path(request.config)
+                if intent.resolved_json is None and request.config is not None
+                else None
+            )
             repository = self._prepare_repository(
                 source,
                 intent,
@@ -918,6 +926,13 @@ def _configuration_path(path: Path) -> Path:
         return expanded.resolve(strict=True)
     except WorkspaceError:
         raise
+    except (OSError, RuntimeError) as error:
+        raise WorkspaceError("Configuration path cannot be canonicalized") from error
+
+
+def _configuration_identity(path: Path) -> Path:
+    try:
+        return path.expanduser().absolute()
     except (OSError, RuntimeError) as error:
         raise WorkspaceError("Configuration path cannot be canonicalized") from error
 

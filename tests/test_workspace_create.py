@@ -1971,6 +1971,32 @@ def test_default_configuration_is_snapshotted_from_resolved_commit(
     )
 
 
+def test_completed_retry_does_not_require_explicit_configuration_source(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    configuration = tmp_path / "fangorn.toml"
+    configuration.write_text("schema_version = 1\n", encoding="utf-8")
+    request = CreateWorkspace(
+        repository=str(repository),
+        branch="explicit-config-retry",
+        path=tmp_path / "worktrees" / "explicit-config-retry",
+        config=configuration,
+        request_id="explicit-config-retry-1",
+        headless=True,
+    )
+    first = facade(tmp_path).create(request)
+    configuration.unlink()
+
+    retried = facade(tmp_path).create(request)
+
+    assert retried.created is False
+    assert retried.workspace.definition.id == first.workspace.definition.id
+    assert retried.operation.id == first.operation.id
+    assert retried.workspace.definition.configuration == b"schema_version = 1\n"
+
+
 def test_resolved_sha_survives_configuration_failure_and_ref_movement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
