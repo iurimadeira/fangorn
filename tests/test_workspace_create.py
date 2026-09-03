@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
 import time
 from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from threading import Event
 from typing import Any, cast
@@ -15,6 +17,7 @@ from typing import Any, cast
 import pytest
 from git_helpers import git, initialize_repository
 
+import fangorn._invocation_cleaner as invocation_cleaner
 import fangorn.workspaces as workspaces_module
 from fangorn.git import GitQuiescenceError, observe_worktree
 from fangorn.git_worktree import create_worktree as real_create_worktree
@@ -1117,6 +1120,31 @@ print(json.dumps(asdict(w._invocation_process_identity())))
     assert marker.exists()
 
     assert facade(tmp_path)._owner_status(owner) == "dead"
+    assert not marker.exists()
+
+
+def test_invocation_cleaner_unlinks_the_inherited_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "marker"
+    marker.touch(mode=0o600)
+    descriptor = os.open(marker, os.O_RDWR)
+    ready_read, ready_write = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cleaner", str(descriptor), str(marker), str(ready_write)],
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    try:
+        assert invocation_cleaner.main() == 0
+        assert os.read(ready_read, 2) == b"r\n"
+    finally:
+        for candidate in (descriptor, ready_read, ready_write):
+            with suppress(OSError):
+                os.close(candidate)
+
     assert not marker.exists()
 
 
