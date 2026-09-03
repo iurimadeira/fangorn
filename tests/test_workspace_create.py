@@ -2445,6 +2445,24 @@ def test_unavailable_boot_probe_never_proves_owner_dead(
     assert workspaces_module._process_owner_status(owner) == "live"
 
 
+def test_zombie_process_owner_is_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    owner = ProcessIdentity("owner", "boot", 123, "start")
+    monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(workspaces_module, "_boot_identity", lambda: "boot")
+    monkeypatch.setattr(
+        workspaces_module, "_process_is_zombie", lambda _pid: True, raising=False
+    )
+    monkeypatch.setattr(
+        workspaces_module,
+        "_process_start_identity",
+        lambda _pid: (_ for _ in ()).throw(
+            AssertionError("zombie must not be treated as live")
+        ),
+    )
+
+    assert workspaces_module._process_owner_status(owner) == "dead"
+
+
 def test_boot_identity_normalizes_darwin_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2508,6 +2526,7 @@ def test_process_start_identity_uses_darwin_microseconds(
                 buffer, ctypes.POINTER(workspaces_module._ProcBsdInfo)
             ).contents
             info.pbi_pid = pid
+            info.pbi_status = 5
             info.pbi_start_tvsec = 1_725_000_000
             info.pbi_start_tvusec = 456
             return size
@@ -2530,6 +2549,7 @@ def test_process_start_identity_uses_darwin_microseconds(
     assert workspaces_module._ProcBsdInfo.pbi_start_tvsec.offset == 120
     assert workspaces_module._ProcBsdInfo.pbi_start_tvusec.offset == 128
     assert workspaces_module._process_start_identity(123) == "darwin:1725000000:000456"
+    assert workspaces_module._process_is_zombie(123) is True
 
 
 def test_portable_identity_probes_fail_closed_on_timeout(

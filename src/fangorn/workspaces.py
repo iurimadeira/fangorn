@@ -1093,6 +1093,11 @@ def _process_start_identity(pid: int) -> str:
 
 
 def _darwin_process_start_identity(pid: int) -> str:
+    info = _darwin_process_info(pid)
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec:06d}"
+
+
+def _darwin_process_info(pid: int) -> _ProcBsdInfo:
     try:
         library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     except OSError as error:
@@ -1116,7 +1121,22 @@ def _darwin_process_start_identity(pid: int) -> str:
         or not 0 <= info.pbi_start_tvusec < 1_000_000
     ):
         raise WorkspaceError("Cannot establish process start identity")
-    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec:06d}"
+    return info
+
+
+def _process_is_zombie(pid: int) -> bool:
+    try:
+        state = (
+            Path(f"/proc/{pid}/stat")
+            .read_text(encoding="ascii")
+            .rsplit(")", 1)[1]
+            .split()[0]
+        )
+        return state == "Z"
+    except (OSError, IndexError):
+        if sys.platform == "darwin":
+            return _darwin_process_info(pid).pbi_status == 5
+        raise WorkspaceError("Cannot establish process state") from None
 
 
 def _process_owner_status(
@@ -1134,6 +1154,11 @@ def _process_owner_status(
     except ProcessLookupError:
         return "dead"
     except PermissionError:
+        return "inconclusive"
+    try:
+        if _process_is_zombie(owner.pid):
+            return "dead"
+    except WorkspaceError:
         return "inconclusive"
     try:
         current_start = _process_start_identity(owner.pid)
