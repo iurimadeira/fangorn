@@ -61,6 +61,10 @@ different immutable fields fails before Git effects. Clone URLs use a shared
 cache under `$XDG_CACHE_HOME/fangorn/repositories`; its acquisition and every
 Workspace mutation use recoverable fenced leases.
 
+Supervised Git effects have a one-hour deadline and retain at most 8 MiB per
+output stream. Hitting either limit fails creation with retryable journal evidence
+after the Git process group is fully stopped.
+
 Machine output uses schema 2:
 
 ```sh

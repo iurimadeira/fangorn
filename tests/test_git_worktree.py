@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -350,15 +351,30 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["supervisor", "10", "11", "12", "13", "", "-1", "cancel", "git"],
+        [
+            "supervisor",
+            "10",
+            "11",
+            "12",
+            "13",
+            "123",
+            "",
+            "-1",
+            "cancel",
+            "3600",
+            str(8 * 1024 * 1024),
+            "git",
+        ],
     )
-    monkeypatch.setattr(os, "fstat", lambda _descriptor: object())
+    monkeypatch.setattr(os, "fstat", lambda _descriptor: os.stat_result((0,) * 10))
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
     monkeypatch.setattr(
         os, "write", lambda *args: (_ for _ in ()).throw(BrokenPipeError())
     )
     monkeypatch.setattr(os, "close", lambda _descriptor: None)
-    monkeypatch.setattr(git_supervisor, "_drain", drained.append)
+    monkeypatch.setattr(
+        git_supervisor, "_drain", lambda value, _process_group: drained.append(value)
+    )
     monkeypatch.setattr(git_supervisor, "_child_running", lambda _child: False)
 
     assert git_supervisor.main() == 0
@@ -381,9 +397,10 @@ def test_supervisor_does_not_reap_before_group_cleanup(
             raise AssertionError("cleanup must not reap through poll")
 
     child = Child()
-    monkeypatch.setattr(git_supervisor, "_process_group_members", lambda _pid: set())
+    monkeypatch.setattr(git_supervisor, "_wait_for_group_state", lambda _pid: False)
+    monkeypatch.setattr(os, "killpg", lambda *_args: None)
 
-    git_supervisor._drain(child)  # type: ignore[arg-type]
+    git_supervisor._drain(child, 123)  # type: ignore[arg-type]
 
     assert child.waited is True
 
@@ -484,7 +501,7 @@ def test_portable_group_probe_ignores_zombie_leader(
     )
     monkeypatch.setattr(os, "getpid", lambda: 999)
 
-    assert git_supervisor._process_group_members(77) == {124}
+    assert git_supervisor._process_group_running(77) is True
 
     monkeypatch.setattr(
         subprocess,
@@ -493,7 +510,47 @@ def test_portable_group_probe_ignores_zombie_leader(
             args[0], 0, "123 77 Z\n", ""
         ),
     )
-    assert git_supervisor._process_group_members(77) == set()
+    assert git_supervisor._process_group_running(77) is False
+
+
+def test_group_probe_falls_back_when_proc_scan_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: True)
+    monkeypatch.setattr(Path, "iterdir", lambda _path: iter((Path("/proc/123"),)))
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError()),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "123 77 S\n", ""
+        ),
+    )
+
+    assert git_supervisor._process_group_running(77) is True
+
+
+def test_group_cleanup_retries_failed_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: Iterator[bool | subprocess.SubprocessError] = iter(
+        (subprocess.SubprocessError(), False)
+    )
+
+    def observe(_process_group: int) -> bool:
+        result = next(observations)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(git_supervisor, "_process_group_running", observe)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert git_supervisor._wait_for_group_state(77) is False
 
 
 def test_supervised_git_rejects_ignored_sigchld_before_effects(
@@ -626,10 +683,18 @@ def test_git_cleanup_owns_supervisor_before_pending_interrupt(
     monkeypatch.setenv("FANGORN_STARTED", str(started))
     monkeypatch.setenv("FANGORN_STOPPED", str(stopped))
     real_popen = subprocess.Popen
+    anchor_pid: int | None = None
 
     def interrupt_after_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        nonlocal anchor_pid
         process = real_popen(*args, **kwargs)
-        os.kill(os.getpid(), signal.SIGINT)
+        command = args[0]
+        if isinstance(command, list) and "signal.pause()" in str(command):
+            anchor_pid = process.pid
+        if isinstance(command, list) and any(
+            str(value).endswith("_git_supervisor.py") for value in command
+        ):
+            os.kill(os.getpid(), signal.SIGINT)
         return process
 
     monkeypatch.setattr(subprocess, "Popen", interrupt_after_spawn)
@@ -643,7 +708,8 @@ def test_git_cleanup_owns_supervisor_before_pending_interrupt(
         os.close(liveness)
         os.close(writer)
 
-    assert stopped.read_text(encoding="utf-8") == "stopped"
+    assert anchor_pid is not None
+    assert not git_worktree_adapter._process_group_running(anchor_pid)
 
 
 def test_supervised_git_cleans_group_when_supervisor_dies(
@@ -655,7 +721,7 @@ def test_supervised_git_cleans_group_when_supervisor_dies(
     fake_git = fake_bin / "git"
     fake_git.write_text(
         "#!/bin/sh\n"
-        'printf "%s" "$PPID" > "$FANGORN_GROUP"\n'
+        'ps -o pgid= -p "$$" | tr -d " " > "$FANGORN_GROUP"\n'
         "(trap '' TERM; while :; do sleep 0.05; done) >/dev/null 2>&1 &\n"
         "sleep 0.05\n"
         'kill -KILL "$PPID"\n'
@@ -704,6 +770,43 @@ def test_supervised_git_captures_output_without_reader_threads(
     assert result.returncode == 0
     assert len(result.stdout) == 131072
     assert len(result.stderr) == 131072
+
+
+@pytest.mark.parametrize(
+    ("timeout", "output_limit", "body", "message"),
+    [
+        (0, 8 * 1024 * 1024, "while :; do sleep 1; done\n", "exceeded one hour"),
+        (3600, 1024, "head -c 4096 /dev/zero\n", "exceeded 8 MiB"),
+    ],
+)
+def test_supervised_git_bounds_time_and_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: int,
+    output_limit: int,
+    body: str,
+    message: str,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(f"#!/bin/sh\n{body}", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(git_worktree_adapter, "GIT_EFFECT_TIMEOUT_SECONDS", timeout)
+    monkeypatch.setattr(git_worktree_adapter, "GIT_CAPTURE_LIMIT", output_limit)
+    liveness, writer = os.pipe()
+    try:
+        result = git_worktree_adapter._run_git_process(
+            tmp_path, "fetch", liveness_fd=liveness
+        )
+    finally:
+        os.close(liveness)
+        os.close(writer)
+
+    assert result.returncode == 124
+    assert message in result.stderr.decode("utf-8")
+    assert len(result.stdout) <= output_limit
 
 
 def test_worktree_create_rejects_replaced_target_parent_before_git_effect(

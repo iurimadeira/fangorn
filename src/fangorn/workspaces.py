@@ -398,13 +398,18 @@ class Workspaces:
             return CreateWorkspaceResult(aggregate, operation, created=created)
         except BaseException as error:
             if intent is not None and lease_epoch is not None:
-                with suppress(RegistryError):
+                try:
                     self._registry.fail_create_operation(
                         operation_id=intent.operation_id,
                         workspace_id=intent.workspace_id,
                         lease_epoch=lease_epoch,
                         error=str(error),
                     )
+                except RegistryError as persistence_error:
+                    raise WorkspaceError(
+                        f"{error}; failed to persist create failure: "
+                        f"{persistence_error}"
+                    ) from error
             if isinstance(error, WorkspaceError):
                 raise
             if isinstance(
@@ -644,7 +649,7 @@ class Workspaces:
 
     def _owner_status(self, owner: ProcessIdentity) -> str:
         status = _process_owner_status(owner)
-        if status == "inconclusive":
+        if status != "dead":
             return status
         marker = self._invocation_root / owner.process_instance_id
         try:

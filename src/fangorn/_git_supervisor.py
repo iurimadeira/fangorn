@@ -17,17 +17,23 @@ def main() -> int:
     completion = int(sys.argv[3])
     liveness = int(sys.argv[4])
     os.fstat(liveness)
-    inherited = tuple(int(value) for value in sys.argv[5].split(",") if value)
-    working_directory = int(sys.argv[6])
-    finish_on_owner_exit = sys.argv[7] == "finish"
+    process_group = int(sys.argv[5])
+    inherited = tuple(int(value) for value in sys.argv[6].split(",") if value)
+    working_directory = int(sys.argv[7])
+    finish_on_owner_exit = sys.argv[8] == "finish"
+    timeout = int(sys.argv[9])
+    output_limit = int(sys.argv[10])
     try:
         result = _supervise(
             control,
             status,
+            process_group,
             inherited,
             working_directory,
             finish_on_owner_exit,
-            sys.argv[8:],
+            timeout,
+            output_limit,
+            sys.argv[11:],
         )
         with suppress(BrokenPipeError):
             os.write(completion, f"{result}\n".encode("ascii"))
@@ -39,14 +45,18 @@ def main() -> int:
 def _supervise(
     control: int,
     status: int,
+    process_group: int,
     inherited: tuple[int, ...],
     working_directory: int,
     finish_on_owner_exit: bool,
+    timeout: int,
+    output_limit: int,
     command: list[str],
 ) -> int:
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
         command,
         pass_fds=inherited,
+        process_group=process_group,
         preexec_fn=(
             (lambda: os.fchdir(working_directory)) if working_directory >= 0 else None
         ),
@@ -57,58 +67,71 @@ def _supervise(
         pass
     finally:
         os.close(status)
-    while _child_running(child):
+    deadline = time.monotonic() + timeout
+    while True:
+        if time.monotonic() >= deadline:
+            _drain(child, process_group)
+            _replace_output("Git operation exceeded one hour")
+            return 124
+        if max(os.fstat(1).st_size, os.fstat(2).st_size) > output_limit:
+            _drain(child, process_group)
+            _replace_output("Git diagnostic output exceeded 8 MiB")
+            return 124
+        if not _child_running(child):
+            break
         readable, _, _ = select.select((control,), (), (), 0.01)
         if not readable:
             continue
         command_byte = os.read(control, 1)
         if not command_byte:
-            (_finish if finish_on_owner_exit else _drain)(child)
+            (_finish if finish_on_owner_exit else _drain)(child, process_group)
             return child.returncode
         if command_byte == b"c":
-            _drain(child)
+            _drain(child, process_group)
             return child.returncode
         if command_byte == b"f":
-            _finish(child)
+            _finish(child, process_group)
             return child.returncode
-    _drain(child)
+    _drain(child, process_group)
     return child.returncode
 
 
-def _finish(child: subprocess.Popen[bytes]) -> None:
+def _replace_output(message: str) -> None:
+    for descriptor in (1, 2):
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    os.write(2, f"{message}\n".encode())
+
+
+def _finish(child: subprocess.Popen[bytes], process_group: int) -> None:
     deadline = time.monotonic() + 2
     while _child_running(child) and time.monotonic() < deadline:
         time.sleep(0.01)
-    _drain(child)
+    _drain(child, process_group)
 
 
-def _drain(child: subprocess.Popen[bytes]) -> None:
-    process_group = os.getpgrp()
-    members = _process_group_members(process_group)
-    if not members:
-        child.wait()
-        return
-    _signal_processes(members, signal.SIGTERM)
-    terminated = members
+def _drain(child: subprocess.Popen[bytes], process_group: int) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(process_group, signal.SIGTERM)
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        members = _process_group_members(process_group)
-        if not members:
+        if not _wait_for_group_state(process_group):
             child.wait()
             return
-        _signal_processes(members - terminated, signal.SIGTERM)
-        terminated |= members
-        time.sleep(0.01)
-    while members := _process_group_members(process_group):
-        _signal_processes(members, signal.SIGKILL)
-        time.sleep(0.01)
+        time.sleep(0.1)
+    with suppress(ProcessLookupError):
+        os.killpg(process_group, signal.SIGKILL)
+    while _wait_for_group_state(process_group):
+        time.sleep(0.1)
     child.wait()
 
 
-def _signal_processes(processes: set[int], requested_signal: signal.Signals) -> None:
-    for process in processes:
-        with suppress(ProcessLookupError):
-            os.kill(process, requested_signal)
+def _wait_for_group_state(process_group: int) -> bool:
+    while True:
+        try:
+            return _process_group_running(process_group)
+        except (OSError, subprocess.SubprocessError):
+            time.sleep(0.1)
 
 
 def _child_running(child: subprocess.Popen[bytes]) -> bool:
@@ -122,11 +145,11 @@ def _child_running(child: subprocess.Popen[bytes]) -> bool:
     )
 
 
-def _process_group_members(process_group: int) -> set[int]:
+def _process_group_running(process_group: int) -> bool:
     proc = Path("/proc")
     if proc.is_dir():
         parsed = False
-        members: set[int] = set()
+        complete = True
         for entry in proc.iterdir():
             if not entry.name.isdigit():
                 continue
@@ -139,12 +162,13 @@ def _process_group_members(process_group: int) -> set[int]:
                 )
                 parsed = True
                 if int(fields[2]) == process_group and fields[0] != "Z":
-                    members.add(int(entry.name))
+                    return True
+            except FileNotFoundError:
+                pass
             except (IndexError, OSError, ValueError):
-                continue
-        if parsed:
-            members.discard(os.getpid())
-            return members
+                complete = False
+        if parsed and complete:
+            return False
     result = subprocess.run(
         ["/bin/ps", "-axo", "pid=,pgid=,state="],
         check=True,
@@ -153,21 +177,14 @@ def _process_group_members(process_group: int) -> set[int]:
         start_new_session=True,
         text=True,
     )
-    members = {
-        int(fields[0])
-        for line in result.stdout.splitlines()
-        if len(fields := line.split()) == 3
+    return any(
+        len(fields := line.split()) == 3
         and fields[0].isdigit()
         and fields[1].isdigit()
         and int(fields[1]) == process_group
         and not fields[2].startswith("Z")
-    }
-    members.discard(os.getpid())
-    return members
-
-
-def _process_group_running(process_group: int) -> bool:
-    return bool(_process_group_members(process_group))
+        for line in result.stdout.splitlines()
+    )
 
 
 if __name__ == "__main__":

@@ -1007,7 +1007,7 @@ def test_inconclusive_lease_owner_is_not_taken_over(tmp_path: Path) -> None:
         )
 
 
-def test_cross_process_ended_invocation_is_proven_dead_while_process_lives(
+def test_cross_process_ended_invocation_remains_live_while_process_lives(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "state" / "registry.sqlite3"
@@ -1060,6 +1060,17 @@ sys.stdin.readline()
         child.stdin.flush()
         assert child.stdout.readline().strip() == "released"
         assert child.poll() is None
+        with pytest.raises(RegistryError, match="Workspace mutation is busy"):
+            registry.acquire_lease(
+                scope_kind="workspace",
+                scope_key=intent.workspace_id,
+                operation_id=intent.operation_id,
+                owner=ProcessIdentity("new", "boot", os.getpid(), "start"),
+                owner_status=checker._owner_status,
+            )
+        child.stdin.write("exit\n")
+        child.stdin.flush()
+        child.wait(timeout=5)
         new_epoch = registry.acquire_lease(
             scope_kind="workspace",
             scope_key=intent.workspace_id,
@@ -1069,9 +1080,10 @@ sys.stdin.readline()
         )
         assert new_epoch == old_epoch + 1
     finally:
-        child.stdin.write("exit\n")
-        child.stdin.flush()
-        child.wait(timeout=5)
+        if child.poll() is None:
+            child.stdin.write("exit\n")
+            child.stdin.flush()
+            child.wait(timeout=5)
 
 
 def test_dead_process_invocation_marker_is_removed(tmp_path: Path) -> None:
@@ -1366,7 +1378,7 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
     )
 
 
-def test_ended_same_process_invocation_can_recover_when_cleanup_failed(
+def test_cleanup_persistence_failure_is_reported_with_effect_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = tmp_path / "repository"
@@ -1389,12 +1401,11 @@ def test_ended_same_process_invocation_can_recover_when_cleanup_failed(
 
     monkeypatch.setattr("fangorn.workspaces.create_worktree", interrupt)
     monkeypatch.setattr(workspaces._registry, "fail_create_operation", cleanup_busy)
-    with pytest.raises(RuntimeError, match="effect failed"):
+    with pytest.raises(
+        WorkspaceError,
+        match="effect failed; failed to persist create failure: Registry is busy",
+    ):
         workspaces.create(request)
-
-    monkeypatch.setattr("fangorn.workspaces.create_worktree", real_create_worktree)
-    recovered = facade(tmp_path).create(request)
-    assert recovered.workspace.state == "ready"
 
 
 def test_create_finishing_between_intent_read_and_lease_is_idempotent(

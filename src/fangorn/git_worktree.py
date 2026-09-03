@@ -17,7 +17,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, BinaryIO, cast
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from fangorn.git import (
@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from fangorn.registry import ProcessIdentity
 
 SUPPORTED_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
+GIT_EFFECT_TIMEOUT_SECONDS = 3600
+GIT_CAPTURE_LIMIT = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -864,19 +866,7 @@ def _run_supervised_git(
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
     completion_read, completion_write = os.pipe()
-    supervisor = [
-        sys.executable,
-        "-I",
-        str(Path(__file__).with_name("_git_supervisor.py")),
-        str(control_read),
-        str(status_write),
-        str(completion_write),
-        str(liveness_fd),
-        ",".join(str(descriptor) for descriptor in extra_fds),
-        str(working_directory_fd if working_directory_fd is not None else -1),
-        "finish" if finish_on_parent_exit else "cancel",
-        *command,
-    ]
+    anchor: subprocess.Popen[bytes] | None = None
     process: subprocess.Popen[bytes] | None = None
     settled = False
     try:
@@ -888,6 +878,38 @@ def _run_supervised_git(
                         signal.SIG_BLOCK, {signal.SIGINT}
                     )
                     try:
+                        anchor = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-I",
+                                "-c",
+                                "import signal\nwhile True: signal.pause()",
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            process_group=0,
+                        )
+                        supervisor = [
+                            sys.executable,
+                            "-I",
+                            str(Path(__file__).with_name("_git_supervisor.py")),
+                            str(control_read),
+                            str(status_write),
+                            str(completion_write),
+                            str(liveness_fd),
+                            str(anchor.pid),
+                            ",".join(str(descriptor) for descriptor in extra_fds),
+                            str(
+                                working_directory_fd
+                                if working_directory_fd is not None
+                                else -1
+                            ),
+                            "finish" if finish_on_parent_exit else "cancel",
+                            str(GIT_EFFECT_TIMEOUT_SECONDS),
+                            str(GIT_CAPTURE_LIMIT),
+                            *command,
+                        ]
                         process = subprocess.Popen(  # noqa: S603
                             supervisor,
                             stdout=stdout,
@@ -900,7 +922,7 @@ def _run_supervised_git(
                                 liveness_fd,
                                 *extra_fds,
                             ),
-                            start_new_session=True,
+                            process_group=0,
                         )
                         os.close(control_read)
                         control_read = -1
@@ -915,11 +937,13 @@ def _run_supervised_git(
                         raise GitError("Git supervisor failed before child startup")
                     returncode = _read_supervisor_completion(completion_read)
                     if returncode is None:
-                        _cancel_process_group(process.pid)
+                        _cancel_process_group(anchor.pid)
                         process.wait()
+                        anchor.wait()
                         settled = True
                         raise GitError("Git supervisor failed before completion")
                     process.wait()
+                    anchor.wait()
                     settled = True
                 except BaseException:
                     for descriptor in (control_read, status_write, completion_write):
@@ -930,14 +954,20 @@ def _run_supervised_git(
                         os.write(control_write, interrupt_command)
                     if process is not None and not settled:
                         completion = _read_supervisor_completion(completion_read)
-                        if completion is None:
-                            _cancel_process_group(process.pid)
+                        if completion is None and anchor is not None:
+                            _cancel_process_group(anchor.pid)
                         process.wait()
+                    if anchor is not None and not settled:
+                        _cancel_process_group(anchor.pid)
+                        anchor.wait()
                     raise
             stdout.seek(0)
             stderr.seek(0)
             return subprocess.CompletedProcess(
-                command, returncode, stdout.read(), stderr.read()
+                command,
+                returncode,
+                _read_capture(stdout, GIT_CAPTURE_LIMIT),
+                _read_capture(stderr, GIT_CAPTURE_LIMIT),
             )
     finally:
         for descriptor in (
@@ -1015,24 +1045,41 @@ def _read_pipe_frame(descriptor: int, limit: int) -> bytes:
     return bytes(value)
 
 
+def _read_capture(stream: BinaryIO, limit: int) -> bytes:
+    data = stream.read(limit + 1)
+    if len(data) <= limit:
+        return data
+    marker = b"\n[diagnostic output truncated]\n"
+    return (data[: max(0, limit - len(marker))] + marker)[:limit]
+
+
 def _cancel_process_group(process_group: int) -> None:
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGTERM)
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        if not _process_group_running(process_group):
+        if not _wait_for_process_group_state(process_group):
             return
         time.sleep(0.01)
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGKILL)
-    while _process_group_running(process_group):
-        time.sleep(0.01)
+    while _wait_for_process_group_state(process_group):
+        time.sleep(0.1)
+
+
+def _wait_for_process_group_state(process_group: int) -> bool:
+    while True:
+        try:
+            return _process_group_running(process_group)
+        except (OSError, subprocess.SubprocessError):
+            time.sleep(0.1)
 
 
 def _process_group_running(process_group: int) -> bool:
     proc = Path("/proc")
     if proc.is_dir():
         parsed = False
+        complete = True
         for entry in proc.iterdir():
             if not entry.name.isdigit():
                 continue
@@ -1046,9 +1093,11 @@ def _process_group_running(process_group: int) -> bool:
                 parsed = True
                 if int(fields[2]) == process_group and fields[0] != "Z":
                     return True
+            except FileNotFoundError:
+                pass
             except (IndexError, OSError, ValueError):
-                continue
-        if parsed:
+                complete = False
+        if parsed and complete:
             return False
     result = subprocess.run(
         ["/bin/ps", "-axo", "pgid=,state="],
