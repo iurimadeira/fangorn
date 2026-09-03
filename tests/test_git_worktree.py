@@ -9,7 +9,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from git_helpers import git, initialize_repository
@@ -338,9 +338,18 @@ def test_supervisor_process_group_probe_falls_back_without_proc(
 def test_supervisor_drains_git_when_owner_dies_before_status_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class Stream:
+        def __init__(self, descriptor: int) -> None:
+            self._descriptor = descriptor
+
+        def fileno(self) -> int:
+            return self._descriptor
+
     class Child:
         pid = 123
         returncode = 0
+        stdout = Stream(20)
+        stderr = Stream(21)
 
         @staticmethod
         def poll() -> int:
@@ -357,7 +366,6 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
             "11",
             "12",
             "13",
-            "123",
             "",
             "-1",
             "cancel",
@@ -376,6 +384,7 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
         git_supervisor, "_drain", lambda value, _process_group: drained.append(value)
     )
     monkeypatch.setattr(git_supervisor, "_child_running", lambda _child: False)
+    monkeypatch.setattr(git_supervisor, "_finish_captures", lambda *_args: False)
 
     assert git_supervisor.main() == 0
     assert drained == [child]
@@ -512,6 +521,16 @@ def test_portable_group_probe_ignores_zombie_leader(
     )
     assert git_supervisor._process_group_running(77) is False
 
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "truncated\n", ""
+        ),
+    )
+    with pytest.raises(OSError, match="parse process-group"):
+        git_supervisor._process_group_running(77)
+
 
 def test_group_probe_falls_back_when_proc_scan_is_incomplete(
     monkeypatch: pytest.MonkeyPatch,
@@ -551,6 +570,22 @@ def test_group_cleanup_retries_failed_observation(
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
 
     assert git_supervisor._wait_for_group_state(77) is False
+
+
+def test_parent_group_probe_rejects_malformed_ps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "truncated\n", ""
+        ),
+    )
+
+    with pytest.raises(OSError, match="parse process-group"):
+        git_worktree_adapter._process_group_running(77)
 
 
 def test_supervised_git_rejects_ignored_sigchld_before_effects(
@@ -683,14 +718,10 @@ def test_git_cleanup_owns_supervisor_before_pending_interrupt(
     monkeypatch.setenv("FANGORN_STARTED", str(started))
     monkeypatch.setenv("FANGORN_STOPPED", str(stopped))
     real_popen = subprocess.Popen
-    anchor_pid: int | None = None
 
     def interrupt_after_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
-        nonlocal anchor_pid
         process = real_popen(*args, **kwargs)
         command = args[0]
-        if isinstance(command, list) and "signal.pause()" in str(command):
-            anchor_pid = process.pid
         if isinstance(command, list) and any(
             str(value).endswith("_git_supervisor.py") for value in command
         ):
@@ -708,8 +739,7 @@ def test_git_cleanup_owns_supervisor_before_pending_interrupt(
         os.close(liveness)
         os.close(writer)
 
-    assert anchor_pid is not None
-    assert not git_worktree_adapter._process_group_running(anchor_pid)
+    assert not started.exists() or stopped.read_text(encoding="utf-8") == "stopped"
 
 
 def test_supervised_git_cleans_group_when_supervisor_dies(
@@ -909,6 +939,42 @@ def test_target_parent_helpers_fail_closed(
         os.close(descriptor)
 
 
+def test_cache_staging_cleanup_failure_is_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_repository = tmp_path / "source"
+    repository(source_repository)
+    source = normalize_repository_source(source_repository.as_uri())
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr("fangorn.git_worktree.shutil.rmtree", fail_cleanup)
+
+    with pytest.raises(GitError, match="Failed to clean clone staging"):
+        materialize_cache(source, tmp_path / "cache" / "repository.git")
+
+
+def test_receipt_staging_cleanup_failure_is_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = tmp_path / "receipt"
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    original_unlink = Path.unlink
+
+    def fail_temporary_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name.startswith(".receipt."):
+            raise OSError("cleanup failed")
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", fail_temporary_unlink)
+    try:
+        with pytest.raises(GitError, match="Failed to clean receipt staging"):
+            git_worktree_adapter._create_staging_receipt(receipt, "a" * 64, descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def test_clone_cache_removes_only_proven_dead_private_clone(tmp_path: Path) -> None:
     source_repository = tmp_path / "source"
     repository(source_repository)
@@ -994,11 +1060,13 @@ def test_git_adapter_forces_stable_diagnostics_locale(
 ) -> None:
     captured: dict[str, str] = {}
 
-    def run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        captured.update(cast(dict[str, str], kwargs["env"]))
+    def run(
+        command: list[str], environment: dict[str, str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        captured.update(environment)
         return subprocess.CompletedProcess([], 0, b"a" * 40, b"")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(git_worktree_adapter, "_run_supervised_git", run)
     resolve_commit(tmp_path, None)
 
     assert captured["LC_ALL"] == "C"

@@ -17,23 +17,22 @@ def main() -> int:
     completion = int(sys.argv[3])
     liveness = int(sys.argv[4])
     os.fstat(liveness)
-    process_group = int(sys.argv[5])
-    inherited = tuple(int(value) for value in sys.argv[6].split(",") if value)
-    working_directory = int(sys.argv[7])
-    finish_on_owner_exit = sys.argv[8] == "finish"
-    timeout = int(sys.argv[9])
-    output_limit = int(sys.argv[10])
+    inherited = tuple(int(value) for value in sys.argv[5].split(",") if value)
+    working_directory = int(sys.argv[6])
+    finish_on_owner_exit = sys.argv[7] == "finish"
+    timeout = int(sys.argv[8])
+    output_limit = int(sys.argv[9])
     try:
         result = _supervise(
             control,
             status,
-            process_group,
+            liveness,
             inherited,
             working_directory,
             finish_on_owner_exit,
             timeout,
             output_limit,
-            sys.argv[11:],
+            sys.argv[10:],
         )
         with suppress(BrokenPipeError):
             os.write(completion, f"{result}\n".encode("ascii"))
@@ -45,7 +44,7 @@ def main() -> int:
 def _supervise(
     control: int,
     status: int,
-    process_group: int,
+    liveness: int,
     inherited: tuple[int, ...],
     working_directory: int,
     finish_on_owner_exit: bool,
@@ -55,8 +54,10 @@ def _supervise(
 ) -> int:
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
         command,
-        pass_fds=inherited,
-        process_group=process_group,
+        pass_fds=(liveness, *inherited),
+        process_group=0,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         preexec_fn=(
             (lambda: os.fchdir(working_directory)) if working_directory >= 0 else None
         ),
@@ -67,33 +68,93 @@ def _supervise(
         pass
     finally:
         os.close(status)
+    process_group = child.pid
+    if child.stdout is None or child.stderr is None:
+        raise RuntimeError("Git capture pipes are unavailable")
+    captures = {
+        child.stdout.fileno(): [1, 0],
+        child.stderr.fileno(): [2, 0],
+    }
     deadline = time.monotonic() + timeout
     while True:
         if time.monotonic() >= deadline:
+            _close_captures(captures)
             _drain(child, process_group)
             _replace_output("Git operation exceeded one hour")
             return 124
-        if max(os.fstat(1).st_size, os.fstat(2).st_size) > output_limit:
+        if not _child_running(child):
+            break
+        readable, _, _ = select.select((control, *captures), (), (), 0.01)
+        if _forward_captures(readable, captures, output_limit):
+            _close_captures(captures)
             _drain(child, process_group)
             _replace_output("Git diagnostic output exceeded 8 MiB")
             return 124
-        if not _child_running(child):
-            break
-        readable, _, _ = select.select((control,), (), (), 0.01)
         if not readable:
+            continue
+        if control not in readable:
             continue
         command_byte = os.read(control, 1)
         if not command_byte:
             (_finish if finish_on_owner_exit else _drain)(child, process_group)
+            if _finish_captures(captures, output_limit):
+                _replace_output("Git diagnostic output exceeded 8 MiB")
+                return 124
             return child.returncode
         if command_byte == b"c":
             _drain(child, process_group)
+            if _finish_captures(captures, output_limit):
+                _replace_output("Git diagnostic output exceeded 8 MiB")
+                return 124
             return child.returncode
         if command_byte == b"f":
             _finish(child, process_group)
+            if _finish_captures(captures, output_limit):
+                _replace_output("Git diagnostic output exceeded 8 MiB")
+                return 124
             return child.returncode
     _drain(child, process_group)
+    if _finish_captures(captures, output_limit):
+        _replace_output("Git diagnostic output exceeded 8 MiB")
+        return 124
+    if time.monotonic() >= deadline:
+        _replace_output("Git operation exceeded one hour")
+        return 124
     return child.returncode
+
+
+def _forward_captures(
+    readable: list[int], captures: dict[int, list[int]], limit: int
+) -> bool:
+    exceeded = False
+    for descriptor in set(readable) & captures.keys():
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            del captures[descriptor]
+            continue
+        destination, written = captures[descriptor]
+        remaining = max(0, limit - written)
+        retained = chunk[:remaining]
+        while retained:
+            count = os.write(destination, retained)
+            retained = retained[count:]
+        captures[descriptor][1] += min(len(chunk), remaining)
+        exceeded |= len(chunk) > remaining
+    return exceeded
+
+
+def _finish_captures(captures: dict[int, list[int]], limit: int) -> bool:
+    exceeded = False
+    while captures:
+        readable, _, _ = select.select(tuple(captures), (), ())
+        exceeded |= _forward_captures(readable, captures, limit)
+    return exceeded
+
+
+def _close_captures(captures: dict[int, list[int]]) -> None:
+    for descriptor in captures:
+        os.close(descriptor)
+    captures.clear()
 
 
 def _replace_output(message: str) -> None:
@@ -177,14 +238,14 @@ def _process_group_running(process_group: int) -> bool:
         start_new_session=True,
         text=True,
     )
-    return any(
-        len(fields := line.split()) == 3
-        and fields[0].isdigit()
-        and fields[1].isdigit()
-        and int(fields[1]) == process_group
-        and not fields[2].startswith("Z")
-        for line in result.stdout.splitlines()
-    )
+    running = False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            raise OSError("Cannot parse process-group state")
+        if int(fields[1]) == process_group and not fields[2].startswith("Z"):
+            running = True
+    return running
 
 
 if __name__ == "__main__":

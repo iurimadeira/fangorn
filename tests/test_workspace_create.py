@@ -1239,6 +1239,46 @@ def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     assert (tmp_path / "worktrees" / "cli-stopped").exists()
 
 
+@pytest.mark.parametrize("clone_url", [False, True])
+def test_cli_workspace_create_supports_default_paths_and_clone_urls(
+    tmp_path: Path, clone_url: bool
+) -> None:
+    repository = tmp_path / "repository"
+    created_from_sha = create_repository(repository)
+    data_home = tmp_path / "data"
+    source = repository.as_uri() if clone_url else str(repository)
+    completed = subprocess.run(  # noqa: S603 -- test controls installed executable
+        [
+            Path(sys.executable).with_name("fangorn"),
+            "--json",
+            "workspace",
+            "create",
+            "--repo",
+            source,
+            "--branch",
+            "default-path",
+            "--headless",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **dict(os.environ),
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+            "XDG_DATA_HOME": str(data_home),
+            "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["schema_version"] == 2
+    assert payload["workspace"]["definition"]["created_from_sha"] == created_from_sha
+    target = Path(payload["workspace"]["path"])
+    assert target.is_relative_to(data_home / "fangorn" / "worktrees")
+    assert target.exists()
+
+
 def test_cli_workspace_create_human_retry_and_scope_error(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -1404,6 +1444,39 @@ def test_cleanup_persistence_failure_is_reported_with_effect_failure(
     with pytest.raises(
         WorkspaceError,
         match="effect failed; failed to persist create failure: Registry is busy",
+    ):
+        workspaces.create(request)
+
+
+def test_repository_release_failure_preserves_cache_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=repository.as_uri(),
+        branch="cache-release",
+        path=tmp_path / "worktrees" / "cache-release",
+        request_id="cache-release-1",
+        headless=True,
+    )
+    release = workspaces._registry.release_lease
+
+    def fail_cache(*_args: object, **_kwargs: object) -> Path:
+        raise OSError("cache failed")
+
+    def fail_repository_release(**kwargs: object) -> None:
+        if kwargs["scope_kind"] == "repository":
+            raise RegistryError("release failed")
+        release(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("fangorn.workspaces.materialize_cache", fail_cache)
+    monkeypatch.setattr(workspaces._registry, "release_lease", fail_repository_release)
+
+    with pytest.raises(
+        WorkspaceError,
+        match="cache failed; failed to release Repository lease: release failed",
     ):
         workspaces.create(request)
 

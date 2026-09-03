@@ -202,6 +202,7 @@ def materialize_cache(
     prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
     invocation = Path(tempfile.mkdtemp(prefix=prefix, dir=cache_path.parent))
     clone = invocation / "repository.git"
+    primary_error: BaseException | None = None
     try:
         if owner is not None:
             (invocation / "owner.json").write_text(
@@ -256,11 +257,24 @@ def materialize_cache(
                 )
         _fsync_directory(cache_path.parent, "Repository cache publication")
         return cache_path
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if invocation.parent == cache_path.parent and invocation.name.startswith(
             "clone-"
         ):
-            shutil.rmtree(invocation, ignore_errors=True)
+            try:
+                shutil.rmtree(invocation)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                if primary_error is not None:
+                    raise GitError(
+                        f"{primary_error}; failed to clean clone staging: "
+                        f"{cleanup_error}"
+                    ) from primary_error
+                raise GitError("Failed to clean clone staging") from cleanup_error
 
 
 def _cleanup_abandoned_clones(
@@ -563,6 +577,7 @@ def _create_staging_receipt(
 ) -> None:
     descriptor: int | None = None
     temporary: Path | None = None
+    primary_error: GitError | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.", dir=path.parent
@@ -584,7 +599,8 @@ def _create_staging_receipt(
         )
         _fsync_descriptor(parent_descriptor, "Workspace staging ownership")
     except OSError as error:
-        raise GitError("Workspace staging ownership receipt is unavailable") from error
+        primary_error = GitError("Workspace staging ownership receipt is unavailable")
+        raise primary_error from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -592,8 +608,15 @@ def _create_staging_receipt(
             try:
                 temporary.unlink()
                 _fsync_directory(path.parent, "Workspace staging ownership")
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as cleanup_error:
+                if primary_error is not None:
+                    raise GitError(
+                        f"{primary_error}; failed to clean receipt staging: "
+                        f"{cleanup_error}"
+                    ) from primary_error
+                raise GitError("Failed to clean receipt staging") from cleanup_error
 
 
 def _require_staging_receipt(
@@ -824,20 +847,11 @@ def _run_git_process(
         environment.pop(name, None)
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    owned_liveness: tuple[int, int] | None = None
     try:
         if liveness_fd is None:
-            return subprocess.run(  # noqa: S603
-                command,
-                check=False,
-                capture_output=True,
-                env=environment,
-                pass_fds=extra_fds,
-                preexec_fn=(
-                    (lambda: os.fchdir(working_directory_fd))
-                    if working_directory_fd is not None
-                    else None
-                ),
-            )
+            owned_liveness = os.pipe()
+            liveness_fd = owned_liveness[0]
         return _run_supervised_git(
             command,
             environment,
@@ -850,6 +864,11 @@ def _run_git_process(
         raise GitError("Git executable was not found") from error
     except OSError as error:
         raise GitError(f"Cannot run Git: {error}") from error
+    finally:
+        if owned_liveness is not None:
+            for descriptor in owned_liveness:
+                with suppress(OSError):
+                    os.close(descriptor)
 
 
 def _run_supervised_git(
@@ -866,8 +885,8 @@ def _run_supervised_git(
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
     completion_read, completion_write = os.pipe()
-    anchor: subprocess.Popen[bytes] | None = None
     process: subprocess.Popen[bytes] | None = None
+    process_group: int | None = None
     settled = False
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -878,18 +897,6 @@ def _run_supervised_git(
                         signal.SIG_BLOCK, {signal.SIGINT}
                     )
                     try:
-                        anchor = subprocess.Popen(
-                            [
-                                sys.executable,
-                                "-I",
-                                "-c",
-                                "import signal\nwhile True: signal.pause()",
-                            ],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            process_group=0,
-                        )
                         supervisor = [
                             sys.executable,
                             "-I",
@@ -898,7 +905,6 @@ def _run_supervised_git(
                             str(status_write),
                             str(completion_write),
                             str(liveness_fd),
-                            str(anchor.pid),
                             ",".join(str(descriptor) for descriptor in extra_fds),
                             str(
                                 working_directory_fd
@@ -935,15 +941,14 @@ def _run_supervised_git(
                     child_pid = _read_supervisor_pid(status_read)
                     if child_pid is None:
                         raise GitError("Git supervisor failed before child startup")
+                    process_group = child_pid
                     returncode = _read_supervisor_completion(completion_read)
                     if returncode is None:
-                        _cancel_process_group(anchor.pid)
+                        _cancel_process_group(process_group)
                         process.wait()
-                        anchor.wait()
                         settled = True
                         raise GitError("Git supervisor failed before completion")
                     process.wait()
-                    anchor.wait()
                     settled = True
                 except BaseException:
                     for descriptor in (control_read, status_write, completion_write):
@@ -954,12 +959,9 @@ def _run_supervised_git(
                         os.write(control_write, interrupt_command)
                     if process is not None and not settled:
                         completion = _read_supervisor_completion(completion_read)
-                        if completion is None and anchor is not None:
-                            _cancel_process_group(anchor.pid)
+                        if completion is None and process_group is not None:
+                            _cancel_process_group(process_group)
                         process.wait()
-                    if anchor is not None and not settled:
-                        _cancel_process_group(anchor.pid)
-                        anchor.wait()
                     raise
             stdout.seek(0)
             stderr.seek(0)
@@ -1107,13 +1109,14 @@ def _process_group_running(process_group: int) -> bool:
         start_new_session=True,
         text=True,
     )
-    return any(
-        len(fields := line.split()) == 2
-        and fields[0].isdigit()
-        and int(fields[0]) == process_group
-        and not fields[1].startswith("Z")
-        for line in result.stdout.splitlines()
-    )
+    running = False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            raise OSError("Cannot parse process-group state")
+        if int(fields[0]) == process_group and not fields[1].startswith("Z"):
+            running = True
+    return running
 
 
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:

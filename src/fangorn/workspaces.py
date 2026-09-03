@@ -473,6 +473,7 @@ class Workspaces:
             owner=owner,
             owner_status=self._owner_status,
         )
+        primary_error: BaseException | None = None
         try:
             previous = self._registry.start_operation_step(
                 operation_id,
@@ -507,13 +508,24 @@ class Workspaces:
                     lease_epoch=epoch,
                 )
             return repository
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            self._registry.release_lease(
-                scope_kind="repository",
-                scope_key=source.normalized,
-                operation_id=operation_id,
-                lease_epoch=epoch,
-            )
+            try:
+                self._registry.release_lease(
+                    scope_kind="repository",
+                    scope_key=source.normalized,
+                    operation_id=operation_id,
+                    lease_epoch=epoch,
+                )
+            except RegistryError as release_error:
+                if primary_error is not None:
+                    raise WorkspaceError(
+                        f"{primary_error}; failed to release Repository lease: "
+                        f"{release_error}"
+                    ) from primary_error
+                raise
 
     def _load_completed(
         self, workspace_id: str
