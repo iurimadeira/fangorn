@@ -164,11 +164,8 @@ def read_configuration(
 ) -> bytes | None:
     if explicit is not None:
         try:
-            descriptor = os.open(explicit, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            descriptor = _open_configuration_file(explicit)
             try:
-                metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise GitError("Configuration must be a regular non-symlink file")
                 with os.fdopen(descriptor, "rb") as opened:
                     descriptor = -1
                     content = opened.read(CONFIGURATION_LIMIT + 1)
@@ -199,6 +196,34 @@ def read_configuration(
     ):
         return None
     raise GitError(_git_error(result))
+
+
+def _open_configuration_file(path: Path) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise GitError("Configuration is unavailable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, directory_flags)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        result = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=descriptor,
+        )
+        try:
+            regular = stat.S_ISREG(os.fstat(result).st_mode)
+        except BaseException:
+            os.close(result)
+            raise
+        if not regular:
+            os.close(result)
+            raise GitError("Configuration must be a regular non-symlink file")
+        return result
+    finally:
+        os.close(descriptor)
 
 
 def materialize_cache(

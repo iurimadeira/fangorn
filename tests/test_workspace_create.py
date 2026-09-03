@@ -315,28 +315,49 @@ def test_reused_target_with_divergent_definition_conflicts_before_effects(
 
 
 def test_configuration_symlink_loop_is_a_domain_error_before_effects(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
-    first = tmp_path / "config"
-    first.write_text("schema_version = 1\n", encoding="utf-8")
+    first = tmp_path / "config-a"
+    second = tmp_path / "config-b"
+    first.symlink_to(second)
+    second.symlink_to(first)
     target = tmp_path / "target"
-    real_resolve = Path.resolve
-
-    def loop(path: Path, *, strict: bool = False) -> Path:
-        if path == first:
-            raise RuntimeError("synthetic symlink loop")
-        return real_resolve(path, strict=strict)
-
-    monkeypatch.setattr(Path, "resolve", loop)
 
     with pytest.raises(
-        WorkspaceError, match="Configuration path cannot be canonicalized"
+        WorkspaceError, match="Configuration must be a regular non-symlink file"
     ):
         facade(tmp_path).create(
             CreateWorkspace(
                 repository=str(repository), branch="topic", path=target, config=first
+            )
+        )
+
+    assert not target.exists()
+
+
+def test_explicit_configuration_rejects_symlinked_ancestor_before_effects(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    (redirected / "fangorn.toml").write_text(
+        "schema_version = 1\n# secret\n", encoding="utf-8"
+    )
+    controlled = tmp_path / "controlled"
+    controlled.symlink_to(redirected, target_is_directory=True)
+    target = tmp_path / "target"
+
+    with pytest.raises(WorkspaceError, match="Configuration is unavailable"):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(repository),
+                branch="topic",
+                path=target,
+                config=controlled / "fangorn.toml",
             )
         )
 
@@ -2451,7 +2472,7 @@ def test_create_rejects_dangling_target_symlink(tmp_path: Path) -> None:
     assert not (tmp_path / "state").exists()
 
 
-def test_explicit_configuration_uses_its_canonical_path(
+def test_explicit_configuration_expands_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = tmp_path / "repository"

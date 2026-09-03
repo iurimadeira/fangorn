@@ -357,8 +357,8 @@ class Workspaces:
                 return self._completed_create(intent.workspace_id, created=created)
 
             config = (
-                _configuration_path(request.config)
-                if intent.resolved_json is None and request.config is not None
+                Path(config_identity)
+                if intent.resolved_json is None and config_identity is not None
                 else None
             )
             repository = self._prepare_repository(
@@ -1046,18 +1046,6 @@ def _canonical_target(path: Path) -> Path:
     resolved = absolute.resolve(strict=False)
     validate_target_path(resolved)
     return resolved
-
-
-def _configuration_path(path: Path) -> Path:
-    try:
-        expanded = path.expanduser().absolute()
-        if expanded.is_symlink():
-            raise WorkspaceError("Configuration must be a regular non-symlink file")
-        return expanded.resolve(strict=True)
-    except WorkspaceError:
-        raise
-    except (OSError, RuntimeError) as error:
-        raise WorkspaceError("Configuration path cannot be canonicalized") from error
 
 
 def _configuration_identity(path: Path) -> Path:

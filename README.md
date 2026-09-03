@@ -61,7 +61,8 @@ operational Git facts. `--no-start` provisions the Worktree and returns
 `stopped`. Use `--base REF` to resolve another commit once, `--request-id KEY`
 for caller idempotency, and `--config PATH` to snapshot an explicit
 `fangorn.toml`. Configuration is capped at 1 MiB whether read from that path or
-from the resolved commit.
+from the resolved commit. Every component of an explicit configuration path
+must be a real, non-symlink filesystem entry.
 
 Equivalent retries return the same Workspace ID, resolved `created_from_sha`,
 target path, and completed operation. Reusing a request ID or target path with

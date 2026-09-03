@@ -171,11 +171,15 @@ def test_explicit_configuration_is_read_from_validated_descriptor(
     swapped = False
 
     def swap_after_open(
-        path: str | bytes | os.PathLike[str] | os.PathLike[bytes], flags: int
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
     ) -> int:
         nonlocal swapped
-        descriptor = real_open(path, flags)
-        if path == explicit:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path in {explicit, explicit.name}:
             swapped = True
             explicit.unlink()
             explicit.symlink_to(replacement)
@@ -184,6 +188,50 @@ def test_explicit_configuration_is_read_from_validated_descriptor(
     monkeypatch.setattr(os, "open", swap_after_open)
 
     assert read_configuration(source, commit, explicit) == b"schema_version = 1\n"
+    assert swapped
+
+
+def test_explicit_configuration_read_stays_bound_to_opened_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "repository"
+    commit = repository(source)
+    controlled = tmp_path / "controlled"
+    controlled.mkdir()
+    parked = tmp_path / "parked"
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    explicit = controlled / "fangorn.toml"
+    explicit.write_bytes(b"schema_version = 1\n# trusted\n")
+    (redirected / explicit.name).write_bytes(b"schema_version = 1\n# secret\n")
+    real_open = os.open
+    swapped = False
+
+    def swap_ancestor(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and path == explicit:
+            controlled.rename(parked)
+            controlled.symlink_to(redirected, target_is_directory=True)
+            swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if not swapped and path == controlled.name:
+            controlled.rename(parked)
+            controlled.symlink_to(redirected, target_is_directory=True)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swap_ancestor)
+
+    assert read_configuration(source, commit, explicit) == (
+        b"schema_version = 1\n# trusted\n"
+    )
     assert swapped
 
 
