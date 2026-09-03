@@ -7,6 +7,7 @@ from git_helpers import git, initialize_repository
 
 from fangorn.git import GitError
 from fangorn.git_worktree import (
+    RepositorySource,
     create_worktree,
     inspect_owned_worktree,
     materialize_cache,
@@ -73,6 +74,18 @@ def test_commit_and_configuration_reads_are_immutable(tmp_path: Path) -> None:
     symlink.symlink_to(explicit)
     with pytest.raises(GitError, match="non-symlink"):
         read_configuration(source, commit, symlink)
+    with pytest.raises(GitError, match="Configuration is unavailable"):
+        read_configuration(source, commit, tmp_path / "missing.toml")
+
+
+def test_materialize_local_source_requires_and_returns_path(tmp_path: Path) -> None:
+    source = RepositorySource("local", tmp_path, None, "local")
+
+    assert materialize_cache(source, tmp_path / "unused") == tmp_path
+    with pytest.raises(GitError, match="Local repository path is unavailable"):
+        materialize_cache(
+            RepositorySource("local", None, None, "local"), tmp_path / "unused"
+        )
 
 
 def test_clone_cache_reuses_only_matching_bare_repository(tmp_path: Path) -> None:
@@ -89,6 +102,11 @@ def test_clone_cache_reuses_only_matching_bare_repository(tmp_path: Path) -> Non
     git(cache, "remote", "set-url", "origin", second.as_uri())
     with pytest.raises(GitError, match="belongs to another source"):
         materialize_cache(source, cache)
+
+    invalid_cache = tmp_path / "cache" / "not-bare.git"
+    invalid_cache.mkdir()
+    with pytest.raises(GitError, match="not a bare repository"):
+        materialize_cache(source, invalid_cache)
 
 
 def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -> None:
@@ -124,6 +142,24 @@ def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -
             branch="topic",
             commit=commit,
             ownership_token=token,
+            reconcile=False,
+        )
+    with pytest.raises(GitError, match="interrupted create"):
+        create_worktree(
+            source,
+            target=target,
+            branch="topic",
+            commit="0" * 40,
+            ownership_token=token,
+            reconcile=True,
+        )
+    with pytest.raises(GitError, match="already exists"):
+        create_worktree(
+            source,
+            target=tmp_path / "other-target",
+            branch="main",
+            commit=commit,
+            ownership_token="c" * 64,
             reconcile=False,
         )
     with pytest.raises(GitError, match="ownership token"):

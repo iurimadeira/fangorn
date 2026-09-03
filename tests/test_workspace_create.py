@@ -322,6 +322,51 @@ def test_cli_workspace_create_emits_schema_2(tmp_path: Path) -> None:
     assert payload["operation"]["status"] == "completed"
 
 
+def test_cli_workspace_create_human_retry_and_scope_error(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    state_home = tmp_path / "state"
+    target = tmp_path / "worktrees" / "human"
+    executable = Path(sys.executable).with_name("fangorn")
+    environment = {
+        **dict(os.environ),
+        "XDG_STATE_HOME": str(state_home),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+    }
+    arguments: list[str | Path] = [
+        executable,
+        "workspace",
+        "create",
+        "--repo",
+        str(repository),
+        "--branch",
+        "human-topic",
+        "--path",
+        str(target),
+        "--headless",
+    ]
+
+    created = subprocess.run(  # noqa: S603 -- test controls installed executable
+        arguments, check=False, capture_output=True, text=True, env=environment
+    )
+    retried = subprocess.run(  # noqa: S603 -- test controls installed executable
+        arguments, check=False, capture_output=True, text=True, env=environment
+    )
+    unsupported = subprocess.run(  # noqa: S603 -- test controls installed executable
+        arguments[:-1], check=False, capture_output=True, text=True, env=environment
+    )
+
+    assert created.returncode == 0
+    assert created.stdout.startswith("Created Workspace ")
+    assert "State: ready\n" in created.stdout
+    assert f"Path: {target}\n" in created.stdout
+    assert retried.returncode == 0
+    assert retried.stdout.startswith("Already created Workspace ")
+    assert unsupported.returncode != 0
+    assert "Only headless Workspace creation" in unsupported.stderr
+
+
 def test_retry_reconciles_worktree_after_interrupted_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

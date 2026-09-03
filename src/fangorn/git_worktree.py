@@ -194,7 +194,13 @@ def inspect_owned_worktree(
 
 
 def _verify_bare_repository(path: Path, normalized_source: str) -> None:
-    if _run_git(path, "rev-parse", "--is-bare-repository") != "true":
+    try:
+        bare = _run_git(path, "rev-parse", "--is-bare-repository")
+    except GitError as error:
+        raise GitError(
+            f"Repository cache entry is not a bare repository: {path}"
+        ) from error
+    if bare != "true":
         raise GitError(f"Repository cache entry is not a bare repository: {path}")
     origin = _run_git(path, "remote", "get-url", "origin")
     try:
