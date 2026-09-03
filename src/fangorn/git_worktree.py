@@ -459,9 +459,10 @@ def create_worktree(
                 "worktree",
                 "add",
                 "--detach",
-                str(staging),
+                _descriptor_entry(parent.descriptor, staging.name),
                 commit,
                 liveness_fd=liveness_fd,
+                extra_fds=(parent.descriptor,),
             )
             if added.returncode != 0:
                 raise GitError(_git_error(added))
@@ -484,7 +485,12 @@ def create_worktree(
                 else ("checkout", "-b", branch, commit)
             )
             _require_target_parent(parent)
-            selected = _run_git_process(staging, *checkout, liveness_fd=liveness_fd)
+            selected = _run_git_process(
+                Path(_descriptor_entry(parent.descriptor, staging.name)),
+                *checkout,
+                liveness_fd=liveness_fd,
+                extra_fds=(parent.descriptor,),
+            )
             if selected.returncode != 0:
                 raise GitError(_git_error(selected))
             _require_target_parent(parent)
@@ -497,10 +503,11 @@ def create_worktree(
             repository,
             "worktree",
             "move",
-            str(staging),
-            str(target),
+            _descriptor_entry(parent.descriptor, staging.name),
+            _descriptor_entry(parent.descriptor, target.name),
             liveness_fd=liveness_fd,
             finish_on_parent_exit=True,
+            extra_fds=(parent.descriptor,),
         )
         if moved.returncode != 0:
             raise GitError(_git_error(moved))
@@ -693,6 +700,11 @@ def _entry_kind(parent_descriptor: int, name: str) -> str | None:
     return "symlink" if stat.S_ISLNK(metadata.st_mode) else "present"
 
 
+def _descriptor_entry(parent_descriptor: int, name: str) -> str:
+    root = "/dev/fd" if Path("/dev/fd").is_dir() else "/proc/self/fd"
+    return f"{root}/{parent_descriptor}/{name}"
+
+
 def _fsync_descriptor(descriptor: int, label: str) -> None:
     try:
         os.fsync(descriptor)
@@ -786,6 +798,7 @@ def _run_git_process(
     use_c: bool = False,
     liveness_fd: int | None = None,
     finish_on_parent_exit: bool = False,
+    extra_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     command = ["git"]
     if use_c:
@@ -808,12 +821,14 @@ def _run_git_process(
                 check=False,
                 capture_output=True,
                 env=environment,
+                pass_fds=extra_fds,
             )
         return _run_supervised_git(
             command,
             environment,
             liveness_fd=liveness_fd,
             finish_on_parent_exit=finish_on_parent_exit,
+            extra_fds=extra_fds,
         )
     except FileNotFoundError as error:
         raise GitError("Git executable was not found") from error
@@ -827,6 +842,7 @@ def _run_supervised_git(
     *,
     liveness_fd: int,
     finish_on_parent_exit: bool,
+    extra_fds: tuple[int, ...],
 ) -> subprocess.CompletedProcess[bytes]:
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
@@ -837,17 +853,19 @@ def _run_supervised_git(
         str(control_read),
         str(status_write),
         str(liveness_fd),
+        ",".join(str(descriptor) for descriptor in extra_fds),
         *command,
     ]
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            with _ignore_repeated_sigint():
+            interrupt_command = b"f" if finish_on_parent_exit else b"c"
+            with _ignore_repeated_sigint(control_write, interrupt_command):
                 process = subprocess.Popen(  # noqa: S603
                     supervisor,
                     stdout=stdout,
                     stderr=stderr,
                     env=environment,
-                    pass_fds=(control_read, status_write, liveness_fd),
+                    pass_fds=(control_read, status_write, liveness_fd, *extra_fds),
                     start_new_session=True,
                 )
                 os.close(control_read)
@@ -883,7 +901,9 @@ def _run_supervised_git(
 
 
 @contextmanager
-def _ignore_repeated_sigint() -> Iterator[None]:
+def _ignore_repeated_sigint(
+    control_descriptor: int, interrupt_command: bytes
+) -> Iterator[None]:
     try:
         previous = signal.getsignal(signal.SIGINT)
         installed = True
@@ -895,6 +915,8 @@ def _ignore_repeated_sigint() -> Iterator[None]:
                 return
             interrupted = True
             signal.signal(signal.SIGINT, signal.SIG_IGN)
+            with suppress(OSError):
+                os.write(control_descriptor, interrupt_command)
             if callable(previous):
                 previous(signum, frame)
             elif previous != signal.SIG_IGN:

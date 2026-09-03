@@ -13,13 +13,13 @@ from pathlib import Path
 def main() -> int:
     control = int(sys.argv[1])
     status = int(sys.argv[2])
-    int(sys.argv[3])
+    liveness = int(sys.argv[3])
+    inherited = tuple(int(value) for value in sys.argv[4].split(",") if value)
     child = subprocess.Popen(  # noqa: S603 -- caller supplies Fangorn's fixed Git argv
-        sys.argv[4:], start_new_session=True
+        sys.argv[5:], start_new_session=True, pass_fds=(liveness, *inherited)
     )
     os.write(status, f"{child.pid}\n".encode("ascii"))
     os.close(status)
-    finish = False
     while child.poll() is None:
         readable, _, _ = select.select((control,), (), (), 0.01)
         if not readable:
@@ -29,11 +29,17 @@ def main() -> int:
             _drain(child)
             return child.returncode
         if command == b"f":
-            finish = True
-        if finish:
-            continue
+            _finish(child)
+            return child.returncode
     _drain(child)
     return child.returncode
+
+
+def _finish(child: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 2
+    while child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    _drain(child)
 
 
 def _drain(child: subprocess.Popen[bytes]) -> None:

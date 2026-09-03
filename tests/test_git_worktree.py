@@ -209,7 +209,7 @@ def test_interrupted_refresh_is_replayed_without_completion_receipt(
         (False, False, "terminated"),
         (True, False, "completed"),
         (False, True, "terminated"),
-        (True, True, "terminated"),
+        (True, True, "completed"),
     ],
 )
 def test_interrupted_owner_waits_for_git_tree_before_releasing_lease(
@@ -286,7 +286,12 @@ finally:
         time.sleep(0.01)
     assert started.exists()
 
-    child.send_signal(signal.SIGKILL if hard_death else signal.SIGINT)
+    if hard_death and finish_on_parent_exit:
+        child.send_signal(signal.SIGINT)
+        time.sleep(0.1)
+        child.send_signal(signal.SIGKILL)
+    else:
+        child.send_signal(signal.SIGKILL if hard_death else signal.SIGINT)
     registry = Registry(database)
     checker = Workspaces(registry)
     with pytest.raises(RegistryError, match="mutation is busy"):
@@ -455,19 +460,20 @@ def test_worktree_create_rejects_replaced_target_parent_before_git_effect(
     replacement = tmp_path / "replacement"
     replacement.mkdir(mode=0o700)
     original_parent = tmp_path / "original-parent"
-    original = git_worktree_adapter._run_git_process
-    swapped = False
+    original = git_worktree_adapter._require_target_parent
+    checks = 0
 
-    def swap_after_probe(*args: object, **kwargs: object) -> object:
-        nonlocal swapped
-        result = original(*args, **kwargs)  # type: ignore[arg-type]
-        if "show-ref" in args and not swapped:
-            swapped = True
+    def swap_after_final_check(guard: object) -> None:
+        nonlocal checks
+        original(guard)  # type: ignore[arg-type]
+        checks += 1
+        if checks == 2:
             parent.rename(original_parent)
             parent.symlink_to(replacement, target_is_directory=True)
-        return result
 
-    monkeypatch.setattr(git_worktree_adapter, "_run_git_process", swap_after_probe)
+    monkeypatch.setattr(
+        git_worktree_adapter, "_require_target_parent", swap_after_final_check
+    )
 
     with pytest.raises(GitError, match="parent changed"):
         create_worktree(
@@ -480,6 +486,7 @@ def test_worktree_create_rejects_replaced_target_parent_before_git_effect(
         )
 
     assert not any(replacement.iterdir())
+    assert any(original_parent.iterdir())
 
 
 def test_target_parent_walk_rejects_relative_and_symlink_paths(tmp_path: Path) -> None:
