@@ -328,6 +328,91 @@ def test_new_clone_create_refreshes_cached_remote_head(tmp_path: Path) -> None:
     assert second.workspace.definition.created_from_sha == second_sha
 
 
+def test_new_clone_create_tracks_changed_remote_default_branch(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="first",
+            path=tmp_path / "worktrees" / "first",
+        )
+    )
+    git(repository, "checkout", "-b", "new-default")
+    (repository / "new-default.txt").write_text("new default\n", encoding="utf-8")
+    git(repository, "add", "new-default.txt")
+    git(repository, "commit", "-m", "new default")
+    expected = git(repository, "rev-parse", "HEAD")
+
+    second = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="second",
+            path=tmp_path / "worktrees" / "second",
+        )
+    )
+
+    assert second.workspace.definition.created_from_sha == expected
+
+
+def test_clone_refresh_does_not_overwrite_checked_out_workspace_branch(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="topic",
+            path=tmp_path / "worktrees" / "topic",
+        )
+    )
+    git(repository, "branch", "topic")
+
+    result = workspaces.create(
+        CreateWorkspace(
+            repository=repository.as_uri(),
+            branch="other",
+            path=tmp_path / "worktrees" / "other",
+        )
+    )
+
+    assert result.workspace.state == "ready"
+
+
+def test_clone_retry_reuses_completed_cache_while_origin_is_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    request = CreateWorkspace(
+        repository=repository.as_uri(),
+        branch="offline-retry",
+        path=tmp_path / "worktrees" / "offline-retry",
+        request_id="offline-retry",
+    )
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def interrupt_after_effect(*args: object, **kwargs: object) -> object:
+        real_create_worktree(*args, **kwargs)  # type: ignore[arg-type]
+        raise SimulatedInterruption("after Worktree publication")
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", interrupt_after_effect)
+    with pytest.raises(SimulatedInterruption):
+        workspaces.create(request)
+    repository.rename(tmp_path / "origin-offline")
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", real_create_worktree)
+
+    recovered = workspaces.create(request)
+
+    assert recovered.workspace.state == "ready"
+
+
 def test_proven_dead_lease_takeover_fences_stale_result(tmp_path: Path) -> None:
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     intent, _ = registry.begin_create_intent(

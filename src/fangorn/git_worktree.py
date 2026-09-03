@@ -70,15 +70,26 @@ def normalize_repository_source(value: str) -> RepositorySource:
     return RepositorySource(str(common), resolved, None, name or "repository")
 
 
-def resolve_commit(repository: Path, ref: str | None) -> str:
-    selected = ref or "HEAD"
-    try:
-        value = _run_git(repository, "rev-parse", "--verify", f"{selected}^{{commit}}")
-    except GitError as error:
-        raise GitError(f"Cannot resolve Git base {selected}: {error}") from error
-    if not re.fullmatch(r"[0-9a-f]{40,64}", value):
-        raise GitError(f"Git returned an invalid commit for {selected}")
-    return value
+def resolve_commit(repository: Path, ref: str | None, *, remote: bool = False) -> str:
+    selected = ref or ("refs/remotes/origin/HEAD" if remote else "HEAD")
+    candidates = (
+        (f"refs/remotes/origin/{ref}", ref)
+        if remote and ref is not None
+        else (selected,)
+    )
+    error: GitError | None = None
+    for candidate in candidates:
+        try:
+            value = _run_git(
+                repository, "rev-parse", "--verify", f"{candidate}^{{commit}}"
+            )
+        except GitError as candidate_error:
+            error = candidate_error
+            continue
+        if not re.fullmatch(r"[0-9a-f]{40,64}", value):
+            raise GitError(f"Git returned an invalid commit for {candidate}")
+        return value
+    raise GitError(f"Cannot resolve Git base {selected}: {error}")
 
 
 def validate_branch_name(branch: str) -> None:
@@ -117,6 +128,7 @@ def materialize_cache(
     *,
     owner: ProcessIdentity | None = None,
     owner_status: Callable[[ProcessIdentity], str] | None = None,
+    refresh: bool = True,
 ) -> Path:
     if source.clone_url is None:
         if source.path is None:
@@ -127,16 +139,8 @@ def materialize_cache(
         _cleanup_abandoned_clones(cache_path.parent, owner_status)
     if cache_path.exists():
         _verify_bare_repository(cache_path, source.normalized)
-        fetched = _run_git_process(
-            cache_path,
-            "fetch",
-            "--prune",
-            "--tags",
-            "origin",
-            "+refs/heads/*:refs/heads/*",
-        )
-        if fetched.returncode != 0:
-            raise GitError(_git_error(fetched))
+        if refresh:
+            _refresh_bare_repository(cache_path)
         return cache_path
     require_supported_git(cache_path.parent)
     prefix = f"clone-{owner.process_instance_id}-" if owner is not None else "clone-"
@@ -172,6 +176,7 @@ def materialize_cache(
             os.replace(clone, cache_path)
         except FileExistsError:
             _verify_bare_repository(cache_path, source.normalized)
+        _refresh_bare_repository(cache_path)
         return cache_path
     finally:
         if invocation.parent == cache_path.parent and invocation.name.startswith(
@@ -214,6 +219,22 @@ def _cleanup_abandoned_clones(
             continue
         if owner_status(owner) == "dead":
             shutil.rmtree(resolved)
+
+
+def _refresh_bare_repository(path: Path) -> None:
+    fetched = _run_git_process(
+        path,
+        "fetch",
+        "--prune",
+        "--tags",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+    )
+    if fetched.returncode != 0:
+        raise GitError(_git_error(fetched))
+    head = _run_git_process(path, "remote", "set-head", "origin", "--auto")
+    if head.returncode != 0:
+        raise GitError(_git_error(head))
 
 
 def create_worktree(
@@ -300,10 +321,17 @@ def _create_staging_receipt(path: Path, ownership_token: str) -> None:
     except OSError as error:
         raise GitError("Workspace staging ownership receipt is unavailable") from error
     try:
-        os.write(descriptor, ownership_token.encode())
+        payload = ownership_token.encode()
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("short write")
+            written += count
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    _fsync_directory(path.parent)
 
 
 def _require_staging_receipt(path: Path, ownership_token: str) -> None:
@@ -336,6 +364,23 @@ def _remove_staging_receipt(path: Path, ownership_token: str) -> None:
     except OSError as error:
         raise GitError(
             "Workspace staging ownership receipt cannot be removed"
+        ) from error
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise GitError(
+            "Workspace staging ownership directory is not durable"
         ) from error
 
 

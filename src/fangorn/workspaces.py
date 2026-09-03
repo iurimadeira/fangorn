@@ -258,7 +258,11 @@ class Workspaces:
                 if commit is None:
                     commit = self._registry.persist_resolved_sha(
                         intent.operation_id,
-                        resolve_commit(repository, request.base),
+                        resolve_commit(
+                            repository,
+                            request.base,
+                            remote=source.clone_url is not None,
+                        ),
                         workspace_id=intent.workspace_id,
                         lease_epoch=lease_epoch,
                     )
@@ -462,6 +466,7 @@ class Workspaces:
                 selected,
                 owner=owner,
                 owner_status=self._owner_status,
+                refresh=previous != "completed" or entry is None,
             )
             if previous != "completed" or entry is None:
                 self._registry.save_cache_entry(
