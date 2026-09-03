@@ -1039,6 +1039,8 @@ def _run_supervised_git(
 ) -> subprocess.CompletedProcess[bytes]:
     if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
         raise GitError("Cannot supervise Git while SIGCHLD is ignored")
+    helper_environment = dict(environment)
+    helper_environment.pop("COVERAGE_PROCESS_CONFIG", None)
     control_read, control_write = os.pipe()
     status_read, status_write = os.pipe()
     completion_read, completion_write = os.pipe()
@@ -1073,6 +1075,7 @@ def _run_supervised_git(
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
+                                env=helper_environment,
                                 pass_fds=(anchor_control_read, liveness_fd),
                                 process_group=0,
                             )
@@ -1107,7 +1110,7 @@ def _run_supervised_git(
                             supervisor,
                             stdout=stdout,
                             stderr=stderr,
-                            env=environment,
+                            env=helper_environment,
                             pass_fds=(
                                 control_read,
                                 status_write,
@@ -1328,6 +1331,11 @@ def _retain_quiescence_guardian(process_group: int, *, liveness_fd: int) -> None
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env={
+                name: value
+                for name, value in os.environ.items()
+                if name != "COVERAGE_PROCESS_CONFIG"
+            },
             pass_fds=(liveness_fd, ready_write),
             process_group=0,
         )

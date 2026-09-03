@@ -979,6 +979,32 @@ def test_parent_does_not_start_git_without_ready_guardian(
     assert commands[0][2].endswith("_git_anchor.py")
 
 
+def test_internal_git_helpers_do_not_inherit_coverage_instrumentation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environments: list[dict[str, str]] = []
+    real_popen = subprocess.Popen
+
+    def start(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        command = args[0]
+        if isinstance(command, list) and any(
+            str(value).endswith(
+                ("_git_anchor.py", "_git_guardian.py", "_git_supervisor.py")
+            )
+            for value in command
+        ):
+            environments.append(kwargs["env"])
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setenv("COVERAGE_PROCESS_CONFIG", "instrument")
+    monkeypatch.setattr(subprocess, "Popen", start)
+    result = git_worktree_adapter._run_git_process(tmp_path, "--version")
+
+    assert result.returncode == 0
+    assert len(environments) == 3
+    assert all("COVERAGE_PROCESS_CONFIG" not in value for value in environments)
+
+
 def test_parent_group_probe_rejects_malformed_ps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
