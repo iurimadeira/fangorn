@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import stat
@@ -18,7 +19,7 @@ ADOPTION_TIMEOUT_SECONDS = 5.0
 ADOPTION_RETRY_DELAY_SECONDS = 0.01
 READ_INITIALIZATION_TIMEOUT_SECONDS = 1.0
 READ_INITIALIZATION_RETRY_DELAY_SECONDS = 0.01
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class RegistryError(RuntimeError):
@@ -56,6 +57,36 @@ class WorkspaceRecord:
             "created_at": self.created_at,
             "last_observed_at": self.last_observed_at,
         }
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    process_instance_id: str
+    boot_identity: str
+    pid: int
+    process_start_identity: str
+
+
+@dataclass(frozen=True)
+class CreateIntentRecord:
+    operation_id: str
+    workspace_id: str
+    request_key: str
+    request_json: str
+    request_id: str | None
+    target_path: str
+    resolved_json: str | None
+    status: str
+
+
+@dataclass(frozen=True)
+class LeaseRecord:
+    scope_kind: str
+    scope_key: str
+    operation_id: str
+    owner: ProcessIdentity
+    epoch: int
+    active: bool
 
 
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -133,6 +164,138 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 OR NEW.git_dir_generation IS NOT OLD.git_dir_generation
             BEGIN
                 SELECT RAISE(ABORT, 'workspace binding is immutable');
+            END
+            """,
+        ),
+    ),
+    (
+        2,
+        (
+            """
+            ALTER TABLE workspaces
+            ADD COLUMN parent_id TEXT REFERENCES workspaces(id)
+            """,
+            "ALTER TABLE workspaces ADD COLUMN created_from_sha TEXT",
+            "ALTER TABLE workspaces ADD COLUMN configuration BLOB",
+            "ALTER TABLE workspaces ADD COLUMN configuration_json TEXT",
+            "ALTER TABLE workspaces ADD COLUMN configuration_digest TEXT",
+            "ALTER TABLE workspaces ADD COLUMN lifecycle_state TEXT",
+            """
+            ALTER TABLE workspaces
+            ADD COLUMN aggregate_version INTEGER NOT NULL DEFAULT 0
+            """,
+            "ALTER TABLE workspaces ADD COLUMN origin TEXT",
+            "ALTER TABLE workspaces ADD COLUMN completed_operation_id TEXT",
+            """
+            CREATE TABLE workspace_create_intents (
+                operation_id TEXT PRIMARY KEY NOT NULL,
+                workspace_id TEXT NOT NULL UNIQUE,
+                request_key TEXT NOT NULL UNIQUE,
+                request_id TEXT UNIQUE,
+                request_json TEXT NOT NULL,
+                target_path TEXT NOT NULL UNIQUE,
+                resolved_json TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE operations (
+                id TEXT PRIMARY KEY NOT NULL,
+                workspace_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE operation_steps (
+                operation_id TEXT NOT NULL REFERENCES operations(id),
+                position INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                resource_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                PRIMARY KEY (operation_id, position)
+            )
+            """,
+            """
+            CREATE TABLE workspace_resources (
+                workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                position INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                adapter_api_major INTEGER NOT NULL,
+                configuration_json TEXT NOT NULL,
+                external_reference TEXT,
+                locator TEXT NOT NULL UNIQUE,
+                ownership_token TEXT NOT NULL UNIQUE,
+                provisioning_status TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, name),
+                UNIQUE (workspace_id, position)
+            )
+            """,
+            """
+            CREATE TABLE repository_cache_entries (
+                normalized_source TEXT PRIMARY KEY NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                repository_generation TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE mutation_leases (
+                scope_kind TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                process_instance_id TEXT NOT NULL,
+                boot_identity TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                process_start_identity TEXT NOT NULL,
+                epoch INTEGER NOT NULL CHECK (epoch > 0),
+                active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                PRIMARY KEY (scope_kind, scope_key)
+            )
+            """,
+            """
+            CREATE TRIGGER workspace_aggregate_definition_immutable
+            BEFORE UPDATE OF parent_id, repository_id, created_from_sha,
+                configuration, configuration_json, configuration_digest, origin
+            ON workspaces
+            FOR EACH ROW
+            WHEN NEW.parent_id IS NOT OLD.parent_id
+                OR NEW.repository_id IS NOT OLD.repository_id
+                OR NEW.created_from_sha IS NOT OLD.created_from_sha
+                OR NEW.configuration IS NOT OLD.configuration
+                OR NEW.configuration_json IS NOT OLD.configuration_json
+                OR NEW.configuration_digest IS NOT OLD.configuration_digest
+                OR NEW.origin IS NOT OLD.origin
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace definition is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_resource_definition_immutable
+            BEFORE UPDATE OF workspace_id, position, name, kind, adapter_id,
+                adapter_api_major, configuration_json, external_reference,
+                locator, ownership_token
+            ON workspace_resources
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace resource definition is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER workspace_resource_membership_immutable
+            BEFORE DELETE ON workspace_resources
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'workspace resource membership is immutable');
             END
             """,
         ),
@@ -403,6 +566,585 @@ class Registry:
                 workspace is None and observation.git_dir_generation is None,
             )
 
+    def begin_create_intent(
+        self,
+        *,
+        request_key: str,
+        request_id: str | None,
+        request_json: str,
+        target_path: str,
+        workspace_id: str,
+        operation_id: str,
+        prepare_cache: bool,
+    ) -> tuple[CreateIntentRecord, bool]:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = None
+                if request_id is not None:
+                    row = connection.execute(
+                        "SELECT * FROM workspace_create_intents WHERE request_id = ?",
+                        (request_id,),
+                    ).fetchone()
+                    if row is not None and str(row["request_json"]) != request_json:
+                        raise RegistryError(
+                            "Create idempotency key belongs to a different request"
+                        )
+                if row is None:
+                    row = connection.execute(
+                        "SELECT * FROM workspace_create_intents WHERE request_key = ?",
+                        (request_key,),
+                    ).fetchone()
+                if row is not None:
+                    connection.commit()
+                    return _create_intent_from_row(row), False
+                collision = connection.execute(
+                    "SELECT request_key FROM workspace_create_intents "
+                    "WHERE target_path = ?",
+                    (target_path,),
+                ).fetchone()
+                if collision is not None:
+                    raise RegistryError(
+                        "Target path belongs to a different Workspace create request"
+                    )
+                now = _timestamp()
+                connection.execute(
+                    """
+                    INSERT INTO workspace_create_intents (
+                        operation_id, workspace_id, request_key, request_id,
+                        request_json, target_path, resolved_json, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'preparing', ?, ?)
+                    """,
+                    (
+                        operation_id,
+                        workspace_id,
+                        request_key,
+                        request_id,
+                        request_json,
+                        target_path,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO operations (
+                        id, workspace_id, kind, status, error, created_at, updated_at
+                    ) VALUES (?, ?, 'create', 'running', NULL, ?, ?)
+                    """,
+                    (operation_id, workspace_id, now, now),
+                )
+                if prepare_cache:
+                    connection.execute(
+                        """
+                        INSERT INTO operation_steps (
+                            operation_id, position, action, resource_name, status
+                        ) VALUES (?, 0, 'prepare', 'repository-cache', 'pending')
+                        """,
+                        (operation_id,),
+                    )
+                connection.commit()
+                return CreateIntentRecord(
+                    operation_id=operation_id,
+                    workspace_id=workspace_id,
+                    request_key=request_key,
+                    request_json=request_json,
+                    request_id=request_id,
+                    target_path=target_path,
+                    resolved_json=None,
+                    status="preparing",
+                ), True
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def enrich_create_intent(
+        self,
+        operation_id: str,
+        *,
+        resolved: dict[str, object],
+        steps: tuple[tuple[str, str], ...],
+    ) -> dict[str, object]:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM workspace_create_intents WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryError("Workspace create intent is unavailable")
+                if row["resolved_json"] is not None:
+                    existing = json.loads(str(row["resolved_json"]))
+                    if not isinstance(existing, dict):
+                        raise RegistryError("Stored create intent is malformed")
+                    connection.commit()
+                    return existing
+                encoded = json.dumps(resolved, sort_keys=True, separators=(",", ":"))
+                now = _timestamp()
+                connection.execute(
+                    """
+                    UPDATE workspace_create_intents
+                    SET resolved_json = ?, status = 'creating', updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (encoded, now, operation_id),
+                )
+                start_position = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(position), -1) + 1 FROM operation_steps "
+                        "WHERE operation_id = ?",
+                        (operation_id,),
+                    ).fetchone()[0]
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO operation_steps (
+                        operation_id, position, action, resource_name, status
+                    ) VALUES (?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        (operation_id, start_position + index, action, resource)
+                        for index, (action, resource) in enumerate(steps)
+                    ),
+                )
+                connection.commit()
+                return resolved
+            except (sqlite3.Error, RegistryError, ValueError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                if isinstance(error, ValueError):
+                    raise RegistryError("Stored create intent is malformed") from error
+                raise _registry_error(error) from error
+
+    def acquire_lease(
+        self,
+        *,
+        scope_kind: str,
+        scope_key: str,
+        operation_id: str,
+        owner: ProcessIdentity,
+        owner_status: Callable[[ProcessIdentity], str],
+    ) -> int:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM mutation_leases "
+                    "WHERE scope_kind = ? AND scope_key = ?",
+                    (scope_kind, scope_key),
+                ).fetchone()
+                if row is None:
+                    epoch = 1
+                    connection.execute(
+                        """
+                        INSERT INTO mutation_leases (
+                            scope_kind, scope_key, operation_id,
+                            process_instance_id, boot_identity, pid,
+                            process_start_identity, epoch, active
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (
+                            scope_kind,
+                            scope_key,
+                            operation_id,
+                            owner.process_instance_id,
+                            owner.boot_identity,
+                            owner.pid,
+                            owner.process_start_identity,
+                            epoch,
+                        ),
+                    )
+                else:
+                    previous = _lease_from_row(row)
+                    same_owner = previous.owner == owner
+                    if previous.active and not (
+                        same_owner and previous.operation_id == operation_id
+                    ):
+                        status = owner_status(previous.owner)
+                        if status != "dead":
+                            raise RegistryError(
+                                f"{scope_kind.capitalize()} mutation is busy"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE operation_steps SET status = 'unknown'
+                            WHERE operation_id = ? AND status = 'running'
+                            """,
+                            (previous.operation_id,),
+                        )
+                    if previous.active and same_owner:
+                        epoch = previous.epoch
+                    else:
+                        epoch = previous.epoch + 1
+                        connection.execute(
+                            """
+                            UPDATE mutation_leases
+                            SET operation_id = ?, process_instance_id = ?,
+                                boot_identity = ?, pid = ?,
+                                process_start_identity = ?, epoch = ?, active = 1
+                            WHERE scope_kind = ? AND scope_key = ?
+                            """,
+                            (
+                                operation_id,
+                                owner.process_instance_id,
+                                owner.boot_identity,
+                                owner.pid,
+                                owner.process_start_identity,
+                                epoch,
+                                scope_kind,
+                                scope_key,
+                            ),
+                        )
+                connection.commit()
+                return epoch
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def start_operation_step(
+        self,
+        operation_id: str,
+        *,
+        position: int,
+        scope_kind: str,
+        scope_key: str,
+        lease_epoch: int,
+    ) -> str:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    lease_epoch=lease_epoch,
+                )
+                row = connection.execute(
+                    "SELECT status FROM operation_steps "
+                    "WHERE operation_id = ? AND position = ?",
+                    (operation_id, position),
+                ).fetchone()
+                if row is None:
+                    raise RegistryError("Workspace operation step is unavailable")
+                status = str(row["status"])
+                if status != "completed":
+                    connection.execute(
+                        "UPDATE operation_steps SET status = 'running' "
+                        "WHERE operation_id = ? AND position = ?",
+                        (operation_id, position),
+                    )
+                connection.commit()
+                return status
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def finish_operation_step(
+        self,
+        operation_id: str,
+        *,
+        position: int,
+        scope_kind: str,
+        scope_key: str,
+        lease_epoch: int,
+        result: dict[str, object],
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    lease_epoch=lease_epoch,
+                )
+                changed = connection.execute(
+                    """
+                    UPDATE operation_steps
+                    SET status = 'completed', result_json = ?
+                    WHERE operation_id = ? AND position = ?
+                    """,
+                    (
+                        json.dumps(result, sort_keys=True, separators=(",", ":")),
+                        operation_id,
+                        position,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise RegistryError("Workspace operation step is unavailable")
+                connection.commit()
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def release_lease(
+        self,
+        *,
+        scope_kind: str,
+        scope_key: str,
+        operation_id: str,
+        lease_epoch: int,
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=operation_id,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    lease_epoch=lease_epoch,
+                )
+                connection.execute(
+                    "UPDATE mutation_leases SET active = 0 "
+                    "WHERE scope_kind = ? AND scope_key = ?",
+                    (scope_kind, scope_key),
+                )
+                connection.commit()
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def save_cache_entry(
+        self,
+        normalized_source: str,
+        *,
+        path: str,
+        repository_generation: str | None,
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO repository_cache_entries (
+                        normalized_source, path, status,
+                        repository_generation, updated_at
+                    ) VALUES (?, ?, 'ready', ?, ?)
+                    ON CONFLICT(normalized_source) DO UPDATE SET
+                        path = excluded.path,
+                        status = excluded.status,
+                        repository_generation = excluded.repository_generation,
+                        updated_at = excluded.updated_at
+                    """,
+                    (normalized_source, path, repository_generation, _timestamp()),
+                )
+                connection.commit()
+            except sqlite3.Error as error:
+                connection.rollback()
+                raise _registry_error(error) from error
+
+    def cache_entry(self, normalized_source: str) -> tuple[str, str | None] | None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            row = connection.execute(
+                "SELECT path, repository_generation FROM repository_cache_entries "
+                "WHERE normalized_source = ? AND status = 'ready'",
+                (normalized_source,),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row["path"]), (
+                str(row["repository_generation"])
+                if row["repository_generation"] is not None
+                else None
+            )
+
+    def complete_workspace_create(
+        self,
+        *,
+        intent: CreateIntentRecord,
+        observation: WorktreeObservation,
+        created_from_sha: str,
+        configuration: bytes,
+        configuration_json: str,
+        configuration_digest: str,
+        state: str,
+        lease_epoch: int,
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_lease(
+                    connection,
+                    operation_id=intent.operation_id,
+                    scope_kind="workspace",
+                    scope_key=intent.workspace_id,
+                    lease_epoch=lease_epoch,
+                )
+                if observation.git_common_dir_generation is None:
+                    raise RegistryError("Repository generation marker is unavailable")
+                if observation.git_dir_generation is None:
+                    raise RegistryError("Worktree generation marker is unavailable")
+                token = _reserve_observation(connection)
+                now = _timestamp()
+                repository = connection.execute(
+                    "SELECT * FROM repositories WHERE git_common_dir = ?",
+                    (str(observation.repository_common_dir),),
+                ).fetchone()
+                if repository is None:
+                    repository_id = str(uuid4())
+                    connection.execute(
+                        """
+                        INSERT INTO repositories (
+                            id, git_common_dir, git_common_dir_generation,
+                            created_observation_token, created_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            repository_id,
+                            str(observation.repository_common_dir),
+                            observation.git_common_dir_generation,
+                            token,
+                            now,
+                        ),
+                    )
+                else:
+                    _validate_repository_binding(repository, observation)
+                    repository_id = str(repository["id"])
+                connection.execute(
+                    """
+                    INSERT INTO workspaces (
+                        id, repository_id, git_dir, git_dir_generation,
+                        path, branch, head, adopted_head, created_at,
+                        last_observed_at, last_observation_token, parent_id,
+                        created_from_sha, configuration, configuration_json,
+                        configuration_digest, lifecycle_state,
+                        aggregate_version, origin, completed_operation_id
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL,
+                        ?, ?, ?, ?, ?, 1, 'created', ?
+                    )
+                    """,
+                    (
+                        intent.workspace_id,
+                        repository_id,
+                        str(observation.git_dir),
+                        observation.git_dir_generation,
+                        str(observation.path),
+                        observation.branch,
+                        observation.head,
+                        now,
+                        observation.observed_at,
+                        token,
+                        created_from_sha,
+                        configuration,
+                        configuration_json,
+                        configuration_digest,
+                        state,
+                        intent.operation_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO workspace_resources (
+                        workspace_id, position, name, kind, adapter_id,
+                        adapter_api_major, configuration_json,
+                        external_reference, locator, ownership_token,
+                        provisioning_status
+                    ) VALUES (?, 0, 'worktree', 'worktree',
+                        'fangorn.git-worktree', 1, '{}', NULL, ?, ?, 'created')
+                    """,
+                    (
+                        intent.workspace_id,
+                        str(observation.path),
+                        observation.git_dir_generation,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE operations SET status = 'completed', updated_at = ? "
+                    "WHERE id = ?",
+                    (now, intent.operation_id),
+                )
+                connection.execute(
+                    "UPDATE workspace_create_intents "
+                    "SET status = 'completed', updated_at = ? WHERE operation_id = ?",
+                    (now, intent.operation_id),
+                )
+                connection.execute(
+                    "UPDATE mutation_leases SET active = 0 "
+                    "WHERE scope_kind = 'workspace' AND scope_key = ?",
+                    (intent.workspace_id,),
+                )
+                connection.commit()
+            except (sqlite3.Error, RegistryError) as error:
+                connection.rollback()
+                if isinstance(error, RegistryError):
+                    raise
+                raise _registry_error(error) from error
+
+    def load_created_workspace(
+        self, workspace_id: str
+    ) -> tuple[sqlite3.Row, list[sqlite3.Row], sqlite3.Row]:
+        with self._read_connection() as connection:
+            if connection is None:
+                raise RegistryError("Created Workspace is unavailable")
+            workspace = connection.execute(
+                "SELECT * FROM workspaces WHERE id = ? AND origin = 'created'",
+                (workspace_id,),
+            ).fetchone()
+            if workspace is None:
+                raise RegistryError("Created Workspace is unavailable")
+            resources = connection.execute(
+                "SELECT * FROM workspace_resources WHERE workspace_id = ? "
+                "ORDER BY position",
+                (workspace_id,),
+            ).fetchall()
+            operation = connection.execute(
+                "SELECT * FROM operations WHERE id = ?",
+                (str(workspace["completed_operation_id"]),),
+            ).fetchone()
+            if operation is None:
+                raise RegistryError("Completed create operation is unavailable")
+            return workspace, resources, operation
+
+    @staticmethod
+    def _require_lease(
+        connection: sqlite3.Connection,
+        *,
+        operation_id: str,
+        scope_kind: str,
+        scope_key: str,
+        lease_epoch: int,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT operation_id, epoch, active FROM mutation_leases
+            WHERE scope_kind = ? AND scope_key = ?
+            """,
+            (scope_kind, scope_key),
+        ).fetchone()
+        if (
+            row is None
+            or not bool(row["active"])
+            or str(row["operation_id"]) != operation_id
+            or int(row["epoch"]) != lease_epoch
+        ):
+            raise RegistryError("Stale operation result rejected by lease fence")
+
     def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
         observation_token = _observation_token(observation)
         with self._connection() as connection:
@@ -666,6 +1408,37 @@ def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:
         created_at=str(row["created_at"]),
         last_observed_at=str(row["last_observed_at"]),
         last_observation_token=int(row["last_observation_token"]),
+    )
+
+
+def _create_intent_from_row(row: sqlite3.Row) -> CreateIntentRecord:
+    return CreateIntentRecord(
+        operation_id=str(row["operation_id"]),
+        workspace_id=str(row["workspace_id"]),
+        request_key=str(row["request_key"]),
+        request_json=str(row["request_json"]),
+        request_id=str(row["request_id"]) if row["request_id"] is not None else None,
+        target_path=str(row["target_path"]),
+        resolved_json=(
+            str(row["resolved_json"]) if row["resolved_json"] is not None else None
+        ),
+        status=str(row["status"]),
+    )
+
+
+def _lease_from_row(row: sqlite3.Row) -> LeaseRecord:
+    return LeaseRecord(
+        scope_kind=str(row["scope_kind"]),
+        scope_key=str(row["scope_key"]),
+        operation_id=str(row["operation_id"]),
+        owner=ProcessIdentity(
+            process_instance_id=str(row["process_instance_id"]),
+            boot_identity=str(row["boot_identity"]),
+            pid=int(row["pid"]),
+            process_start_identity=str(row["process_start_identity"]),
+        ),
+        epoch=int(row["epoch"]),
+        active=bool(row["active"]),
     )
 
 

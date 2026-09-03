@@ -129,7 +129,7 @@ def test_workspaces_reads_reject_newer_registry_schema_without_migrating(
     database = state_home / "fangorn" / "registry.sqlite3"
     connection = sqlite3.connect(database)
     connection.execute(
-        "INSERT INTO schema_migrations (version, applied_at) VALUES (2, 'future')"
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, 'future')"
     )
     connection.commit()
     migrations_before = connection.execute(
@@ -137,7 +137,7 @@ def test_workspaces_reads_reject_newer_registry_schema_without_migrating(
     ).fetchall()
     connection.close()
 
-    with pytest.raises(WorkspaceError, match="newer than this Fangorn version: 2"):
+    with pytest.raises(WorkspaceError, match="newer than this Fangorn version: 3"):
         workspaces.list()
 
     connection = sqlite3.connect(database)

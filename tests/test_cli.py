@@ -2327,7 +2327,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
     try:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,)]
+        ).fetchall() == [(1,), (2,)]
         repository_columns = {
             row[1]: row for row in connection.execute("PRAGMA table_info(repositories)")
         }

@@ -72,6 +72,14 @@ GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
 
+def establish_worktree_generation(directory: Path, ownership_token: str) -> str:
+    """Establish the immutable planned owner token for a new Worktree Resource."""
+    return _create_generation_marker(
+        directory,
+        expected_generation=ownership_token,
+    )
+
+
 def _run_git(
     path: Path,
     *arguments: str,
@@ -431,6 +439,7 @@ def _create_generation_marker(
     *,
     marker_name: str = GENERATION_MARKER_NAME,
     identity: str = "worktree",
+    expected_generation: str | None = None,
 ) -> str:
     marker = directory / marker_name
     pending_name = f".{marker_name}.pending"
@@ -459,6 +468,11 @@ def _create_generation_marker(
             directory_descriptor=directory_descriptor,
         )
         if winner is not None:
+            if expected_generation is not None and winner != expected_generation:
+                raise GitError(
+                    f"Fangorn {identity} generation marker does not match "
+                    "the planned ownership token"
+                )
             _verify_locked_directory(directory, directory_descriptor, identity=identity)
             _cleanup_pending_marker(
                 pending_name, directory_descriptor, ignore_errors=False
@@ -467,7 +481,9 @@ def _create_generation_marker(
             return winner
 
         _cleanup_pending_marker(pending_name, directory_descriptor, ignore_errors=False)
-        generation = secrets.token_hex(32)
+        generation = expected_generation or secrets.token_hex(32)
+        if not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise GitError(f"Planned Fangorn {identity} ownership token is invalid")
         payload = f"{generation}\n".encode("ascii")
         pending_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
