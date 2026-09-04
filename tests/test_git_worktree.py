@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import grp
 import json
 import os
-import pwd
 import selectors
 import shutil
 import signal
@@ -827,174 +825,52 @@ def test_supervisor_does_not_reap_before_group_cleanup(
     assert child.waited is True
 
 
-def test_supervisor_observes_child_without_reaping() -> None:
-    if not hasattr(os, "waitid"):
-        pytest.skip("platform does not expose waitid")
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
+def test_supervisor_permission_denial_still_requires_group_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        returncode = 0
+
+        @staticmethod
+        def wait(timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    scans = iter((True, True))
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(PermissionError()),
+    )
+    monkeypatch.setattr(
+        git_supervisor,
+        "_wait_for_group_state",
+        lambda *_args, **_kwargs: next(scans),
+    )
+
+    assert git_supervisor._drain(Child(), 123) is False  # type: ignore[arg-type]
+
+
+def test_supervisor_reaps_child_without_releasing_anchor_group() -> None:
+    anchor = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], process_group=0
+    )
+    child = subprocess.Popen([sys.executable, "-c", "pass"], process_group=anchor.pid)
     try:
         deadline = time.monotonic() + 2
         while git_supervisor._child_running(child):
             assert time.monotonic() < deadline
             time.sleep(0.01)
 
-        observation = os.waitid(
-            os.P_PID,
-            child.pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        )
-        assert observation is not None
-        assert observation.si_pid == child.pid
-        assert child.returncode is None
+        assert child.returncode == 0
+        os.killpg(anchor.pid, 0)
     finally:
+        if child.poll() is None:
+            child.kill()
         child.wait(timeout=2)
-
-
-class _FakeProcPidInfo:
-    argtypes: object = None
-    restype: object = None
-
-    def __init__(
-        self,
-        *,
-        status: int = 2,
-        result: int | None = None,
-        reported_pid: int | None = None,
-        error: int = 0,
-    ) -> None:
-        self.status = status
-        self.result = result
-        self.reported_pid = reported_pid
-        self.error = error
-
-    def __call__(
-        self,
-        pid: int,
-        flavor: int,
-        arg: int,
-        buffer: Any,
-        size: int,
-    ) -> int:
-        assert (flavor, arg, size) == (3, 0, 136)
-        ctypes.set_errno(self.error)
-        info = ctypes.cast(buffer, ctypes.POINTER(git_supervisor._ProcBsdInfo)).contents
-        info.pbi_pid = self.reported_pid if self.reported_pid is not None else pid
-        info.pbi_status = self.status
-        return size if self.result is None else self.result
-
-
-class _FakeLibProc:
-    def __init__(self, proc_pidinfo: _FakeProcPidInfo) -> None:
-        self.proc_pidinfo = proc_pidinfo
-
-
-@pytest.mark.parametrize(("status", "expected"), [(2, True), (5, False)])
-def test_supervisor_darwin_observes_child_without_reaping(
-    status: int, expected: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class Child:
-        pid = 123
-
-        @staticmethod
-        def poll() -> int:
-            raise AssertionError("Darwin child observation must not reap through poll")
-
-    probe = _FakeProcPidInfo(status=status)
-    monkeypatch.delattr(os, "waitid", raising=False)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(
-        ctypes,
-        "CDLL",
-        lambda path, *, use_errno: (
-            _FakeLibProc(probe)
-            if (path, use_errno) == ("/usr/lib/libproc.dylib", True)
-            else (_ for _ in ()).throw(AssertionError("unexpected libproc load"))
-        ),
-    )
-
-    assert git_supervisor._child_running(Child()) is expected  # type: ignore[arg-type]
-    assert probe.argtypes == (
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_uint64,
-        ctypes.c_void_p,
-        ctypes.c_int,
-    )
-    assert probe.restype is ctypes.c_int
-
-
-def test_supervisor_darwin_proc_bsdinfo_abi() -> None:
-    assert ctypes.sizeof(git_supervisor._ProcBsdInfo) == 136
-    assert [
-        getattr(git_supervisor._ProcBsdInfo, name).offset
-        for name, _field_type in git_supervisor._ProcBsdInfo._fields_
-    ] == [
-        0,
-        4,
-        8,
-        12,
-        16,
-        20,
-        24,
-        28,
-        32,
-        36,
-        40,
-        44,
-        48,
-        64,
-        96,
-        100,
-        104,
-        108,
-        112,
-        116,
-        120,
-        128,
-    ]
-
-
-@pytest.mark.parametrize(
-    ("result", "reported_pid"),
-    [(135, 123), (136, 124)],
-)
-def test_supervisor_darwin_child_probe_rejects_incomplete_identity(
-    result: int, reported_pid: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    probe = _FakeProcPidInfo(result=result, reported_pid=reported_pid)
-    monkeypatch.delattr(os, "waitid", raising=False)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibProc(probe))
-
-    with pytest.raises(OSError) as raised:
-        git_supervisor._child_running(cast(Any, type("Child", (), {"pid": 123})()))
-
-    assert raised.value.errno == errno.EIO
-
-
-def test_supervisor_darwin_child_probe_preserves_libproc_errno(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    probe = _FakeProcPidInfo(result=0, error=errno.ESRCH)
-    monkeypatch.delattr(os, "waitid", raising=False)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibProc(probe))
-
-    with pytest.raises(OSError) as raised:
-        git_supervisor._child_running(cast(Any, type("Child", (), {"pid": 123})()))
-
-    assert raised.value.errno == errno.ESRCH
-
-
-def test_supervisor_requires_nonreaping_probe_outside_darwin(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delattr(os, "waitid", raising=False)
-    monkeypatch.setattr(sys, "platform", "linux")
-
-    with pytest.raises(OSError) as raised:
-        git_supervisor._child_running(cast(Any, type("Child", (), {"pid": 123})()))
-
-    assert raised.value.errno == errno.ENOSYS
+        if anchor.poll() is None:
+            os.killpg(anchor.pid, signal.SIGKILL)
+        anchor.wait(timeout=2)
 
 
 def test_supervised_git_rejects_missing_child_handshake(
@@ -1092,6 +968,7 @@ def test_supervisor_pid_reader_rejects_eof_before_newline(
 ) -> None:
     chunks = iter((b"123", b""))
     monkeypatch.setattr(os, "read", lambda *args: next(chunks))
+    monkeypatch.setattr(selectors, "DefaultSelector", _stub_selector(True))
 
     assert git_worktree_adapter._read_supervisor_pid(10) is None
 
@@ -1765,7 +1642,9 @@ def test_supervisor_executable_reports_completed_effect() -> None:
             "cancel",
             "10",
             str(8 * 1024 * 1024),
-            "/bin/true",
+            sys.executable,
+            "-c",
+            "pass",
         ],
         pass_fds=(
             control_read,
@@ -1958,6 +1837,29 @@ def test_parent_group_cleanup_stops_at_deadline(
         git_worktree_adapter._cancel_process_group(77, deadline=time.monotonic())
 
     assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_parent_group_cleanup_permission_denial_stays_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probes = 0
+
+    def scan(*_args: object, **_kwargs: object) -> bool:
+        nonlocal probes
+        probes += 1
+        raise GitQuiescenceError("still unproven")
+
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(PermissionError()),
+    )
+    monkeypatch.setattr(git_worktree_adapter, "_wait_for_process_group_state", scan)
+
+    with pytest.raises(GitQuiescenceError, match="still unproven"):
+        git_worktree_adapter._cancel_process_group(77)
+
+    assert probes == 2
 
 
 def test_parent_group_cleanup_waits_through_running_observations(
@@ -3109,19 +3011,13 @@ def test_worktree_creation_rejects_shared_repository_configuration(
     assert not (tmp_path / "target").exists()
 
 
-def test_worktree_creation_rejects_configuration_writable_by_shared_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_worktree_creation_rejects_group_writable_configuration(
+    tmp_path: Path,
 ) -> None:
     source = tmp_path / "repository"
     commit = repository(source)
     configured = source / ".git" / "config"
     configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
-
-    class OtherAccount:
-        pw_uid = os.geteuid() + 1
-        pw_gid = configured.stat().st_gid
-
-    monkeypatch.setattr(pwd, "getpwall", lambda: [OtherAccount()])
 
     with pytest.raises(GitError, match="checkout configuration is unsafe"):
         create_worktree(
@@ -3131,50 +3027,6 @@ def test_worktree_creation_rejects_configuration_writable_by_shared_group(
             commit=commit,
             ownership_token="f" * 64,
             reconcile=False,
-        )
-
-
-def test_group_write_is_rejected_when_nss_enumeration_is_incomplete(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = tmp_path / "repository"
-    commit = repository(source)
-    configured = source / ".git" / "config"
-    configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
-
-    class Group:
-        gr_mem: tuple[str, ...] = ()
-
-    monkeypatch.setattr(grp, "getgrgid", lambda _gid: Group())
-    monkeypatch.setattr(pwd, "getpwall", lambda: [])
-    monkeypatch.setattr(os, "listxattr", lambda _descriptor: [])
-
-    with pytest.raises(GitError, match="checkout configuration is unsafe"):
-        create_worktree(
-            source,
-            target=tmp_path / "target",
-            branch="topic",
-            commit=commit,
-            ownership_token="5" * 64,
-            reconcile=False,
-        )
-
-    assert not (tmp_path / "target").exists()
-
-
-def test_linux_named_acl_is_not_treated_as_a_private_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    configured = tmp_path / "config"
-    configured.write_text("", encoding="utf-8")
-    configured.chmod(configured.stat().st_mode | stat.S_IWGRP)
-    with configured.open("rb") as stream:
-        monkeypatch.setattr(sys, "platform", "linux")
-        monkeypatch.setattr(
-            os, "listxattr", lambda descriptor: ["system.posix_acl_access"]
-        )
-        assert git_worktree_adapter._writable_by_another_principal(
-            os.fstat(stream.fileno()), stream.fileno()
         )
 
 

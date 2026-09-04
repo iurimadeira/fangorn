@@ -2026,7 +2026,7 @@ def _read_capture(stream: BinaryIO, limit: int) -> bytes:
 def _cancel_process_group(process_group: int, *, deadline: float | None = None) -> None:
     if deadline is None:
         deadline = time.monotonic() + 5
-    with suppress(ProcessLookupError):
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(process_group, signal.SIGTERM)
     try:
         _wait_for_process_group_state(
@@ -2035,7 +2035,7 @@ def _cancel_process_group(process_group: int, *, deadline: float | None = None) 
         return
     except GitQuiescenceError:
         pass
-    with suppress(ProcessLookupError):
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(process_group, signal.SIGKILL)
     _wait_for_process_group_state(process_group, deadline=deadline)
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ctypes
-import errno
 import os
 import selectors
 import signal
@@ -12,35 +10,6 @@ from contextlib import suppress
 from pathlib import Path
 
 UNPROVEN_GROUP_TERMINATION = 256
-PROC_PIDTBSDINFO = 3
-SZOMB = 5
-
-
-class _ProcBsdInfo(ctypes.Structure):
-    _fields_ = (
-        ("pbi_flags", ctypes.c_uint32),
-        ("pbi_status", ctypes.c_uint32),
-        ("pbi_xstatus", ctypes.c_uint32),
-        ("pbi_pid", ctypes.c_uint32),
-        ("pbi_ppid", ctypes.c_uint32),
-        ("pbi_uid", ctypes.c_uint32),
-        ("pbi_gid", ctypes.c_uint32),
-        ("pbi_ruid", ctypes.c_uint32),
-        ("pbi_rgid", ctypes.c_uint32),
-        ("pbi_svuid", ctypes.c_uint32),
-        ("pbi_svgid", ctypes.c_uint32),
-        ("rfu_1", ctypes.c_uint32),
-        ("pbi_comm", ctypes.c_char * 16),
-        ("pbi_name", ctypes.c_char * 32),
-        ("pbi_nfiles", ctypes.c_uint32),
-        ("pbi_pgid", ctypes.c_uint32),
-        ("pbi_pjobc", ctypes.c_uint32),
-        ("e_tdev", ctypes.c_uint32),
-        ("e_tpgid", ctypes.c_uint32),
-        ("pbi_nice", ctypes.c_int32),
-        ("pbi_start_tvsec", ctypes.c_uint64),
-        ("pbi_start_tvusec", ctypes.c_uint64),
-    )
 
 
 def main() -> int:
@@ -291,13 +260,13 @@ def _finish(child: subprocess.Popen[bytes], process_group: int) -> bool:
 
 
 def _drain(child: subprocess.Popen[bytes], process_group: int) -> bool:
-    with suppress(ProcessLookupError):
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(process_group, signal.SIGTERM)
     deadline = time.monotonic() + 2
     if not _wait_for_group_state(process_group, deadline=deadline):
         child.wait()
         return True
-    with suppress(ProcessLookupError):
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(process_group, signal.SIGKILL)
     deadline = time.monotonic() + 2
     running = _wait_for_group_state(process_group, deadline=deadline)
@@ -326,49 +295,7 @@ def _wait_for_group_state(process_group: int, *, deadline: float | None = None) 
 
 
 def _child_running(child: subprocess.Popen[bytes]) -> bool:
-    if hasattr(os, "waitid"):
-        return (
-            os.waitid(
-                os.P_PID,
-                child.pid,
-                os.WEXITED | os.WNOHANG | os.WNOWAIT,
-            )
-            is None
-        )
-    if sys.platform == "darwin":
-        return _darwin_child_running(child.pid)
-    raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
-
-
-def _darwin_child_running(pid: int) -> bool:
-    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    proc_pidinfo = library.proc_pidinfo
-    proc_pidinfo.argtypes = (
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_uint64,
-        ctypes.c_void_p,
-        ctypes.c_int,
-    )
-    proc_pidinfo.restype = ctypes.c_int
-    info = _ProcBsdInfo()
-    size = ctypes.sizeof(info)
-    ctypes.set_errno(0)
-    result = proc_pidinfo(
-        pid,
-        PROC_PIDTBSDINFO,
-        0,
-        ctypes.byref(info),
-        size,
-    )
-    if result != size:
-        code = ctypes.get_errno()
-        if result <= 0 and code:
-            raise OSError(code, os.strerror(code))
-        raise OSError(errno.EIO, "Incomplete Darwin process information")
-    if info.pbi_pid != pid:
-        raise OSError(errno.EIO, "Mismatched Darwin process information")
-    return int(info.pbi_status) != SZOMB
+    return child.poll() is None
 
 
 def _process_group_running(
