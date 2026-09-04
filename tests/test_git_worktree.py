@@ -790,14 +790,174 @@ def test_supervisor_does_not_reap_before_group_cleanup(
     assert child.waited is True
 
 
-def test_supervisor_observes_child_without_reaping(
+def test_supervisor_observes_child_without_reaping() -> None:
+    if not hasattr(os, "waitid"):
+        pytest.skip("platform does not expose waitid")
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 2
+        while git_supervisor._child_running(child):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        observation = os.waitid(
+            os.P_PID,
+            child.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        assert observation is not None
+        assert observation.si_pid == child.pid
+        assert child.returncode is None
+    finally:
+        child.wait(timeout=2)
+
+
+class _FakeProcPidInfo:
+    argtypes: object = None
+    restype: object = None
+
+    def __init__(
+        self,
+        *,
+        status: int = 2,
+        result: int | None = None,
+        reported_pid: int | None = None,
+        error: int = 0,
+    ) -> None:
+        self.status = status
+        self.result = result
+        self.reported_pid = reported_pid
+        self.error = error
+
+    def __call__(
+        self,
+        pid: int,
+        flavor: int,
+        arg: int,
+        buffer: Any,
+        size: int,
+    ) -> int:
+        assert (flavor, arg, size) == (3, 0, 136)
+        ctypes.set_errno(self.error)
+        info = ctypes.cast(buffer, ctypes.POINTER(git_supervisor._ProcBsdInfo)).contents
+        info.pbi_pid = self.reported_pid if self.reported_pid is not None else pid
+        info.pbi_status = self.status
+        return size if self.result is None else self.result
+
+
+class _FakeLibProc:
+    def __init__(self, proc_pidinfo: _FakeProcPidInfo) -> None:
+        self.proc_pidinfo = proc_pidinfo
+
+
+@pytest.mark.parametrize(("status", "expected"), [(2, True), (5, False)])
+def test_supervisor_darwin_observes_child_without_reaping(
+    status: int, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Child:
+        pid = 123
+
+        @staticmethod
+        def poll() -> int:
+            raise AssertionError("Darwin child observation must not reap through poll")
+
+    probe = _FakeProcPidInfo(status=status)
+    monkeypatch.delattr(os, "waitid", raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda path, *, use_errno: (
+            _FakeLibProc(probe)
+            if (path, use_errno) == ("/usr/lib/libproc.dylib", True)
+            else (_ for _ in ()).throw(AssertionError("unexpected libproc load"))
+        ),
+    )
+
+    assert git_supervisor._child_running(Child()) is expected  # type: ignore[arg-type]
+    assert probe.argtypes == (
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    assert probe.restype is ctypes.c_int
+
+
+def test_supervisor_darwin_proc_bsdinfo_abi() -> None:
+    assert ctypes.sizeof(git_supervisor._ProcBsdInfo) == 136
+    assert [
+        getattr(git_supervisor._ProcBsdInfo, name).offset
+        for name, _field_type in git_supervisor._ProcBsdInfo._fields_
+    ] == [
+        0,
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        28,
+        32,
+        36,
+        40,
+        44,
+        48,
+        64,
+        96,
+        100,
+        104,
+        108,
+        112,
+        116,
+        120,
+        128,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("result", "reported_pid"),
+    [(135, 123), (136, 124)],
+)
+def test_supervisor_darwin_child_probe_rejects_incomplete_identity(
+    result: int, reported_pid: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _FakeProcPidInfo(result=result, reported_pid=reported_pid)
+    monkeypatch.delattr(os, "waitid", raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibProc(probe))
+
+    with pytest.raises(OSError) as raised:
+        git_supervisor._child_running(cast(Any, type("Child", (), {"pid": 123})()))
+
+    assert raised.value.errno == errno.EIO
+
+
+def test_supervisor_darwin_child_probe_preserves_libproc_errno(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait()
-    monkeypatch.setattr(os, "waitid", lambda *args: object())
+    probe = _FakeProcPidInfo(result=0, error=errno.ESRCH)
+    monkeypatch.delattr(os, "waitid", raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibProc(probe))
 
-    assert git_supervisor._child_running(child) is False
+    with pytest.raises(OSError) as raised:
+        git_supervisor._child_running(cast(Any, type("Child", (), {"pid": 123})()))
+
+    assert raised.value.errno == errno.ESRCH
+
+
+def test_supervisor_requires_nonreaping_probe_outside_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(os, "waitid", raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    with pytest.raises(OSError) as raised:
+        git_supervisor._child_running(cast(Any, type("Child", (), {"pid": 123})()))
+
+    assert raised.value.errno == errno.ENOSYS
 
 
 def test_supervised_git_rejects_missing_child_handshake(
