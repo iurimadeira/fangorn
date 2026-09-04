@@ -778,6 +778,14 @@ def test_registry_tombstones_cannot_be_removed_or_reopened(
         receipt = workspaces.forget(workspace_id, acknowledge_orphans=True)
     registry = Registry(tmp_path / "state" / "registry.sqlite3")
     with sqlite3.connect(registry.path) as connection:
+        with pytest.raises(sqlite3.OperationalError, match="rowid"):
+            connection.execute(
+                "INSERT OR REPLACE INTO workspace_lifecycle "
+                "(rowid, workspace_id, operation_id, lifecycle_state, forgotten) "
+                "SELECT rowid, 'replacement', operation_id, 'ready', 0 "
+                "FROM workspace_lifecycle WHERE workspace_id = ?",
+                (workspace_id,),
+            )
         with pytest.raises(sqlite3.IntegrityError, match=r"immutable|tombstone"):
             connection.execute(
                 "INSERT OR REPLACE INTO workspace_lifecycle "

@@ -567,7 +567,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             forgotten INTEGER NOT NULL DEFAULT 0 CHECK (forgotten IN (0, 1)),
             FOREIGN KEY (operation_id, workspace_id)
                 REFERENCES operations(id, workspace_id)
-        )
+        ) WITHOUT ROWID
     """,
             """
             CREATE TRIGGER lifecycle_identity_immutable
