@@ -556,15 +556,57 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         3,
         (
+            "CREATE UNIQUE INDEX operation_workspace_identity "
+            "ON operations(id, workspace_id)",
             """
         CREATE TABLE workspace_lifecycle (
             workspace_id TEXT PRIMARY KEY
                 REFERENCES workspace_create_intents(workspace_id),
-            operation_id TEXT NOT NULL REFERENCES operations(id),
+            operation_id TEXT NOT NULL,
             lifecycle_state TEXT NOT NULL,
-            forgotten INTEGER NOT NULL DEFAULT 0 CHECK (forgotten IN (0, 1))
+            forgotten INTEGER NOT NULL DEFAULT 0 CHECK (forgotten IN (0, 1)),
+            FOREIGN KEY (operation_id, workspace_id)
+                REFERENCES operations(id, workspace_id)
         )
     """,
+            """
+            CREATE TRIGGER lifecycle_identity_immutable
+            BEFORE UPDATE OF workspace_id ON workspace_lifecycle
+            WHEN NEW.workspace_id IS NOT OLD.workspace_id
+            BEGIN
+                SELECT RAISE(ABORT, 'lifecycle identity is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER lifecycle_receipt_immutable
+            BEFORE DELETE ON workspace_lifecycle
+            BEGIN
+                SELECT RAISE(ABORT, 'lifecycle tombstone is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER lifecycle_tombstone_immutable
+            BEFORE UPDATE ON workspace_lifecycle
+            WHEN (OLD.lifecycle_state = 'deleted'
+                    AND NEW.lifecycle_state IS NOT OLD.lifecycle_state)
+                OR (OLD.forgotten = 1 AND (
+                    NEW.forgotten IS NOT OLD.forgotten
+                    OR NEW.operation_id IS NOT OLD.operation_id
+                    OR NEW.lifecycle_state IS NOT OLD.lifecycle_state))
+            BEGIN
+                SELECT RAISE(ABORT, 'lifecycle tombstone is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER lifecycle_operation_identity_immutable
+            BEFORE UPDATE OF workspace_id, kind ON operations
+            WHEN (NEW.workspace_id IS NOT OLD.workspace_id OR NEW.kind IS NOT OLD.kind)
+                AND EXISTS (SELECT 1 FROM workspace_lifecycle
+                    WHERE operation_id = OLD.id)
+            BEGIN
+                SELECT RAISE(ABORT, 'operation identity is immutable');
+            END
+            """,
             """
             CREATE TABLE lifecycle_evidence (
                 id INTEGER PRIMARY KEY,
@@ -1809,65 +1851,106 @@ class Registry:
         with self._read_connection() as connection:
             if connection is None:
                 raise RegistryError("Workspace is unavailable")
-            intent = connection.execute(
-                "SELECT * FROM workspace_create_intents WHERE workspace_id = ?",
+            return self._lifecycle_snapshot(connection, workspace_id)
+
+    @staticmethod
+    def _lifecycle_snapshot(
+        connection: sqlite3.Connection,
+        workspace_id: str,
+    ) -> dict[str, object]:
+        intent = connection.execute(
+            "SELECT * FROM workspace_create_intents WHERE workspace_id = ?",
+            (workspace_id,),
+        ).fetchone()
+        if intent is None:
+            raise RegistryError("Workspace is unavailable")
+        aggregate = connection.execute(
+            "SELECT * FROM workspace_aggregates WHERE workspace_id = ?",
+            (workspace_id,),
+        ).fetchone()
+        has_lifecycle = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'workspace_lifecycle'"
+        ).fetchone()
+        lifecycle = (
+            connection.execute(
+                "SELECT * FROM workspace_lifecycle WHERE workspace_id = ?",
                 (workspace_id,),
             ).fetchone()
-            if intent is None:
-                raise RegistryError("Workspace is unavailable")
-            aggregate = connection.execute(
-                "SELECT * FROM workspace_aggregates WHERE workspace_id = ?",
-                (workspace_id,),
-            ).fetchone()
-            has_lifecycle = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE name = 'workspace_lifecycle'"
-            ).fetchone()
-            lifecycle = (
-                connection.execute(
-                    "SELECT * FROM workspace_lifecycle WHERE workspace_id = ?",
+            if has_lifecycle
+            else None
+        )
+        operation_id = (
+            lifecycle["operation_id"] if lifecycle else intent["operation_id"]
+        )
+        journal: list[dict[str, object]] = []
+        operation = None
+        provisioned: set[str] = set()
+        for row in connection.execute(
+            "SELECT * FROM operations WHERE workspace_id = ? ORDER BY rowid",
+            (workspace_id,),
+        ).fetchall():
+            steps = [
+                dict(step)
+                for step in connection.execute(
+                    "SELECT * FROM operation_steps WHERE operation_id = ? "
+                    "ORDER BY position",
+                    (row["id"],),
+                ).fetchall()
+            ]
+            entry = dict(row) | {"steps": steps}
+            journal.append(entry)
+            if row["id"] == operation_id:
+                operation = entry
+            if row["id"] == intent["operation_id"]:
+                provisioned.update(
+                    str(step["resource_name"])
+                    for step in steps
+                    if step["action"] == "create" and step["status"] == "completed"
+                )
+        if operation is None:
+            raise RegistryError("Workspace operation is unavailable")
+        if has_lifecycle:
+            provisioned.update(
+                str(row["resource_name"])
+                for row in connection.execute(
+                    "SELECT DISTINCT steps.resource_name "
+                    "FROM lifecycle_evidence AS evidence "
+                    "JOIN operation_steps AS steps "
+                    "ON steps.operation_id = evidence.operation_id "
+                    "AND steps.position = evidence.position "
+                    "WHERE evidence.operation_id = ? AND evidence.status = 'completed' "
+                    "AND steps.action = 'create'",
+                    (intent["operation_id"],),
+                ).fetchall()
+            )
+        return {
+            "intent": dict(intent),
+            "aggregate": dict(aggregate) if aggregate else None,
+            "operation": operation,
+            "operations": journal,
+            "steps": operation["steps"],
+            "provisioned": sorted(provisioned),
+            "forgotten": bool(lifecycle and lifecycle["forgotten"]),
+            "state": str(lifecycle["lifecycle_state"])
+            if lifecycle
+            else (
+                str(aggregate["lifecycle_state"])
+                if aggregate
+                else str(intent["status"])
+            ),
+            "history": [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT lifecycle_evidence.* FROM lifecycle_evidence "
+                    "JOIN operations "
+                    "ON operations.id = lifecycle_evidence.operation_id "
+                    "WHERE operations.workspace_id = ? ORDER BY lifecycle_evidence.id",
                     (workspace_id,),
-                ).fetchone()
-                if has_lifecycle
-                else None
-            )
-            operation_id = (
-                lifecycle["operation_id"] if lifecycle else intent["operation_id"]
-            )
-            operation = connection.execute(
-                "SELECT * FROM operations WHERE id = ?", (operation_id,)
-            ).fetchone()
-            steps = connection.execute(
-                "SELECT * FROM operation_steps WHERE operation_id = ? "
-                "ORDER BY position",
-                (operation_id,),
-            ).fetchall()
-            return {
-                "intent": dict(intent),
-                "aggregate": dict(aggregate) if aggregate else None,
-                "operation": dict(operation) if operation else None,
-                "steps": [dict(step) for step in steps],
-                "forgotten": bool(lifecycle and lifecycle["forgotten"]),
-                "state": str(lifecycle["lifecycle_state"])
-                if lifecycle
-                else (
-                    str(aggregate["lifecycle_state"])
-                    if aggregate
-                    else str(intent["status"])
-                ),
-                "history": [
-                    dict(row)
-                    for row in connection.execute(
-                        "SELECT lifecycle_evidence.* FROM lifecycle_evidence "
-                        "JOIN operations "
-                        "ON operations.id = lifecycle_evidence.operation_id "
-                        "WHERE operations.workspace_id = ? "
-                        "ORDER BY lifecycle_evidence.id",
-                        (workspace_id,),
-                    ).fetchall()
-                ]
-                if has_lifecycle
-                else [],
-            }
+                ).fetchall()
+            ]
+            if has_lifecycle
+            else [],
+        }
 
     def begin_lifecycle(
         self,
@@ -1891,14 +1974,28 @@ class Registry:
                 lease_epoch=epoch,
             )
             previous = connection.execute(
-                "SELECT operation_id, forgotten FROM workspace_lifecycle "
+                "SELECT operation_id, forgotten, lifecycle_state "
+                "FROM workspace_lifecycle "
                 "WHERE workspace_id = ?",
                 (workspace_id,),
             ).fetchone()
-            if previous and (
-                previous["forgotten"] or previous["operation_id"] != expected_operation
+            if previous:
+                if previous["forgotten"]:
+                    raise RegistryError("Workspace is forgotten")
+                if previous["lifecycle_state"] == "deleted" and kind != "forget":
+                    raise RegistryError("Workspace is deleted")
+                if previous["operation_id"] != expected_operation:
+                    raise RegistryError(
+                        "Workspace operation changed; inspect and retry"
+                    )
+            operation = connection.execute(
+                "SELECT workspace_id, kind FROM operations WHERE id = ?",
+                (operation_id,),
+            ).fetchone()
+            if operation is not None and (
+                operation["workspace_id"] != workspace_id or operation["kind"] != kind
             ):
-                raise RegistryError("Workspace operation changed; inspect and retry")
+                raise RegistryError("Workspace operation identity does not match")
             now = _timestamp()
             connection.execute(
                 "INSERT OR IGNORE INTO operations "
@@ -1945,7 +2042,7 @@ class Registry:
         state: str,
         error: str | None = None,
         forgotten: bool = False,
-    ) -> None:
+    ) -> dict[str, object]:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_lease(
@@ -1993,7 +2090,9 @@ class Registry:
                 "WHERE scope_kind = 'workspace' AND scope_key = ?",
                 (workspace_id,),
             )
+            snapshot = self._lifecycle_snapshot(connection, workspace_id)
             connection.commit()
+            return snapshot
 
     def require_no_active_operation(self, workspace_id: str) -> None:
         with self._read_connection() as connection:
@@ -2115,6 +2214,12 @@ class Registry:
         )
         if int(row["aggregate_version"]) != current_version:
             raise RegistryError("Stale operation result rejected by aggregate version")
+        if scope_kind == "workspace":
+            operation = connection.execute(
+                "SELECT workspace_id FROM operations WHERE id = ?", (operation_id,)
+            ).fetchone()
+            if operation is not None and operation["workspace_id"] != scope_key:
+                raise RegistryError("Workspace operation identity does not match")
 
     def get_by_worktree(self, observation: WorktreeObservation) -> WorkspaceRecord:
         observation_token = _observation_token(observation)

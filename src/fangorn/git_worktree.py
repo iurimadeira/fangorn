@@ -2155,7 +2155,11 @@ def observe_lifecycle_worktree(
                 "absence is unknown"
             )
         # A moved or staged checkout must not be mistaken for deleted ownership.
-        if registered.exists() and registered != common_dir:
+        if not registered.exists():
+            raise GitError(
+                "Git registration is unavailable; ownership and absence are unknown"
+            )
+        if registered != common_dir:
             observation = observe_worktree(registered, liveness_fd=liveness_fd)
             if observation.git_dir_generation == ownership_token:
                 raise GitError(

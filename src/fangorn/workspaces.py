@@ -265,6 +265,7 @@ class WorkspaceInspection:
     error: str | None
     state: str
     history: tuple[dict[str, object], ...]
+    operations: tuple[dict[str, object], ...]
 
 
 class WorkspaceOperationError(WorkspaceError):
@@ -665,9 +666,14 @@ class Workspaces:
         return self.inspect(path or Path.cwd()).binding.id
 
     def _inspect_lifecycle(
-        self, workspace_id: str, *, observe: bool
+        self,
+        workspace_id: str,
+        *,
+        observe: bool,
+        snapshot: dict[str, object] | None = None,
     ) -> WorkspaceInspection:
-        snapshot = self._registry.lifecycle_snapshot(workspace_id)
+        if snapshot is None:
+            snapshot = self._registry.lifecycle_snapshot(workspace_id)
         intent = cast(dict[str, object], snapshot["intent"])
         row = cast(dict[str, object] | None, snapshot["aggregate"])
         op = cast(dict[str, object], snapshot["operation"])
@@ -696,7 +702,9 @@ class Workspaces:
                 resource_states=tuple(
                     ResourceState(
                         resource.name,
-                        "created" if row["completed_operation_id"] else "uncreated",
+                        "created"
+                        if resource.name in cast(list[str], snapshot["provisioned"])
+                        else "uncreated",
                     )
                     for resource in resources
                 ),
@@ -745,6 +753,7 @@ class Workspaces:
             str(op["error"]) if op["error"] else None,
             str(snapshot["state"]),
             tuple(cast(list[dict[str, object]], snapshot["history"])),
+            tuple(cast(list[dict[str, object]], snapshot["operations"])),
         )
 
     def _observe_lifecycle(
@@ -833,14 +842,31 @@ class Workspaces:
                     if command != "delete":
                         if workspace is None:
                             raise WorkspaceError("Workspace definition is unavailable")
-                        self._observe_lifecycle(
+                        verified = self._observe_lifecycle(
                             workspace,
                             intent,
                             liveness_fd=self._invocation_descriptor(owner),
                         )
+                except GitQuiescenceError:
+                    raise
                 except GitError:
                     pass  # The journal below retains the failed reconciliation.
                 else:
+                    current_workspace = current.workspace
+                    if command != "delete" and current_workspace is not None:
+                        current_workspace = replace(
+                            current_workspace, branch=verified.branch
+                        )
+                    receipt = replace(
+                        current,
+                        workspace=current_workspace,
+                        observed_status=(
+                            "absent" if command == "delete" else plan.success_state
+                        ),
+                        observation={
+                            "status": "absent" if command == "delete" else "ready"
+                        },
+                    )
                     self._registry.release_lease(
                         scope_kind="workspace",
                         scope_key=workspace_id,
@@ -848,9 +874,7 @@ class Workspaces:
                         lease_epoch=epoch,
                     )
                     epoch = None
-                    return self._inspect_lifecycle(
-                        workspace_id, observe=command != "delete"
-                    )
+                    return receipt
             actions = (
                 ("ownership", "delete", "absence")
                 if command == "delete"
@@ -949,7 +973,7 @@ class Workspaces:
                     lease_epoch=epoch,
                     result=evidence,
                 )
-            self._registry.finish_lifecycle(
+            completed = self._registry.finish_lifecycle(
                 workspace_id,
                 operation_id,
                 epoch,
@@ -957,8 +981,29 @@ class Workspaces:
                 forgotten=command == "forget",
             )
             epoch = None
-            return self._inspect_lifecycle(
-                workspace_id, observe=command not in {"forget", "delete"}
+            receipt = self._inspect_lifecycle(
+                workspace_id, observe=False, snapshot=completed
+            )
+            if (
+                command not in {"forget", "delete"}
+                and receipt.workspace is not None
+                and observed is not None
+            ):
+                receipt = replace(
+                    receipt,
+                    workspace=replace(
+                        receipt.workspace,
+                        branch=observed.branch,
+                    ),
+                )
+            return replace(
+                receipt,
+                observed_status=(
+                    "unknown"
+                    if command == "forget"
+                    else ("absent" if command == "delete" else plan.success_state)
+                ),
+                observation=evidence,
             )
         except (WorkspaceError, GitError, RegistryError, OSError, ValueError) as error:
             quiescence_unknown = isinstance(error, GitQuiescenceError)

@@ -220,6 +220,7 @@ def _echo_inspection(
                 "operation": _operation_schema(result.operation),
                 "steps": list(result.steps),
                 "history": list(result.history),
+                "operations": list(result.operations),
                 "observed_status": result.observed_status,
                 "observation": result.observation,
                 "forgotten": result.forgotten,

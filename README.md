@@ -148,7 +148,9 @@ identities cannot be resurrected by create retries or compatibility adoption.
 
 All new lifecycle commands accept `--json` and emit schema 2. Failures emit JSON
 to stderr with operation ID, Resource, failed step, and a safe next action.
-Inspection includes current operation steps and retained retry history. Python
+Inspection includes every operation's current steps and errors, plus retained
+retry history. Command results preserve their own completed receipt even when
+another command begins immediately afterward. Python
 callers use `Workspaces.inspect_workspace`, `start`, `stop`, `restart`, `delete`,
 and `forget`; inspection returns a `WorkspaceInspection`, whose `workspace` is
 absent only while a preliminary create has no resolved definition.

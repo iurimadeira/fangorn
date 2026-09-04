@@ -4,13 +4,14 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from git_helpers import git
 from test_workspace_create import create_repository, facade
 
-from fangorn.git import observe_worktree
+from fangorn.git import GitQuiescenceError, observe_worktree
+from fangorn.git_worktree import inspect_owned_worktree
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
 from fangorn.workspaces import CreateWorkspace, WorkspaceError
 
@@ -23,6 +24,20 @@ def test_headless_lifecycle_reconciles_without_changing_git(tmp_path: Path) -> N
         CreateWorkspace(str(repository), "topic", tmp_path / "topic", start=False)
     )
     workspace_id = created.workspace.definition.id
+    target = Path(created.workspace.path)
+    (target / "README.md").write_text("tracked changes\n")
+    (target / "staged").write_text("staged changes\n")
+    git(target, "add", "staged")
+    (target / "untracked").write_text("untracked changes\n")
+    index = observe_worktree(target).git_dir / "index"
+    before = (
+        git(target, "rev-parse", "HEAD"),
+        git(target, "branch", "--show-current"),
+        index.read_bytes(),
+        (target / "README.md").read_bytes(),
+        (target / "staged").read_bytes(),
+        (target / "untracked").read_bytes(),
+    )
     assert workspaces.inspect_workspace(workspace_id).state == "stopped"
     started = workspaces.start(workspace_id)
     assert started.state == "ready"
@@ -32,6 +47,14 @@ def test_headless_lifecycle_reconciles_without_changing_git(tmp_path: Path) -> N
     assert workspaces.stop(workspace_id).operation.id == stopped.operation.id
     assert workspaces.restart(workspace_id).state == "ready"
     assert workspaces.inspect(Path(created.workspace.path)).binding.id == workspace_id
+    assert before == (
+        git(target, "rev-parse", "HEAD"),
+        git(target, "branch", "--show-current"),
+        index.read_bytes(),
+        (target / "README.md").read_bytes(),
+        (target / "staged").read_bytes(),
+        (target / "untracked").read_bytes(),
+    )
 
 
 def test_first_restart_journals_stop_then_start_even_when_ready(tmp_path: Path) -> None:
@@ -321,6 +344,11 @@ def test_partial_creation_is_inspectable_and_deletable(
             )
     inspected = workspaces.inspect_workspace(workspace_id)
     assert inspected.operation.kind == "create"
+    if stage != "before_definition":
+        assert inspected.workspace is not None
+        assert inspected.workspace.resource_states[0].provisioning_status == (
+            "created" if stage == "after_target" else "uncreated"
+        )
     deleted = workspaces.delete(workspace_id)
     assert deleted.state == "deleted"
     assert not (tmp_path / "topic").exists()
@@ -558,3 +586,233 @@ def test_children_block_delete_force_and_forget(tmp_path: Path) -> None:
         workspaces.forget(workspace_id, acknowledge_orphans=True)
     assert (tmp_path / "topic").exists()
     assert workspaces.inspect_workspace(workspace_id).error
+
+
+def test_repeated_command_retains_unknown_quiescence_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fangorn.workspaces as application
+
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    created = workspaces.create(
+        CreateWorkspace(str(repository), "topic", tmp_path / "topic")
+    )
+    workspace_id = created.workspace.definition.id
+    workspaces.stop(workspace_id)
+    original = inspect_owned_worktree
+    calls = 0
+
+    def unknown(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise GitQuiescenceError("quiescence remains unknown")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(application, "inspect_owned_worktree", unknown)
+    with pytest.raises(WorkspaceError, match="quiescence remains unknown"):
+        workspaces.stop(workspace_id)
+    assert calls == 1
+    with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT active FROM mutation_leases WHERE scope_key = ?", (workspace_id,)
+        ).fetchone() == (1,)
+    with pytest.raises(WorkspaceError, match="busy"):
+        workspaces.start(workspace_id)
+
+
+@pytest.mark.parametrize("repeated", [False, True])
+def test_command_returns_its_own_receipt_when_next_command_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repeated: bool,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    created = workspaces.create(
+        CreateWorkspace(str(repository), "topic", tmp_path / "topic")
+    )
+    workspace_id = created.workspace.definition.id
+    if repeated:
+        workspaces.stop(workspace_id)
+    interleaved = False
+    original_finish = Registry.finish_lifecycle
+    original_release = Registry.release_lease
+
+    def finish(self: Registry, *args: Any, **kwargs: Any) -> Any:
+        nonlocal interleaved
+        result = original_finish(self, *args, **kwargs)
+        if not interleaved and kwargs["state"] == "stopped":
+            interleaved = True
+            facade(tmp_path).start(workspace_id)
+        return result
+
+    def release(self: Registry, **kwargs: Any) -> None:
+        nonlocal interleaved
+        original_release(self, **kwargs)
+        if not interleaved:
+            interleaved = True
+            facade(tmp_path).start(workspace_id)
+
+    monkeypatch.setattr(
+        Registry,
+        "release_lease" if repeated else "finish_lifecycle",
+        release if repeated else finish,
+    )
+    stopped = workspaces.stop(workspace_id)
+    assert interleaved
+    assert stopped.operation.kind == "stop" and stopped.operation.status == "completed"
+    assert stopped.state == "stopped"
+    assert workspaces.inspect_workspace(workspace_id).state == "ready"
+
+
+def test_missing_moved_checkout_never_proves_deletion(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    target = tmp_path / "topic"
+    created = workspaces.create(CreateWorkspace(str(repository), "topic", target))
+    moved = tmp_path / "moved"
+    hidden = tmp_path / "unavailable"
+    git(repository, "worktree", "move", str(target), str(moved))
+    moved.rename(hidden)
+    with pytest.raises(WorkspaceError, match=r"unknown|ownership"):
+        workspaces.delete(created.workspace.definition.id)
+    assert hidden.exists()
+    assert (
+        workspaces.inspect_workspace(created.workspace.definition.id).state
+        == "delete_failed"
+    )
+
+
+def test_inspection_retains_failed_operations_after_command_switch(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    target = tmp_path / "topic"
+    created = workspaces.create(CreateWorkspace(str(repository), "topic", target))
+    workspace_id = created.workspace.definition.id
+    marker = observe_worktree(target).git_dir / "fangorn-worktree-generation"
+    token = marker.read_text()
+    marker.write_text("f" * 64)
+    with pytest.raises(WorkspaceError, match=r"ownership|identity"):
+        workspaces.stop(workspace_id)
+    failed_before = workspaces.inspect_workspace(workspace_id)
+    failed_id = failed_before.operation.id
+    marker.write_text(token)
+    workspaces.delete(workspace_id)
+    inspected = workspaces.inspect_workspace(workspace_id)
+    failed = next(op for op in inspected.operations if op["id"] == failed_id)
+    assert failed["status"] == "failed" and failed["error"] == failed_before.error
+    assert cast(list[dict[str, object]], failed["steps"])[0]["status"] == "failed"
+
+
+def test_registry_rejects_cross_workspace_operation_reuse(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    a = workspaces.create(CreateWorkspace(str(repository), "a", tmp_path / "a"))
+    b = workspaces.create(CreateWorkspace(str(repository), "b", tmp_path / "b"))
+    stopped = workspaces.stop(a.workspace.definition.id)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    epoch = registry.acquire_lease(
+        scope_kind="workspace",
+        scope_key=b.workspace.definition.id,
+        operation_id=stopped.operation.id,
+        owner=ProcessIdentity("writer", "boot", 1, "start"),
+        owner_status=lambda _: "dead",
+        update_operation=False,
+    )
+    with pytest.raises(
+        RegistryError, match=r"operation.*(Workspace|workspace|identity)"
+    ):
+        registry.begin_lifecycle(
+            b.workspace.definition.id,
+            stopped.operation.id,
+            epoch,
+            kind="stop",
+            state="stopping",
+            actions=("stop",),
+            expected_operation=b.operation.id,
+        )
+    assert (
+        workspaces.inspect_workspace(a.workspace.definition.id).operation.status
+        == "completed"
+    )
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO workspace_lifecycle "
+                "(workspace_id, operation_id, lifecycle_state) "
+                "VALUES (?, ?, 'stopped')",
+                (b.workspace.definition.id, stopped.operation.id),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE operations SET workspace_id = ? WHERE id = ?",
+                (b.workspace.definition.id, stopped.operation.id),
+            )
+
+
+@pytest.mark.parametrize("terminal", ["delete", "forget"])
+def test_registry_tombstones_cannot_be_removed_or_reopened(
+    tmp_path: Path, terminal: str
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    workspaces = facade(tmp_path)
+    created = workspaces.create(
+        CreateWorkspace(str(repository), "topic", tmp_path / "topic")
+    )
+    workspace_id = created.workspace.definition.id
+    if terminal == "delete":
+        receipt = workspaces.delete(workspace_id)
+    else:
+        receipt = workspaces.forget(workspace_id, acknowledge_orphans=True)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    with sqlite3.connect(registry.path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match=r"immutable|tombstone"):
+            connection.execute(
+                "DELETE FROM workspace_lifecycle WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match=r"immutable|tombstone"):
+            connection.execute(
+                "UPDATE workspace_lifecycle "
+                "SET lifecycle_state = 'starting', forgotten = 0 "
+                "WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+    epoch = registry.acquire_lease(
+        scope_kind="workspace",
+        scope_key=workspace_id,
+        operation_id="reopen",
+        owner=ProcessIdentity("writer", "boot", 1, "start"),
+        owner_status=lambda _: "dead",
+        update_operation=False,
+    )
+    with pytest.raises(RegistryError, match=r"deleted|forgotten"):
+        registry.begin_lifecycle(
+            workspace_id,
+            "reopen",
+            epoch,
+            kind="start",
+            state="starting",
+            actions=("start",),
+            expected_operation=receipt.operation.id,
+        )
+    registry.release_lease(
+        scope_kind="workspace",
+        scope_key=workspace_id,
+        operation_id="reopen",
+        lease_epoch=epoch,
+    )
+    if terminal == "delete":
+        assert workspaces.forget(workspace_id, acknowledge_orphans=True).forgotten
