@@ -598,6 +598,23 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             END
             """,
             """
+            CREATE TRIGGER lifecycle_tombstone_insert_guard
+            BEFORE INSERT ON workspace_lifecycle
+            WHEN EXISTS (
+                SELECT 1 FROM workspace_lifecycle AS existing
+                WHERE existing.workspace_id = NEW.workspace_id
+                    AND ((existing.lifecycle_state = 'deleted'
+                        AND NEW.lifecycle_state IS NOT existing.lifecycle_state)
+                    OR (existing.forgotten = 1 AND (
+                        NEW.forgotten IS NOT existing.forgotten
+                        OR NEW.operation_id IS NOT existing.operation_id
+                        OR NEW.lifecycle_state IS NOT existing.lifecycle_state)))
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'lifecycle tombstone is immutable');
+            END
+            """,
+            """
             CREATE TRIGGER lifecycle_operation_identity_immutable
             BEFORE UPDATE OF workspace_id, kind ON operations
             WHEN (NEW.workspace_id IS NOT OLD.workspace_id OR NEW.kind IS NOT OLD.kind)

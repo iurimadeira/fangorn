@@ -780,6 +780,14 @@ def test_registry_tombstones_cannot_be_removed_or_reopened(
     with sqlite3.connect(registry.path) as connection:
         with pytest.raises(sqlite3.IntegrityError, match=r"immutable|tombstone"):
             connection.execute(
+                "INSERT OR REPLACE INTO workspace_lifecycle "
+                "(workspace_id, operation_id, lifecycle_state, forgotten) "
+                "SELECT workspace_id, operation_id, 'ready', 0 "
+                "FROM workspace_lifecycle WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match=r"immutable|tombstone"):
+            connection.execute(
                 "DELETE FROM workspace_lifecycle WHERE workspace_id = ?",
                 (workspace_id,),
             )
