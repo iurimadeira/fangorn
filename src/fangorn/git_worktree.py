@@ -2107,3 +2107,214 @@ def _process_group_running(process_group: int, *, timeout: float = 1) -> bool:
 def _git_error(result: subprocess.CompletedProcess[bytes]) -> str:
     detail = (result.stderr or result.stdout).decode("utf-8", errors="replace").strip()
     return detail or f"Git command failed with exit status {result.returncode}"
+
+
+def observe_lifecycle_worktree(
+    target: Path,
+    *,
+    ownership_token: str,
+    common_dir: Path,
+    common_generation: str,
+    liveness_fd: int | None = None,
+) -> WorktreeObservation | None:
+    """Return matching ownership or proven absence; uncertainty raises."""
+    validate_target_path(target)
+    if target.is_symlink():
+        raise GitError("Worktree Resource locator is a symlink; ownership is unknown")
+    if repository_generation(common_dir, create=False) != common_generation:
+        raise GitError("Repository ownership identity changed")
+    if target.exists():
+        return inspect_owned_worktree(
+            target,
+            expected_commit=None,
+            expected_branch=None,
+            ownership_token=ownership_token,
+            expected_repository_common_dir=common_dir,
+            expected_repository_generation=common_generation,
+            liveness_fd=liveness_fd,
+        )
+    with _trusted_checkout_configuration(common_dir, common_dir):
+        result = _run_git_process(
+            common_dir,
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+            git_dir=True,
+            liveness_fd=liveness_fd,
+        )
+    if result.returncode:
+        raise GitError(_git_error(result))
+    for field in result.stdout.split(b"\0"):
+        if not field.startswith(b"worktree "):
+            continue
+        registered = Path(os.fsdecode(field[len(b"worktree ") :]))
+        if registered == target:
+            raise GitError(
+                "Worktree locator is missing but Git registration remains; "
+                "absence is unknown"
+            )
+        # A moved or staged checkout must not be mistaken for deleted ownership.
+        if registered.exists() and registered != common_dir:
+            observation = observe_worktree(registered, liveness_fd=liveness_fd)
+            if observation.git_dir_generation == ownership_token:
+                raise GitError(
+                    "Owned Worktree moved from its immutable locator; "
+                    "inspect before retry"
+                )
+    return None
+
+
+def inspect_delete_worktree(
+    target: Path,
+    *,
+    ownership_token: str,
+    common_dir: Path,
+    common_generation: str,
+    liveness_fd: int | None = None,
+) -> WorktreeObservation | None:
+    """Include the F2 staging locator and receipt in deletion reconciliation."""
+    validate_target_path(target)
+    staging = target.parent / f".fangorn-{ownership_token}"
+    receipt = target.parent / f".fangorn-{ownership_token}.intent"
+    descriptor = _walk_target_parent(target.parent, create=False)
+    if descriptor is not None:
+        try:
+            if _entry_kind(descriptor, receipt.name) is not None:
+                _require_staging_receipt(receipt, ownership_token, descriptor)
+            elif _entry_kind(descriptor, staging.name) is not None:
+                raise GitError("Staged Worktree has no ownership receipt")
+            if _entry_kind(descriptor, staging.name) is not None:
+                if _entry_kind(descriptor, target.name) is not None:
+                    raise GitError(
+                        "Both final and staging locators exist; ownership is ambiguous"
+                    )
+                return observe_lifecycle_worktree(
+                    staging,
+                    ownership_token=ownership_token,
+                    common_dir=common_dir,
+                    common_generation=common_generation,
+                    liveness_fd=liveness_fd,
+                )
+        finally:
+            os.close(descriptor)
+    return observe_lifecycle_worktree(
+        target,
+        ownership_token=ownership_token,
+        common_dir=common_dir,
+        common_generation=common_generation,
+        liveness_fd=liveness_fd,
+    )
+
+
+def delete_owned_worktree(
+    target: Path,
+    *,
+    ownership_token: str,
+    common_dir: Path,
+    common_generation: str,
+    force: bool,
+    liveness_fd: int,
+) -> None:
+    observation = inspect_delete_worktree(
+        target,
+        ownership_token=ownership_token,
+        common_dir=common_dir,
+        common_generation=common_generation,
+        liveness_fd=liveness_fd,
+    )
+    receipt = target.parent / f".fangorn-{ownership_token}.intent"
+    if observation is None:
+        descriptor = _walk_target_parent(target.parent, create=False)
+        if descriptor is not None:
+            try:
+                _remove_staging_receipt(receipt, ownership_token, descriptor)
+            finally:
+                os.close(descriptor)
+        return
+    target = observation.path
+    parent = _prepare_target_parent(target.parent)
+    try:
+        with _trusted_worktree_checkout_configuration(
+            parent.descriptor,
+            target.name,
+            observation,
+            label="delete",
+            liveness_fd=liveness_fd,
+        ) as descriptor:
+            index = _run_git_process(
+                Path("."),
+                "ls-files",
+                "--stage",
+                "-z",
+                liveness_fd=liveness_fd,
+                working_directory_fd=descriptor,
+                extra_fds=(descriptor,),
+            )
+            if index.returncode:
+                raise GitError(_git_error(index))
+            if any(entry.startswith(b"160000 ") for entry in index.stdout.split(b"\0")):
+                raise GitError(
+                    "Worktree contains submodules; force supports dirty removal only"
+                )
+            dirty = _run_git_process(
+                Path("."),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                liveness_fd=liveness_fd,
+                working_directory_fd=descriptor,
+                extra_fds=(descriptor,),
+            )
+            if dirty.returncode:
+                raise GitError(_git_error(dirty))
+            if dirty.stdout and not force:
+                raise GitError(
+                    "Worktree is dirty; preserve changes or explicitly retry "
+                    "delete --force"
+                )
+            _require_target_parent(parent)
+            current = inspect_owned_worktree(
+                target,
+                expected_commit=None,
+                expected_branch=None,
+                ownership_token=ownership_token,
+                expected_repository_common_dir=common_dir,
+                expected_repository_generation=common_generation,
+                liveness_fd=liveness_fd,
+            )
+            if current.git_dir != observation.git_dir:
+                raise GitError("Worktree administrative identity changed")
+            arguments = (
+                "worktree",
+                "remove",
+                *(("--force",) if force else ()),
+                "--",
+                str(target),
+            )
+            result = _run_git_process(
+                common_dir, *arguments, git_dir=True, liveness_fd=liveness_fd
+            )
+            if result.returncode:
+                raise GitError(_git_error(result))
+    finally:
+        os.close(parent.descriptor)
+    if observation.git_dir.exists() or observation.git_dir.is_symlink():
+        raise GitError("Worktree administrative identity remains after delete")
+    if (
+        observe_lifecycle_worktree(
+            target,
+            ownership_token=ownership_token,
+            common_dir=common_dir,
+            common_generation=common_generation,
+            liveness_fd=liveness_fd,
+        )
+        is not None
+    ):
+        raise GitError("Worktree remains after delete; absence was not proven")
+    descriptor = _walk_target_parent(target.parent, create=False)
+    if descriptor is not None:
+        try:
+            _remove_staging_receipt(receipt, ownership_token, descriptor)
+        finally:
+            os.close(descriptor)

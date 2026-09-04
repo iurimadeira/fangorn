@@ -8,8 +8,9 @@ technical Git identity shared by Worktree Resources; it is not a second
 user-managed project object.
 
 This release creates root headless Workspaces containing one built-in Git
-Worktree Resource. Terminal, Service, parent-lineage, and later lifecycle
-commands are not shipped yet. Existing `info`, `list`, and hidden migration
+Worktree Resource and supports aggregate inspection, start, stop, restart,
+delete, and metadata-only forget. Terminal, Service, parent-lineage, and
+recursive deletion are not shipped yet. Existing `info`, `list`, and hidden migration
 `adopt` compatibility commands retain their schema-1 meanings.
 
 ## Requirements
@@ -113,6 +114,44 @@ reports aggregate `state`, `version`, `path`, and `branch`. `operation` reports
 its `id`, `kind`, and `status`.
 
 ## Inspect compatibility records
+
+Operate a headless Workspace through its ID or Worktree path:
+
+```sh
+fangorn workspace inspect --path ./feature
+fangorn workspace stop --workspace WORKSPACE_ID
+fangorn workspace start --workspace WORKSPACE_ID
+fangorn workspace restart --workspace WORKSPACE_ID
+fangorn workspace delete --workspace WORKSPACE_ID --yes
+```
+
+Inspect, start, stop, and restart default to the registered Workspace containing
+the current directory. Worktree start/stop verify ownership without changing
+checkout files, branch, or HEAD. Stop retains the Worktree. Restart stops first
+and never starts after failed stop. Inspection separates persisted `state` from
+current `observed_status`; drift never repairs metadata or rewrites lifecycle
+state. Failed and partially created Workspaces remain inspectable by ID.
+
+Deletion requires an explicit ID and confirmation (`--yes` for automation).
+It records matching ownership before removal and proves final and interrupted
+creation staging locators absent before success. Dirty Worktrees are refused;
+`--force` supports dirty removal only. Ownership mismatches, unknown outcomes,
+locked worktrees, submodules, and child guards remain enforced. `--recursive` is rejected.
+Failure evidence and lease fencing survive retries; repeated completed deletion
+returns the original receipt. Git branches remain available after deletion.
+
+`fangorn workspace forget --workspace WORKSPACE_ID --acknowledge-orphans`
+removes a childless Workspace from the active view without calling Git or
+cleaning external Resources. It requires no active operation and retains an
+audit receipt explicitly stating cleanup was not proven. Forgotten and deleted
+identities cannot be resurrected by create retries or compatibility adoption.
+
+All new lifecycle commands accept `--json` and emit schema 2. Failures emit JSON
+to stderr with operation ID, Resource, failed step, and a safe next action.
+Inspection includes current operation steps and retained retry history. Python
+callers use `Workspaces.inspect_workspace`, `start`, `stop`, `restart`, `delete`,
+and `forget`; inspection returns a `WorkspaceInspection`, whose `workspace` is
+absent only while a preliminary create has no resolved definition.
 
 Inspect the Workspace containing the current directory or list registered
 Workspaces:

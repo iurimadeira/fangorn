@@ -26,7 +26,7 @@ ADOPTION_TIMEOUT_SECONDS = 5.0
 ADOPTION_RETRY_DELAY_SECONDS = 0.01
 READ_INITIALIZATION_TIMEOUT_SECONDS = 1.0
 READ_INITIALIZATION_RETRY_DELAY_SECONDS = 0.01
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class RegistryError(RuntimeError):
@@ -553,6 +553,47 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        3,
+        (
+            """
+        CREATE TABLE workspace_lifecycle (
+            workspace_id TEXT PRIMARY KEY
+                REFERENCES workspace_create_intents(workspace_id),
+            operation_id TEXT NOT NULL REFERENCES operations(id),
+            lifecycle_state TEXT NOT NULL,
+            forgotten INTEGER NOT NULL DEFAULT 0 CHECK (forgotten IN (0, 1))
+        )
+    """,
+            """
+            CREATE TABLE lifecycle_evidence (
+                id INTEGER PRIMARY KEY,
+                operation_id TEXT NOT NULL REFERENCES operations(id),
+                position INTEGER,
+                status TEXT NOT NULL,
+                evidence TEXT,
+                recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TRIGGER retain_step_evidence BEFORE UPDATE ON operation_steps
+            WHEN OLD.status != 'pending'
+            BEGIN
+                INSERT INTO lifecycle_evidence
+                    (operation_id, position, status, evidence)
+                VALUES (OLD.operation_id, OLD.position, OLD.status, OLD.result_json);
+            END
+            """,
+            """
+            CREATE TRIGGER retain_operation_failure BEFORE UPDATE ON operations
+            WHEN OLD.error IS NOT NULL
+            BEGIN
+                INSERT INTO lifecycle_evidence (operation_id, status, evidence)
+                VALUES (OLD.id, OLD.status, OLD.error);
+            END
+            """,
+        ),
+    ),
 )
 
 
@@ -688,6 +729,15 @@ class Registry:
                     (str(observation.git_dir),),
                 ).fetchone()
                 created = workspace is None
+                if (
+                    workspace is not None
+                    and connection.execute(
+                        "SELECT 1 FROM workspace_lifecycle WHERE workspace_id = ? "
+                        "AND (forgotten = 1 OR lifecycle_state = 'deleted')",
+                        (workspace["id"],),
+                    ).fetchone()
+                ):
+                    raise RegistryError("Workspace is deleted or forgotten")
                 if workspace is None:
                     workspace_id = str(uuid4())
                     connection.execute(
@@ -1111,6 +1161,8 @@ class Registry:
         operation_id: str,
         owner: ProcessIdentity,
         owner_status: Callable[[ProcessIdentity], str],
+        reject_active: bool = False,
+        update_operation: bool = True,
     ) -> int:
         with self._connection() as connection:
             self._migrate(connection)
@@ -1134,7 +1186,14 @@ class Registry:
             self._migrate(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                if scope_kind == "workspace":
+                if scope_kind == "workspace" and update_operation:
+                    if connection.execute(
+                        "SELECT 1 FROM workspace_lifecycle WHERE workspace_id = ?",
+                        (scope_key,),
+                    ).fetchone():
+                        raise RegistryError(
+                            "Create cannot resume after another lifecycle operation"
+                        )
                     terminal = connection.execute(
                         "SELECT status FROM workspace_create_intents "
                         "WHERE workspace_id = ? AND operation_id = ?",
@@ -1150,6 +1209,10 @@ class Registry:
                     (scope_kind, scope_key),
                 ).fetchone()
                 current = _lease_from_row(row) if row is not None else None
+                if reject_active and current is not None and current.active:
+                    raise RegistryError(
+                        "Workspace has an active operation; reconcile before forget"
+                    )
                 if current != inspected:
                     raise RegistryError(
                         f"{scope_kind.capitalize()} mutation changed during probe"
@@ -1220,7 +1283,7 @@ class Registry:
                                 scope_key,
                             ),
                         )
-                if scope_kind == "workspace":
+                if scope_kind == "workspace" and update_operation:
                     now = _timestamp()
                     connection.execute(
                         "UPDATE operations SET status = 'running', error = NULL, "
@@ -1290,13 +1353,24 @@ class Registry:
                 if enter_state is not None:
                     changed = connection.execute(
                         "UPDATE workspace_aggregates SET lifecycle_state = ? "
-                        "WHERE workspace_id = ? AND completed_operation_id IS NULL",
-                        (enter_state, scope_key),
+                        "WHERE workspace_id = ? AND (completed_operation_id IS NULL "
+                        "OR EXISTS (SELECT 1 FROM workspace_lifecycle "
+                        "WHERE workspace_id = ? AND operation_id = ?))",
+                        (enter_state, scope_key, scope_key, operation_id),
                     ).rowcount
                     if changed != 1:
                         raise RegistryError(
                             "Workspace lifecycle transition is unavailable"
                         )
+                    connection.execute(
+                        "UPDATE workspaces SET lifecycle_state = ? WHERE id = ?",
+                        (enter_state, scope_key),
+                    )
+                    connection.execute(
+                        "UPDATE workspace_lifecycle SET lifecycle_state = ? "
+                        "WHERE workspace_id = ? AND operation_id = ?",
+                        (enter_state, scope_key, operation_id),
+                    )
                 connection.commit()
                 return status
             except (sqlite3.Error, RegistryError) as error:
@@ -1730,6 +1804,244 @@ class Registry:
                 if isinstance(error, RegistryError):
                     raise
                 raise _registry_error(error) from error
+
+    def lifecycle_snapshot(self, workspace_id: str) -> dict[str, object]:
+        with self._read_connection() as connection:
+            if connection is None:
+                raise RegistryError("Workspace is unavailable")
+            intent = connection.execute(
+                "SELECT * FROM workspace_create_intents WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+            if intent is None:
+                raise RegistryError("Workspace is unavailable")
+            aggregate = connection.execute(
+                "SELECT * FROM workspace_aggregates WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+            has_lifecycle = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'workspace_lifecycle'"
+            ).fetchone()
+            lifecycle = (
+                connection.execute(
+                    "SELECT * FROM workspace_lifecycle WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchone()
+                if has_lifecycle
+                else None
+            )
+            operation_id = (
+                lifecycle["operation_id"] if lifecycle else intent["operation_id"]
+            )
+            operation = connection.execute(
+                "SELECT * FROM operations WHERE id = ?", (operation_id,)
+            ).fetchone()
+            steps = connection.execute(
+                "SELECT * FROM operation_steps WHERE operation_id = ? "
+                "ORDER BY position",
+                (operation_id,),
+            ).fetchall()
+            return {
+                "intent": dict(intent),
+                "aggregate": dict(aggregate) if aggregate else None,
+                "operation": dict(operation) if operation else None,
+                "steps": [dict(step) for step in steps],
+                "forgotten": bool(lifecycle and lifecycle["forgotten"]),
+                "state": str(lifecycle["lifecycle_state"])
+                if lifecycle
+                else (
+                    str(aggregate["lifecycle_state"])
+                    if aggregate
+                    else str(intent["status"])
+                ),
+                "history": [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT lifecycle_evidence.* FROM lifecycle_evidence "
+                        "JOIN operations "
+                        "ON operations.id = lifecycle_evidence.operation_id "
+                        "WHERE operations.workspace_id = ? "
+                        "ORDER BY lifecycle_evidence.id",
+                        (workspace_id,),
+                    ).fetchall()
+                ]
+                if has_lifecycle
+                else [],
+            }
+
+    def begin_lifecycle(
+        self,
+        workspace_id: str,
+        operation_id: str,
+        epoch: int,
+        *,
+        kind: str,
+        state: str,
+        actions: tuple[str, ...],
+        expected_operation: str,
+    ) -> None:
+        with self._connection() as connection:
+            self._migrate(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_lease(
+                connection,
+                operation_id=operation_id,
+                scope_kind="workspace",
+                scope_key=workspace_id,
+                lease_epoch=epoch,
+            )
+            previous = connection.execute(
+                "SELECT operation_id, forgotten FROM workspace_lifecycle "
+                "WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+            if previous and (
+                previous["forgotten"] or previous["operation_id"] != expected_operation
+            ):
+                raise RegistryError("Workspace operation changed; inspect and retry")
+            now = _timestamp()
+            connection.execute(
+                "INSERT OR IGNORE INTO operations "
+                "(id, workspace_id, kind, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'running', ?, ?)",
+                (operation_id, workspace_id, kind, now, now),
+            )
+            connection.execute(
+                "UPDATE operations SET status = 'running', updated_at = ? WHERE id = ?",
+                (now, operation_id),
+            )
+            for position, action in enumerate(actions):
+                connection.execute(
+                    "INSERT OR IGNORE INTO operation_steps "
+                    "(operation_id, position, action, resource_name, status) "
+                    "VALUES (?, ?, ?, 'worktree', 'pending')",
+                    (operation_id, position, action),
+                )
+            connection.execute(
+                "INSERT INTO workspace_lifecycle "
+                "(workspace_id, operation_id, lifecycle_state, forgotten) "
+                "VALUES (?, ?, ?, 0) ON CONFLICT(workspace_id) "
+                "DO UPDATE SET operation_id = excluded.operation_id, "
+                "lifecycle_state = excluded.lifecycle_state",
+                (workspace_id, operation_id, state),
+            )
+            connection.execute(
+                "UPDATE workspace_aggregates SET lifecycle_state = ? "
+                "WHERE workspace_id = ?",
+                (state, workspace_id),
+            )
+            connection.execute(
+                "UPDATE workspaces SET lifecycle_state = ? WHERE id = ?",
+                (state, workspace_id),
+            )
+            connection.commit()
+
+    def finish_lifecycle(
+        self,
+        workspace_id: str,
+        operation_id: str,
+        epoch: int,
+        *,
+        state: str,
+        error: str | None = None,
+        forgotten: bool = False,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_lease(
+                connection,
+                operation_id=operation_id,
+                scope_kind="workspace",
+                scope_key=workspace_id,
+                lease_epoch=epoch,
+            )
+            if state == "deleted" or forgotten:
+                self._require_childless(connection, workspace_id)
+            connection.execute(
+                "UPDATE operations SET status = ?, error = ?, updated_at = ? "
+                "WHERE id = ?",
+                ("failed" if error else "completed", error, _timestamp(), operation_id),
+            )
+            if error:
+                connection.execute(
+                    "UPDATE operation_steps SET status = 'failed', result_json = ? "
+                    "WHERE operation_id = ? AND status = 'running'",
+                    (json.dumps({"error": error}), operation_id),
+                )
+            connection.execute(
+                "UPDATE workspaces SET lifecycle_state = ?, "
+                "aggregate_version = aggregate_version + 1 WHERE id = ?",
+                (state, workspace_id),
+            )
+            connection.execute(
+                "UPDATE workspace_aggregates SET lifecycle_state = ?, "
+                "aggregate_version = aggregate_version + 1 WHERE workspace_id = ?",
+                (state, workspace_id),
+            )
+            connection.execute(
+                "UPDATE workspace_create_intents "
+                "SET aggregate_version = aggregate_version + 1 WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+            connection.execute(
+                "UPDATE workspace_lifecycle SET forgotten = ?, lifecycle_state = ? "
+                "WHERE workspace_id = ?",
+                (int(forgotten), state, workspace_id),
+            )
+            connection.execute(
+                "UPDATE mutation_leases SET active = 0 "
+                "WHERE scope_kind = 'workspace' AND scope_key = ?",
+                (workspace_id,),
+            )
+            connection.commit()
+
+    def require_no_active_operation(self, workspace_id: str) -> None:
+        with self._read_connection() as connection:
+            if (
+                connection is not None
+                and connection.execute(
+                    "SELECT 1 FROM mutation_leases WHERE scope_kind = 'workspace' "
+                    "AND scope_key = ? AND active = 1",
+                    (workspace_id,),
+                ).fetchone()
+            ):
+                raise RegistryError(
+                    "Workspace has an active operation; reconcile it before forget"
+                )
+
+    def workspace_is_inactive(self, workspace_id: str) -> bool:
+        with self._read_connection() as connection:
+            if (
+                connection is None
+                or not connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'workspace_lifecycle'"
+                ).fetchone()
+            ):
+                return False
+            return bool(
+                connection.execute(
+                    "SELECT 1 FROM workspace_lifecycle WHERE workspace_id = ? "
+                    "AND (forgotten = 1 OR lifecycle_state = 'deleted')",
+                    (workspace_id,),
+                ).fetchone()
+            )
+
+    def require_childless(self, workspace_id: str) -> None:
+        with self._read_connection() as connection:
+            if connection is not None:
+                self._require_childless(connection, workspace_id)
+
+    @staticmethod
+    def _require_childless(connection: sqlite3.Connection, workspace_id: str) -> None:
+        if connection.execute(
+            "SELECT 1 FROM workspace_aggregates "
+            "WHERE json_extract(definition_json, '$.parent_id') = ? "
+            "AND lifecycle_state != 'deleted' "
+            "UNION ALL SELECT 1 FROM workspaces "
+            "WHERE parent_id = ? AND lifecycle_state != 'deleted' LIMIT 1",
+            (workspace_id, workspace_id),
+        ).fetchone():
+            raise RegistryError("Workspace has children; child cleanup required")
 
     def load_created_workspace(
         self, workspace_id: str

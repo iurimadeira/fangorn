@@ -19,10 +19,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock, Thread
 from types import MappingProxyType
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
-from fangorn._lifecycle import Observation, finish_create, plan_create
+from fangorn._lifecycle import (
+    LifecyclePlan,
+    Observation,
+    finish_create,
+    plan_create,
+    plan_lifecycle,
+)
 from fangorn._lifecycle import Resource as LifecycleResource
 from fangorn._permissions import (
     descriptor_has_writable_acl as _darwin_acl_allows_write,
@@ -30,15 +36,19 @@ from fangorn._permissions import (
 from fangorn.git import (
     GitError,
     GitQuiescenceError,
+    WorktreeObservation,
     observe_worktree,
     repository_generation,
 )
 from fangorn.git_worktree import (
     RepositorySource,
     create_worktree,
+    delete_owned_worktree,
+    inspect_delete_worktree,
     inspect_owned_worktree,
     materialize_cache,
     normalize_repository_source,
+    observe_lifecycle_worktree,
     read_configuration,
     resolve_commit,
     validate_branch_name,
@@ -241,6 +251,40 @@ class CreateWorkspaceResult:
     workspace: WorkspaceAggregate
     operation: Operation
     created: bool
+
+
+@dataclass(frozen=True)
+class WorkspaceInspection:
+    workspace_id: str
+    workspace: WorkspaceAggregate | None
+    operation: Operation
+    steps: tuple[dict[str, object], ...]
+    observed_status: str
+    observation: dict[str, object]
+    forgotten: bool
+    error: str | None
+    state: str
+    history: tuple[dict[str, object], ...]
+
+
+class WorkspaceOperationError(WorkspaceError):
+    def __init__(
+        self,
+        message: str,
+        workspace_id: str,
+        operation_id: str,
+        step: str,
+        command: str,
+    ) -> None:
+        super().__init__(message)
+        self.details: dict[str, object] = {
+            "workspace_id": workspace_id,
+            "operation_id": operation_id,
+            "resource": "worktree",
+            "step": step,
+            "message": message,
+            "next_action": f"Inspect Workspace and retry {command}",
+        }
 
 
 class Workspaces:
@@ -586,16 +630,386 @@ class Workspaces:
                         raise WorkspaceError(f"{active}; {cleanup_error}") from active
                     raise
 
+    def inspect_workspace(
+        self,
+        workspace_id: str | None = None,
+        *,
+        path: Path | None = None,
+    ) -> WorkspaceInspection:
+        try:
+            selected = self._select_workspace(workspace_id, path)
+            return self._inspect_lifecycle(selected, observe=True)
+        except (RegistryError, GitError, OSError, ValueError) as error:
+            raise WorkspaceError(str(error)) from error
+
+    def start(
+        self, workspace_id: str | None = None, *, path: Path | None = None
+    ) -> WorkspaceInspection:
+        return self._operate("start", self._select_workspace(workspace_id, path))
+
+    def stop(
+        self, workspace_id: str | None = None, *, path: Path | None = None
+    ) -> WorkspaceInspection:
+        return self._operate("stop", self._select_workspace(workspace_id, path))
+
+    def restart(
+        self, workspace_id: str | None = None, *, path: Path | None = None
+    ) -> WorkspaceInspection:
+        return self._operate("restart", self._select_workspace(workspace_id, path))
+
+    def _select_workspace(self, workspace_id: str | None, path: Path | None) -> str:
+        if workspace_id is not None:
+            if path is not None:
+                raise WorkspaceError("Choose Workspace ID or path, not both")
+            return workspace_id
+        return self.inspect(path or Path.cwd()).binding.id
+
+    def _inspect_lifecycle(
+        self, workspace_id: str, *, observe: bool
+    ) -> WorkspaceInspection:
+        snapshot = self._registry.lifecycle_snapshot(workspace_id)
+        intent = cast(dict[str, object], snapshot["intent"])
+        row = cast(dict[str, object] | None, snapshot["aggregate"])
+        op = cast(dict[str, object], snapshot["operation"])
+        workspace = None
+        if row is not None:
+            definition = cast(
+                dict[str, object], json.loads(str(row["definition_json"]))
+            )
+            resources = tuple(
+                ResourceDefinition(**resource)
+                for resource in cast(list[dict[str, Any]], definition["resources"])
+            )
+            workspace = WorkspaceAggregate(
+                definition=WorkspaceDefinition(
+                    id=workspace_id,
+                    parent_id=cast(str | None, definition["parent_id"]),
+                    repository_id=str(definition["repository_id"]),
+                    created_from_sha=str(definition["created_from_sha"]),
+                    configuration=bytes.fromhex(str(definition["configuration"])),
+                    configuration_value=cast(
+                        dict[str, object], definition["configuration_value"]
+                    ),
+                    configuration_digest=str(definition["configuration_digest"]),
+                    resources=resources,
+                ),
+                resource_states=tuple(
+                    ResourceState(
+                        resource.name,
+                        "created" if row["completed_operation_id"] else "uncreated",
+                    )
+                    for resource in resources
+                ),
+                state=str(row["lifecycle_state"]),
+                version=int(cast(int, row["aggregate_version"])),
+                path=str(intent["target_path"]),
+                branch=str(json.loads(str(intent["request_json"]))["branch"]),
+            )
+        operation = Operation(str(op["id"]), str(op["kind"]), str(op["status"]))
+        status = "unknown"
+        evidence: dict[str, object] = {}
+        if observe and workspace is not None and not snapshot["forgotten"]:
+            try:
+                resolved = json.loads(str(intent["resolved_json"]))
+                resource = workspace.definition.resources[0]
+                observation = observe_lifecycle_worktree(
+                    Path(resource.locator),
+                    ownership_token=resource.ownership_token,
+                    common_dir=Path(resolved["repository_common_dir"]),
+                    common_generation=resolved["repository_generation"],
+                )
+                if observation is None:
+                    status = "absent" if workspace.state == "deleted" else "degraded"
+                    evidence = {"status": "absent", "locator": resource.locator}
+                else:
+                    status = "stopped" if workspace.state == "stopped" else "ready"
+                    if workspace.state not in {"ready", "stopped"}:
+                        status = "degraded"
+                    workspace = replace(workspace, branch=observation.branch)
+                    evidence = {
+                        "status": "ready",
+                        "path": str(observation.path),
+                        "head": observation.head,
+                    }
+            except (GitError, OSError) as error:
+                status = "degraded"
+                evidence = {"status": "unknown", "error": str(error)}
+        return WorkspaceInspection(
+            workspace_id,
+            workspace,
+            operation,
+            tuple(cast(list[dict[str, object]], snapshot["steps"])),
+            status,
+            evidence,
+            bool(snapshot["forgotten"]),
+            str(op["error"]) if op["error"] else None,
+            str(snapshot["state"]),
+            tuple(cast(list[dict[str, object]], snapshot["history"])),
+        )
+
+    def _observe_lifecycle(
+        self,
+        workspace: WorkspaceAggregate,
+        intent: dict[str, object],
+        *,
+        liveness_fd: int | None = None,
+    ) -> WorktreeObservation:
+        resolved = json.loads(str(intent["resolved_json"]))
+        resource = workspace.definition.resources[0]
+        if len(workspace.definition.resources) != 1 or resource.kind != "worktree":
+            raise WorkspaceError("Only headless Worktree-only lifecycle is supported")
+        validate_target_path(Path(resource.locator))
+        return inspect_owned_worktree(
+            Path(resource.locator),
+            expected_commit=None,
+            expected_branch=None,
+            ownership_token=resource.ownership_token,
+            expected_repository_common_dir=Path(resolved["repository_common_dir"]),
+            expected_repository_generation=resolved["repository_generation"],
+            liveness_fd=liveness_fd,
+        )
+
+    def delete(self, workspace_id: str, *, force: bool = False) -> WorkspaceInspection:
+        return self._operate("delete", workspace_id, force=force)
+
+    def forget(
+        self, workspace_id: str, *, acknowledge_orphans: bool = False
+    ) -> WorkspaceInspection:
+        if not acknowledge_orphans:
+            raise WorkspaceError("forget requires explicit acknowledge_orphans")
+        return self._operate("forget", workspace_id)
+
+    def _operate(
+        self, command: str, workspace_id: str, *, force: bool = False
+    ) -> WorkspaceInspection:
+        owner = None
+        epoch = None
+        operation_id = str(uuid4())
+        begun = False
+        action = "stop" if command == "restart" else command
+        quiescence_unknown = False
+        try:
+            initial = self._inspect_lifecycle(workspace_id, observe=False)
+            if initial.forgotten:
+                if command == "forget":
+                    return initial
+                raise WorkspaceError("Workspace was forgotten; cleanup was not proven")
+            workspace = initial.workspace
+            state = initial.state
+            if command == "forget":
+                self._registry.require_no_active_operation(workspace_id)
+                plan = LifecyclePlan(("forget",), state)
+            else:
+                plan = plan_lifecycle(command, state)
+            if initial.operation.kind == command and initial.operation.status in {
+                "running",
+                "failed",
+            }:
+                operation_id = initial.operation.id
+            owner = self._invocation_process_identity()
+            epoch = self._registry.acquire_lease(
+                scope_kind="workspace",
+                scope_key=workspace_id,
+                operation_id=operation_id,
+                owner=owner,
+                owner_status=self._owner_status,
+                reject_active=command == "forget",
+                update_operation=False,
+            )
+            current = self._inspect_lifecycle(workspace_id, observe=False)
+            if current.operation != initial.operation or current.workspace != workspace:
+                raise WorkspaceError("Workspace operation changed; inspect and retry")
+            intent = cast(
+                dict[str, object],
+                self._registry.lifecycle_snapshot(workspace_id)["intent"],
+            )
+            if (
+                state == plan.success_state
+                and command != "forget"
+                and initial.operation.status == "completed"
+                and initial.operation.kind == command
+            ):
+                try:
+                    if command != "delete":
+                        if workspace is None:
+                            raise WorkspaceError("Workspace definition is unavailable")
+                        self._observe_lifecycle(
+                            workspace,
+                            intent,
+                            liveness_fd=self._invocation_descriptor(owner),
+                        )
+                except GitError:
+                    pass  # The journal below retains the failed reconciliation.
+                else:
+                    self._registry.release_lease(
+                        scope_kind="workspace",
+                        scope_key=workspace_id,
+                        operation_id=operation_id,
+                        lease_epoch=epoch,
+                    )
+                    epoch = None
+                    return self._inspect_lifecycle(
+                        workspace_id, observe=command != "delete"
+                    )
+            actions = (
+                ("ownership", "delete", "absence")
+                if command == "delete"
+                else plan.actions
+            )
+            enter_state = {
+                "stop": "stopping",
+                "start": "starting",
+                "delete": "deleting",
+                "forget": state,
+            }[action]
+            self._registry.begin_lifecycle(
+                workspace_id,
+                operation_id,
+                epoch,
+                kind=command,
+                state=enter_state,
+                actions=actions,
+                expected_operation=initial.operation.id,
+            )
+            begun = True
+            for position, action in enumerate(actions):
+                self._registry.start_operation_step(
+                    operation_id,
+                    position=position,
+                    scope_kind="workspace",
+                    scope_key=workspace_id,
+                    lease_epoch=epoch,
+                    reconcile_completed=True,
+                    enter_state="starting" if action == "start" else None,
+                )
+                evidence: dict[str, object]
+                if position == 0 and command in {"delete", "forget"}:
+                    self._registry.require_childless(workspace_id)
+                if action == "forget":
+                    evidence = {"cleanup_proven": False, "acknowledge_orphans": True}
+                elif command == "delete":
+                    if workspace is None:
+                        target = Path(str(intent["target_path"]))
+                        validate_target_path(target)
+                        if target.exists() or target.is_symlink():
+                            raise WorkspaceError(
+                                "No resolved ownership proof; inspect and resume create"
+                            )
+                        evidence = {
+                            "observation": "absent",
+                            "no_resource_effect_started": True,
+                        }
+                    else:
+                        resource = workspace.definition.resources[0]
+                        resolved = json.loads(str(intent["resolved_json"]))
+                        arguments = dict(
+                            ownership_token=resource.ownership_token,
+                            common_dir=Path(resolved["repository_common_dir"]),
+                            common_generation=resolved["repository_generation"],
+                            liveness_fd=self._invocation_descriptor(owner),
+                        )
+                        if action == "delete":
+                            delete_owned_worktree(
+                                Path(resource.locator), force=force, **arguments
+                            )
+                        observed = inspect_delete_worktree(
+                            Path(resource.locator), **arguments
+                        )
+                        if action in {"delete", "absence"} and observed is not None:
+                            raise GitError(
+                                "Worktree remains; post-delete absence is unproven"
+                            )
+                        evidence = {
+                            "observation": "ready" if observed else "absent",
+                            "locator": resource.locator,
+                            "ownership_token": resource.ownership_token,
+                        }
+                        if observed:
+                            evidence["git_dir"] = str(observed.git_dir)
+                            evidence["observed_locator"] = str(observed.path)
+                else:
+                    if workspace is None:
+                        raise WorkspaceError(
+                            "Workspace creation is incomplete; retry create"
+                        )
+                    observed = self._observe_lifecycle(
+                        workspace,
+                        intent,
+                        liveness_fd=self._invocation_descriptor(owner),
+                    )
+                    evidence = {
+                        "observation": "ready",
+                        "ownership_token": observed.git_dir_generation,
+                    }
+                self._registry.finish_operation_step(
+                    operation_id,
+                    position=position,
+                    scope_kind="workspace",
+                    scope_key=workspace_id,
+                    lease_epoch=epoch,
+                    result=evidence,
+                )
+            self._registry.finish_lifecycle(
+                workspace_id,
+                operation_id,
+                epoch,
+                state=plan.success_state,
+                forgotten=command == "forget",
+            )
+            epoch = None
+            return self._inspect_lifecycle(
+                workspace_id, observe=command not in {"forget", "delete"}
+            )
+        except (WorkspaceError, GitError, RegistryError, OSError, ValueError) as error:
+            quiescence_unknown = isinstance(error, GitQuiescenceError)
+            message = (
+                f"Workspace {workspace_id}; operation {operation_id}; "
+                f"Resource worktree; step {action}: {error}; "
+                f"inspect and retry {command}"
+            )
+            if epoch is not None and begun and not quiescence_unknown:
+                failure = "delete" if command == "delete" else action
+                self._registry.finish_lifecycle(
+                    workspace_id,
+                    operation_id,
+                    epoch,
+                    state=initial.state if command == "forget" else f"{failure}_failed",
+                    error=message,
+                )
+                epoch = None
+            raise WorkspaceOperationError(
+                message, workspace_id, operation_id, action, command
+            ) from error
+        finally:
+            if owner is not None:
+                try:
+                    if epoch is not None and not quiescence_unknown:
+                        self._registry.release_lease(
+                            scope_kind="workspace",
+                            scope_key=workspace_id,
+                            operation_id=operation_id,
+                            lease_epoch=epoch,
+                        )
+                finally:
+                    self._finish_invocation(owner)
+
     def list(self) -> list[Workspace]:
         try:
-            return [_workspace(record) for record in self._registry.list_workspaces()]
+            return [
+                _workspace(record)
+                for record in self._registry.list_workspaces()
+                if not self._registry.workspace_is_inactive(record.id)
+            ]
         except RegistryError as error:
             raise WorkspaceError(str(error)) from error
 
     def inspect(self, path: Path) -> Workspace:
         try:
             observation = observe_worktree(path)
-            return _workspace(self._registry.inspect_worktree(observation))
+            record = self._registry.inspect_worktree(observation)
+            if self._registry.workspace_is_inactive(record.id):
+                raise WorkspaceError("Workspace is deleted or forgotten")
+            return _workspace(record)
         except (GitError, RegistryError) as error:
             raise WorkspaceError(str(error)) from error
 
@@ -743,6 +1157,10 @@ class Workspaces:
     def _completed_create(
         self, workspace_id: str, *, created: bool = False
     ) -> CreateWorkspaceResult:
+        if self._registry.workspace_is_inactive(workspace_id):
+            raise WorkspaceError(
+                "Workspace is deleted or forgotten; create cannot resurrect it"
+            )
         aggregate, operation = self._load_completed(workspace_id)
         observation = inspect_owned_worktree(
             Path(aggregate.path),
