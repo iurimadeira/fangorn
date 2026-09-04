@@ -111,6 +111,27 @@ def normalize_repository_source(value: str) -> RepositorySource:
     return RepositorySource(str(common), resolved, None, name or "repository")
 
 
+def validate_repository_for_object_reads(
+    repository: Path, *, liveness_fd: int | None = None
+) -> None:
+    common_dir = _required_git_path(
+        repository,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        liveness_fd=liveness_fd,
+    )
+    git_dir = _required_git_path(
+        repository,
+        "rev-parse",
+        "--absolute-git-dir",
+        liveness_fd=liveness_fd,
+    )
+    with _trusted_checkout_configuration(common_dir, git_dir):
+        _reject_executable_checkout_configuration(repository, liveness_fd=liveness_fd)
+        _reject_promisor_repository_configuration(repository, liveness_fd=liveness_fd)
+
+
 def resolve_commit(
     repository: Path,
     ref: str | None,
@@ -1091,6 +1112,49 @@ def _reject_executable_checkout_configuration(
             raise GitError("Repository has executable checkout configuration")
 
 
+def _reject_promisor_repository_configuration(
+    path: Path, *, liveness_fd: int | None
+) -> None:
+    configured = _run_git_process(
+        path,
+        "config",
+        "--no-includes",
+        "--name-only",
+        "--list",
+        liveness_fd=liveness_fd,
+    )
+    if configured.returncode != 0:
+        raise GitError(_git_error(configured))
+    for name in configured.stdout.decode("utf-8", errors="replace").splitlines():
+        lowered = name.lower()
+        if lowered == "extensions.partialclone" or (
+            lowered.startswith("remote.") and lowered.endswith(".partialclonefilter")
+        ):
+            raise GitError(
+                "Repository partial clone or promisor configuration is unsafe"
+            )
+        if not (lowered.startswith("remote.") and lowered.endswith(".promisor")):
+            continue
+        value = _run_git_process(
+            path,
+            "config",
+            "--no-includes",
+            "--bool",
+            "--get-all",
+            name,
+            liveness_fd=liveness_fd,
+        )
+        parsed = value.stdout.decode("ascii", errors="replace").splitlines()
+        if (
+            value.returncode != 0
+            or not parsed
+            or any(item != "false" for item in parsed)
+        ):
+            raise GitError(
+                "Repository partial clone or promisor configuration is unsafe"
+            )
+
+
 def _secure_staging_directory(parent: int, name: str) -> None:
     try:
         descriptor = os.open(
@@ -1612,6 +1676,7 @@ def _run_git_process(
     for name in REPOSITORY_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
     if isolate_config:
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_SYSTEM"] = os.devnull

@@ -42,6 +42,7 @@ from fangorn.git_worktree import (
     read_configuration,
     resolve_commit,
     validate_branch_name,
+    validate_repository_for_object_reads,
     validate_target_path,
 )
 from fangorn.registry import (
@@ -368,6 +369,10 @@ class Workspaces:
                 owner,
                 refresh_default_head=request.base
                 in {None, "HEAD", "origin/HEAD", "refs/remotes/origin/HEAD"},
+            )
+            validate_repository_for_object_reads(
+                repository,
+                liveness_fd=self._invocation_descriptor(owner),
             )
             if intent.resolved_json is None:
                 commit = intent.resolved_sha

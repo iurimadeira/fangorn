@@ -2468,6 +2468,49 @@ def test_default_configuration_is_snapshotted_from_resolved_commit(
     )
 
 
+def test_create_rejects_promisor_repository_before_missing_blob_fetch(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    (repository / "fangorn.toml").write_text("schema_version = 1\n", encoding="utf-8")
+    git(repository, "add", "fangorn.toml")
+    git(repository, "commit", "-m", "configure")
+    blob = git(repository, "rev-parse", "HEAD:fangorn.toml")
+    (repository / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    sentinel = tmp_path / "lazy-fetch-invoked"
+    transport = tmp_path / "ssh-sentinel"
+    transport.write_text(
+        f"#!/bin/sh\ntouch {sentinel}\nexit 1\n",
+        encoding="utf-8",
+    )
+    transport.chmod(0o755)
+    git(
+        repository,
+        "remote",
+        "add",
+        "origin",
+        "ssh://example.invalid/repository.git",
+    )
+    git(repository, "config", "remote.origin.promisor", "true")
+    git(repository, "config", "remote.origin.partialCloneFilter", "blob:none")
+    git(repository, "config", "core.sshCommand", str(transport))
+    target = tmp_path / "worktrees" / "promisor"
+
+    with pytest.raises(WorkspaceError, match="promisor"):
+        facade(tmp_path).create(
+            CreateWorkspace(
+                repository=str(repository),
+                branch="promisor",
+                path=target,
+                headless=True,
+            )
+        )
+
+    assert not sentinel.exists()
+    assert not target.exists()
+
+
 def test_completed_retry_does_not_require_explicit_configuration_source(
     tmp_path: Path,
 ) -> None:

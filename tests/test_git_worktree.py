@@ -47,6 +47,7 @@ from fangorn.git_worktree import (
     normalize_repository_source,
     read_configuration,
     resolve_commit,
+    validate_repository_for_object_reads,
 )
 from fangorn.registry import ProcessIdentity, Registry, RegistryError
 from fangorn.workspaces import Workspaces
@@ -174,6 +175,31 @@ def test_commit_and_configuration_reads_are_immutable(tmp_path: Path) -> None:
         read_configuration(source, commit, symlink)
     with pytest.raises(GitError, match="Configuration is unavailable"):
         read_configuration(source, commit, tmp_path / "missing.toml")
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "rejected"),
+    [
+        ("extensions.partialClone", "origin", True),
+        ("remote.origin.partialCloneFilter", "blob:none", True),
+        ("remote.origin.promisor", "true", True),
+        ("remote.origin.promisor", "false", False),
+        ("remote.origin.promisor", "invalid", True),
+        ("core.sshCommand", "/bin/false", False),
+    ],
+)
+def test_repository_object_reads_reject_promisor_semantics(
+    tmp_path: Path, name: str, value: str, rejected: bool
+) -> None:
+    source = tmp_path / "repository"
+    repository(source)
+    git(source, "config", name, value)
+
+    if rejected:
+        with pytest.raises(GitError, match="promisor"):
+            validate_repository_for_object_reads(source)
+    else:
+        validate_repository_for_object_reads(source)
 
 
 def test_replace_refs_cannot_change_configuration_or_checkout(tmp_path: Path) -> None:
@@ -2481,6 +2507,7 @@ def test_git_adapter_forces_stable_diagnostics_locale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
+    monkeypatch.setenv("GIT_NO_LAZY_FETCH", "0")
     captured: dict[str, str] = {}
 
     def run(
@@ -2499,6 +2526,7 @@ def test_git_adapter_forces_stable_diagnostics_locale(
     assert captured["GIT_CONFIG_GLOBAL"] == os.devnull
     assert captured["GIT_ATTR_NOSYSTEM"] == "1"
     assert captured["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert captured["GIT_NO_LAZY_FETCH"] == "1"
 
 
 def test_worktree_adapter_reconciles_only_its_owned_definition(tmp_path: Path) -> None:
