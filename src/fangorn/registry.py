@@ -641,7 +641,7 @@ class Registry:
                         "Final Git observation token was not reserved by the "
                         "adoption transaction"
                     )
-                _reject_incomplete_create_target(connection, observation.path)
+                _reject_incomplete_create_target(connection, observation)
                 if observation.git_common_dir_generation is None:
                     raise RegistryError(
                         "Fangorn repository generation marker is missing; "
@@ -784,7 +784,7 @@ class Registry:
         with self._connection() as connection:
             self._migrate(connection)
             try:
-                _reject_incomplete_create_target(connection, observation.path)
+                _reject_incomplete_create_target(connection, observation)
                 repository = connection.execute(
                     """
                     SELECT id, git_common_dir_generation
@@ -2191,14 +2191,14 @@ def _repository_id(common_dir: str) -> str:
 
 
 def _reject_incomplete_create_target(
-    connection: sqlite3.Connection, path: Path
+    connection: sqlite3.Connection, observation: WorktreeObservation
 ) -> None:
     for row in connection.execute(
         "SELECT target_path, resolved_json FROM workspace_create_intents "
         "WHERE status <> 'completed'"
     ):
         target = Path(str(row["target_path"]))
-        if path == target:
+        if observation.path == target:
             raise RegistryError(
                 "Workspace creation is incomplete for this target; retry later"
             )
@@ -2211,7 +2211,10 @@ def _reject_incomplete_create_target(
             )
         except (TypeError, ValueError):
             token = None
-        if isinstance(token, str) and path == target.parent / f".fangorn-{token}":
+        if isinstance(token, str) and (
+            observation.path == target.parent / f".fangorn-{token}"
+            or observation.git_dir_generation == token
+        ):
             raise RegistryError(
                 "Workspace creation is incomplete for this target; retry later"
             )

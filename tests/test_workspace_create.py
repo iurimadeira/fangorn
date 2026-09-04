@@ -2016,10 +2016,14 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
     assert definition_seen
 
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT status FROM workspace_create_intents WHERE request_id = ?",
+        intent_row = connection.execute(
+            "SELECT workspace_id, status FROM workspace_create_intents "
+            "WHERE request_id = ?",
             (request.request_id,),
-        ).fetchone() == ("create_failed",)
+        ).fetchone()
+        assert intent_row is not None
+        incomplete_workspace_id = intent_row[0]
+        assert intent_row[1] == "create_failed"
         assert connection.execute(
             "SELECT status FROM operations WHERE id = ("
             "SELECT operation_id FROM workspace_create_intents WHERE request_id = ?)",
@@ -2038,8 +2042,12 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
         assert json.loads(aggregate_row[0])["created_from_sha"]
         assert aggregate_row[1] == "create_failed"
 
+    moved_target = target.with_name("moved-interrupted")
+    git(repository, "worktree", "move", str(target), str(moved_target))
     with pytest.raises(WorkspaceError, match="creation is incomplete"):
-        facade(tmp_path).adopt(target)
+        facade(tmp_path).adopt(moved_target)
+    assert facade(tmp_path).list() == []
+    git(repository, "worktree", "move", str(moved_target), str(target))
     recovery_states: list[str] = []
 
     def inspect_recovery(*args: object, **kwargs: object) -> object:
@@ -2057,7 +2065,9 @@ def test_retry_reconciles_worktree_after_interrupted_effect(
 
     assert set(recovery_states) == {"starting"}
     assert recovered.created is False
+    assert recovered.workspace.definition.id == incomplete_workspace_id
     assert recovered.workspace.state == "ready"
+    assert recovered.operation.status == "completed"
     assert adopted.created is False
     assert adopted.workspace.binding.id == recovered.workspace.definition.id
     assert (
