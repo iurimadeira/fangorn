@@ -41,11 +41,15 @@ from fangorn.workspaces import (
 
 
 def create_repository(path: Path) -> str:
-    initialize_repository(path)
-    (path / "README.md").write_text("root\n", encoding="utf-8")
-    git(path, "add", "README.md")
-    git(path, "commit", "-m", "root")
-    return git(path, "rev-parse", "HEAD")
+    previous_umask = os.umask(0o077)
+    try:
+        initialize_repository(path)
+        (path / "README.md").write_text("root\n", encoding="utf-8")
+        git(path, "add", "README.md")
+        git(path, "commit", "-m", "root")
+        return git(path, "rev-parse", "HEAD")
+    finally:
+        os.umask(previous_umask)
 
 
 def facade(tmp_path: Path) -> Workspaces:
@@ -793,6 +797,56 @@ def test_clone_retry_reuses_completed_cache_while_origin_is_offline(
             ).fetchone()
             == completed_cache_step
         )
+
+
+def test_clone_retry_requires_its_completed_cache_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    registry = Registry(tmp_path / "state" / "registry.sqlite3")
+    workspaces = Workspaces(
+        registry, data_home=tmp_path / "data", cache_home=tmp_path / "cache"
+    )
+    target = tmp_path / "worktrees" / "missing-cache"
+    request = CreateWorkspace(
+        repository=repository.as_uri(),
+        branch="missing-cache",
+        path=target,
+        request_id="missing-cache",
+    )
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        "fangorn.workspaces.create_worktree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SimulatedInterruption()),
+    )
+    with pytest.raises(SimulatedInterruption):
+        workspaces.create(request)
+    with sqlite3.connect(registry.path) as connection:
+        entry = connection.execute(
+            "SELECT path FROM repository_cache_entries"
+        ).fetchone()
+    assert entry is not None
+    cache = Path(entry[0])
+    shutil.rmtree(cache)
+    calls = 0
+
+    def reject_target_effect(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("target effect must not run")
+
+    monkeypatch.setattr("fangorn.workspaces.create_worktree", reject_target_effect)
+
+    with pytest.raises(WorkspaceError, match="Repository cache entry is missing"):
+        workspaces.create(request)
+
+    assert calls == 0
+    assert not cache.exists()
+    assert not target.exists()
 
 
 def test_clone_retry_reconciles_uncommitted_cache_effect_while_origin_is_offline(
@@ -2593,7 +2647,19 @@ def test_local_source_without_base_uses_that_checkout_head(tmp_path: Path) -> No
     repository = tmp_path / "repository"
     source_head = create_repository(repository)
     source_checkout = tmp_path / "source-checkout"
-    git(repository, "worktree", "add", "-b", "source", str(source_checkout), "HEAD")
+    previous_umask = os.umask(0o077)
+    try:
+        git(
+            repository,
+            "worktree",
+            "add",
+            "-b",
+            "source",
+            str(source_checkout),
+            "HEAD",
+        )
+    finally:
+        os.umask(previous_umask)
     (repository / "main-only.txt").write_text("later\n", encoding="utf-8")
     git(repository, "add", "main-only.txt")
     git(repository, "commit", "-m", "advance main")

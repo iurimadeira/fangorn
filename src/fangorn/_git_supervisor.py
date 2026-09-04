@@ -107,6 +107,7 @@ def _supervise(
         process_group=process_group,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        umask=0o077,
         preexec_fn=(
             (lambda: os.fchdir(working_directory)) if working_directory >= 0 else None
         ),

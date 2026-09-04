@@ -121,11 +121,15 @@ def run_fangorn(
 
 
 def create_repository(path: Path) -> str:
-    initialize_repository(path)
-    (path / "README.md").write_text("temporary repository\n", encoding="utf-8")
-    git(path, "add", "README.md")
-    git(path, "commit", "-m", "Initial commit")
-    return git(path, "rev-parse", "HEAD")
+    previous_umask = os.umask(0o077)
+    try:
+        initialize_repository(path)
+        (path / "README.md").write_text("temporary repository\n", encoding="utf-8")
+        git(path, "add", "README.md")
+        git(path, "commit", "-m", "Initial commit")
+        return git(path, "rev-parse", "HEAD")
+    finally:
+        os.umask(previous_umask)
 
 
 def snapshot_tree(path: Path) -> dict[str, tuple[int, int, bytes | None]]:

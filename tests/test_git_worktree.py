@@ -97,11 +97,15 @@ def _stub_selector(*readiness: bool) -> Callable[[], _StubSelector]:
 
 
 def repository(path: Path) -> str:
-    initialize_repository(path)
-    (path / "README.md").write_text("root\n", encoding="utf-8")
-    git(path, "add", "README.md")
-    git(path, "commit", "-m", "root")
-    return git(path, "rev-parse", "HEAD")
+    previous_umask = os.umask(0o077)
+    try:
+        initialize_repository(path)
+        (path / "README.md").write_text("root\n", encoding="utf-8")
+        git(path, "add", "README.md")
+        git(path, "commit", "-m", "root")
+        return git(path, "rev-parse", "HEAD")
+    finally:
+        os.umask(previous_umask)
 
 
 def test_repository_source_normalizes_urls_and_local_identity(tmp_path: Path) -> None:
@@ -332,6 +336,33 @@ def test_explicit_configuration_normalizes_ancestor_symlink_errors(
 
     with pytest.raises(GitError, match="Configuration is unavailable"):
         read_configuration(source, commit, explicit)
+
+
+def test_explicit_configuration_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    explicit = tmp_path / "fangorn.toml"
+    os.mkfifo(explicit)
+    script = """
+import sys
+from pathlib import Path
+from fangorn.git import GitError
+from fangorn.git_worktree import read_configuration
+
+try:
+    read_configuration(Path.cwd(), "HEAD", Path(sys.argv[1]))
+except GitError as error:
+    raise SystemExit(
+        0 if str(error) == "Configuration must be a regular non-symlink file" else 2
+    )
+raise SystemExit(3)
+"""
+
+    result = subprocess.run(  # noqa: S603 -- isolated fixed interpreter invocation
+        [sys.executable, "-I", "-c", script, str(explicit)],
+        check=False,
+        timeout=3,
+    )
+
+    assert result.returncode == 0
 
 
 def test_explicit_configuration_parent_segments_stay_bound_to_opened_ancestors(
@@ -683,10 +714,15 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
 
     child = Child()
     drained: list[object] = []
+    child_options: dict[str, object] = {}
 
     def drain(value: object, _process_group: int) -> bool:
         drained.append(value)
         return True
+
+    def start_child(*_args: object, **options: object) -> Child:
+        child_options.update(options)
+        return child
 
     monkeypatch.setattr(
         sys,
@@ -708,7 +744,7 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
         ],
     )
     monkeypatch.setattr(os, "fstat", lambda _descriptor: os.stat_result((0,) * 10))
-    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(subprocess, "Popen", start_child)
     monkeypatch.setattr(
         os, "write", lambda *args: (_ for _ in ()).throw(BrokenPipeError())
     )
@@ -720,6 +756,7 @@ def test_supervisor_drains_git_when_owner_dies_before_status_read(
 
     assert git_supervisor.main() == 0
     assert drained == [child]
+    assert child_options["umask"] == 0o077
 
 
 def test_supervisor_reports_git_startup_os_error(
@@ -1500,11 +1537,17 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
         )
     )
     sleeps: list[float] = []
+    scans = 0
 
     def probe(_pid: int, _signal: int) -> None:
         state = next(states)
         if isinstance(state, BaseException):
             raise state
+
+    def scan(_group: int) -> bool:
+        nonlocal scans
+        scans += 1
+        return scans < 6
 
     monkeypatch.setattr(
         sys,
@@ -1514,7 +1557,7 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
     monkeypatch.setattr(signal, "signal", lambda *_args: None)
     monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
     monkeypatch.setattr(os, "kill", probe)
-    monkeypatch.setattr(git_guardian, "_process_group_running", lambda _group: False)
+    monkeypatch.setattr(git_guardian, "_process_group_running", scan)
     monkeypatch.setattr(time, "sleep", sleeps.append)
     try:
         assert git_guardian.main() == 0
@@ -1531,6 +1574,7 @@ def test_guardian_main_retries_probe_errors_with_bounded_backoff(
 
     assert sleeps == [0.01, 0.02, 0.04, 0.08, 0.16, 0.25, 0.25]
     assert max(sleeps) == 0.25
+    assert scans == 6
 
 
 def test_guardian_scans_group_only_after_two_cheap_leader_probes(
@@ -1575,6 +1619,51 @@ def test_guardian_scans_group_only_after_two_cheap_leader_probes(
                 os.close(descriptor)
 
     assert events == ["probe", "probe", "scan", "scan"]
+
+
+def test_guardian_scans_zombie_like_leader_after_initial_cheap_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    liveness_read, liveness_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    events: list[str] = []
+
+    def probe(_pid: int, sent: int) -> None:
+        assert sent == 0
+        events.append("probe")
+
+    def scan(_process_group: int) -> bool:
+        events.append("scan")
+        return False
+
+    def bounded_sleep(_seconds: float) -> None:
+        if events.count("probe") >= 3:
+            raise AssertionError("guardian did not scan the zombie-like leader")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["guardian", "123", str(liveness_read), str(ready_write)],
+    )
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *_args: None)
+    monkeypatch.setattr(os, "kill", probe)
+    monkeypatch.setattr(git_guardian, "_process_group_running", scan)
+    monkeypatch.setattr(time, "sleep", bounded_sleep)
+    try:
+        assert git_guardian.main() == 0
+        assert os.read(ready_read, 2) == b"r\n"
+    finally:
+        for descriptor in (
+            liveness_read,
+            liveness_write,
+            ready_read,
+            ready_write,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+
+    assert events == ["probe", "probe", "scan"]
 
 
 def test_guardian_persists_unknown_quiescence_after_probe_budget(
@@ -2763,7 +2852,11 @@ def test_worktree_reconciliation_rejects_another_repository(tmp_path: Path) -> N
     expected = tmp_path / "expected"
     commit = repository(expected)
     other = tmp_path / "other"
-    git(tmp_path, "clone", "--no-hardlinks", str(expected), str(other))
+    previous_umask = os.umask(0o077)
+    try:
+        git(tmp_path, "clone", "--no-hardlinks", str(expected), str(other))
+    finally:
+        os.umask(previous_umask)
     target = tmp_path / "target"
     token = "8" * 64
     create_worktree(
@@ -2871,17 +2964,21 @@ def test_matching_staged_worktree_rejects_executable_worktree_configuration(
     staging = target.parent / f".fangorn-{token}"
     receipt = target.parent / f".fangorn-{token}.intent"
     invoked = tmp_path / "filter-invoked"
-    git(source, "worktree", "add", "-b", "topic", str(staging), commit)
-    observation = observe_worktree(staging)
-    establish_worktree_generation(observation.git_dir, token)
-    receipt.write_text(token, encoding="ascii")
-    git(
-        staging,
-        "config",
-        "--worktree",
-        "filter.evil.smudge",
-        f"touch {invoked}",
-    )
+    previous_umask = os.umask(0o077)
+    try:
+        git(source, "worktree", "add", "-b", "topic", str(staging), commit)
+        observation = observe_worktree(staging)
+        establish_worktree_generation(observation.git_dir, token)
+        receipt.write_text(token, encoding="ascii")
+        git(
+            staging,
+            "config",
+            "--worktree",
+            "filter.evil.smudge",
+            f"touch {invoked}",
+        )
+    finally:
+        os.umask(previous_umask)
 
     with pytest.raises(GitError, match="executable checkout configuration"):
         create_worktree(
@@ -2915,13 +3012,17 @@ def test_matching_final_worktree_rejects_tampered_executable_configuration(
         ownership_token=token,
         reconcile=False,
     )
-    git(
-        target,
-        "config",
-        "--worktree",
-        "filter.evil.smudge",
-        f"touch {invoked}",
-    )
+    previous_umask = os.umask(0o077)
+    try:
+        git(
+            target,
+            "config",
+            "--worktree",
+            "filter.evil.smudge",
+            f"touch {invoked}",
+        )
+    finally:
+        os.umask(previous_umask)
 
     with pytest.raises(GitError, match="executable checkout configuration"):
         create_worktree(
@@ -3033,7 +3134,7 @@ def test_worktree_creation_rejects_configuration_writable_by_shared_group(
         )
 
 
-def test_private_group_write_is_accepted_without_named_acl(
+def test_group_write_is_rejected_when_nss_enumeration_is_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "repository"
@@ -3044,24 +3145,21 @@ def test_private_group_write_is_accepted_without_named_acl(
     class Group:
         gr_mem: tuple[str, ...] = ()
 
-    class CurrentAccount:
-        pw_uid = os.geteuid()
-        pw_gid = configured.stat().st_gid
-
     monkeypatch.setattr(grp, "getgrgid", lambda _gid: Group())
-    monkeypatch.setattr(pwd, "getpwall", lambda: [CurrentAccount()])
+    monkeypatch.setattr(pwd, "getpwall", lambda: [])
     monkeypatch.setattr(os, "listxattr", lambda _descriptor: [])
 
-    result = create_worktree(
-        source,
-        target=tmp_path / "target",
-        branch="topic",
-        commit=commit,
-        ownership_token="5" * 64,
-        reconcile=False,
-    )
+    with pytest.raises(GitError, match="checkout configuration is unsafe"):
+        create_worktree(
+            source,
+            target=tmp_path / "target",
+            branch="topic",
+            commit=commit,
+            ownership_token="5" * 64,
+            reconcile=False,
+        )
 
-    assert result.path == (tmp_path / "target")
+    assert not (tmp_path / "target").exists()
 
 
 def test_linux_named_acl_is_not_treated_as_a_private_group(
@@ -3149,7 +3247,7 @@ def test_darwin_acl_uses_native_iteration_and_einval_termination(
     assert freed == [123]
 
 
-@pytest.mark.parametrize("permissions", [2, 8])
+@pytest.mark.parametrize("permissions", [2, 8, 1 << 7, 1 << 9, 1 << 11])
 def test_darwin_private_acl_rejects_read_and_search(
     monkeypatch: pytest.MonkeyPatch, permissions: int
 ) -> None:

@@ -27,6 +27,8 @@ def main() -> int:
     delay = 0.01
     failures = 0
     scan_group = False
+    cheap_probes = 0
+    periodic_scan = False
     while True:
         try:
             if not scan_group:
@@ -36,7 +38,11 @@ def main() -> int:
                     pass
                 except ProcessLookupError:
                     scan_group = True
-            if scan_group and not _process_group_running(process_group):
+                cheap_probes += 1
+                periodic_scan = periodic_scan or cheap_probes >= 2
+            if (scan_group or periodic_scan) and not _process_group_running(
+                process_group
+            ):
                 return 0
             failures = 0
         except (OSError, subprocess.SubprocessError):

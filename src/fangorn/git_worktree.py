@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import base64
 import errno
-import grp
 import hashlib
 import json
 import os
-import pwd
 import re
 import selectors
 import shutil
@@ -242,7 +240,7 @@ def _open_configuration_file(path: Path) -> int:
             descriptors.append(child)
         result = os.open(
             path.name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=descriptors[-1],
         )
         try:
@@ -280,6 +278,7 @@ def materialize_cache(
     liveness_fd: int | None = None,
     preparation_id: str | None = None,
     namespace_root: Path | None = None,
+    must_exist: bool = False,
 ) -> Path:
     if source.clone_url is None:
         if source.path is None:
@@ -299,6 +298,7 @@ def materialize_cache(
             refresh_default_head=refresh_default_head,
             liveness_fd=liveness_fd,
             preparation_id=preparation_id,
+            must_exist=must_exist,
         )
     finally:
         os.close(cache_parent.descriptor)
@@ -315,6 +315,7 @@ def _materialize_remote_cache(
     refresh_default_head: bool,
     liveness_fd: int | None,
     preparation_id: str | None,
+    must_exist: bool,
 ) -> Path:
     clone_url = source.clone_url
     if clone_url is None:
@@ -343,6 +344,8 @@ def _materialize_remote_cache(
         _require_cache_parent(cache_parent)
         _fsync_descriptor(cache_parent.descriptor, "Repository cache publication")
         return cache_path
+    if must_exist:
+        raise GitError("Repository cache entry is missing")
     _require_cache_parent(cache_parent)
     require_supported_git(cache_path.parent, liveness_fd=liveness_fd)
     prefix = _clone_owner_prefix(owner) if owner is not None else "clone-"
@@ -1308,30 +1311,7 @@ def _writable_by_another_principal(metadata: os.stat_result, descriptor: int) ->
         return True
     if sys.platform == "darwin" and _darwin_acl_allows_write(descriptor):
         return True
-    if not metadata.st_mode & stat.S_IWGRP:
-        return False
-    if sys.platform.startswith("linux") and _linux_has_named_acl(descriptor):
-        return True
-    try:
-        group = grp.getgrgid(metadata.st_gid)
-        member_uids = {pwd.getpwnam(name).pw_uid for name in group.gr_mem}
-        member_uids.update(
-            account.pw_uid
-            for account in pwd.getpwall()
-            if account.pw_gid == metadata.st_gid
-        )
-    except (KeyError, OSError):
-        return True
-    return bool(member_uids - {os.geteuid()})
-
-
-def _linux_has_named_acl(descriptor: int) -> bool:
-    try:
-        return "system.posix_acl_access" in os.listxattr(descriptor)
-    except OSError as error:
-        if error.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
-            return False
-        raise GitError("Repository checkout configuration ACL is unsafe") from error
+    return bool(metadata.st_mode & stat.S_IWGRP)
 
 
 def _darwin_acl_allows_write(descriptor: int) -> bool:
