@@ -12,6 +12,16 @@ def test_readme_documents_public_facade_without_legacy_adopt_flow() -> None:
 
     assert "fangorn.workspaces.Workspaces" in readme
     assert "fangorn adopt" not in readme
+    for marker in (
+        "root headless Workspaces",
+        "Python 3.12 or newer",
+        "Create starts by default",
+        "`--no-start` provisions",
+        "Equivalent retries return the same Workspace ID",
+        "Branch and HEAD can change after creation",
+        "recoverable fenced leases",
+    ):
+        assert marker in readme
 
 
 def test_local_quality_configuration_matches_the_public_contract() -> None:
@@ -51,11 +61,11 @@ def test_ci_exposes_one_stable_aggregate_result() -> None:
     assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
     assert re.search(r"^  quality:\n(?:.*\n)*?    timeout-minutes: 15$", workflow, re.M)
     assert re.search(
-        r"^  compatibility:\n(?:.*\n)*?    timeout-minutes: 15$", workflow, re.M
+        r"^  compatibility:\n(?:.*\n)*?    timeout-minutes: 25$", workflow, re.M
     )
     assert re.search(r"^  ci:\n(?:.*\n)*?    name: CI$", workflow, re.M)
     assert "needs: [quality, compatibility]" in workflow
-    assert workflow.count("timeout-minutes: 15") == 3
+    assert workflow.count("timeout-minutes: 15") == 2
     assert "if: ${{ always() }}" in workflow
     assert "[[ \"${{ needs.quality.result }}\" == 'success' ]]" in workflow
     assert "[[ \"${{ needs.compatibility.result }}\" == 'success' ]]" in workflow

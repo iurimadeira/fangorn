@@ -5,7 +5,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -16,6 +15,10 @@ from pathlib import Path
 
 class GitError(RuntimeError):
     """Git could not prove a requested worktree identity."""
+
+
+class GitQuiescenceError(GitError):
+    """Git process-group termination could not be proven."""
 
 
 @dataclass(frozen=True)
@@ -72,31 +75,44 @@ GENERATION_MARKER_NAME = "fangorn-worktree-generation"
 REPOSITORY_GENERATION_MARKER_NAME = "fangorn-repository-generation"
 
 
+def require_supported_git(path: Path, *, liveness_fd: int | None = None) -> None:
+    """Reject mutation when the process Git does not meet Fangorn's minimum."""
+    _require_supported_git(path, liveness_fd=liveness_fd)
+
+
+def establish_worktree_generation(directory: Path, ownership_token: str) -> str:
+    """Establish the immutable planned owner token for a new Worktree Resource."""
+    return _create_generation_marker(
+        directory,
+        expected_generation=ownership_token,
+    )
+
+
+def repository_generation(directory: Path, *, create: bool) -> str | None:
+    """Read or establish the immutable identity of a Repository cache entry."""
+    return _generation(
+        directory,
+        marker_name=REPOSITORY_GENERATION_MARKER_NAME,
+        identity="repository",
+        create=create,
+    )
+
+
 def _run_git(
     path: Path,
     *arguments: str,
     allowed_exit_codes: frozenset[int] = frozenset(),
+    liveness_fd: int | None = None,
 ) -> str | None:
-    environment = os.environ.copy()
-    for name in REPOSITORY_LOCAL_ENVIRONMENT:
-        environment.pop(name, None)
-    try:
-        result = subprocess.run(  # noqa: S603 -- fixed Git argv, no shell
-            [  # noqa: S607 -- Git lookup intentionally follows process PATH
-                "git",
-                "-C",
-                str(path),
-                *arguments,
-            ],
-            check=False,
-            capture_output=True,
-            env=environment,
-        )
-    except FileNotFoundError as error:
-        raise GitError("Git executable was not found") from error
-    except OSError as error:
-        detail = error.strerror or str(error)
-        raise GitError(f"Cannot run Git: {detail}") from error
+    from fangorn.git_worktree import _run_git_process
+
+    result = _run_git_process(
+        path,
+        *arguments,
+        liveness_fd=liveness_fd,
+        disable_hooks=False,
+        isolate_config=False,
+    )
 
     if result.returncode in allowed_exit_codes:
         return None
@@ -115,6 +131,7 @@ def observe_worktree(
     create_repository_generation: bool | None = None,
     create_worktree_generation: bool | None = None,
     reserve_observation: Callable[[], int] | None = None,
+    liveness_fd: int | None = None,
 ) -> WorktreeObservation:
     requested_path = _resolve_requested_path(path)
     last_failure: GitError | None = None
@@ -128,24 +145,39 @@ def observe_worktree(
             create_repository_generation == create_generation
             and create_worktree_generation == create_generation
         ):
+            if liveness_fd is None:
+                return _capture_snapshot(
+                    requested_path, create_generation=create_generation
+                )
             return _capture_snapshot(
-                requested_path, create_generation=create_generation
+                requested_path,
+                create_generation=create_generation,
+                liveness_fd=liveness_fd,
+            )
+        if liveness_fd is None:
+            return _capture_snapshot(
+                requested_path,
+                create_repository_generation=create_repository_generation,
+                create_worktree_generation=create_worktree_generation,
             )
         return _capture_snapshot(
             requested_path,
             create_repository_generation=create_repository_generation,
             create_worktree_generation=create_worktree_generation,
+            liveness_fd=liveness_fd,
         )
 
     for _ in range(OBSERVATION_ATTEMPTS):
         observed_at = _timestamp()
         try:
-            _require_supported_git(requested_path)
+            _require_supported_git(requested_path, liveness_fd=liveness_fd)
             first = capture()
             observation_token = (
                 reserve_observation() if reserve_observation is not None else None
             )
             second = capture()
+        except GitQuiescenceError:
+            raise
         except GitError as error:
             last_failure = error
             continue
@@ -193,37 +225,30 @@ def _capture_snapshot(
     create_generation: bool = False,
     create_repository_generation: bool | None = None,
     create_worktree_generation: bool | None = None,
+    liveness_fd: int | None = None,
 ) -> _Snapshot:
     if create_repository_generation is None:
         create_repository_generation = create_generation
     if create_worktree_generation is None:
         create_worktree_generation = create_generation
-    inside = _run_git(requested_path, "rev-parse", "--is-inside-work-tree")
-    if inside != "true":
+    identity = _run_git(
+        requested_path,
+        "rev-parse",
+        "--is-inside-work-tree",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-common-dir",
+        "--git-dir",
+        liveness_fd=liveness_fd,
+    )
+    facts = identity.splitlines() if identity is not None else []
+    if not facts or facts[0] != "true":
         raise GitError(f"Path is not inside a Git worktree: {requested_path}")
-
-    worktree_path = _required_path(
-        _run_git(requested_path, "rev-parse", "--show-toplevel"),
-        "worktree path",
-    )
-    common_dir = _required_path(
-        _run_git(
-            requested_path,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ),
-        "Git common directory",
-    )
-    git_dir = _required_path(
-        _run_git(
-            requested_path,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-        ),
-        "Git administrative directory",
-    )
+    if len(facts) != 4:
+        raise GitError(f"Git returned malformed worktree identity for {requested_path}")
+    worktree_path = _required_path(facts[1], "worktree path")
+    common_dir = _required_path(facts[2], "Git common directory")
+    git_dir = _required_path(facts[3], "Git administrative directory")
     common_directory_before = _directory_identity(common_dir)
     git_directory_before = _directory_identity(git_dir)
     repository_generation_before = _generation(
@@ -238,14 +263,17 @@ def _capture_snapshot(
         identity="worktree",
         create=create_worktree_generation,
     )
-    branch = _run_git(
+    branch_ref = _run_git(
         requested_path,
         "symbolic-ref",
         "--quiet",
-        "--short",
         "HEAD",
         allowed_exit_codes=frozenset({1}),
+        liveness_fd=liveness_fd,
     )
+    if branch_ref is not None and not branch_ref.startswith("refs/heads/"):
+        raise GitError("Git HEAD does not reference a local branch")
+    branch = branch_ref.removeprefix("refs/heads/") if branch_ref is not None else None
     head = _run_git(
         requested_path,
         "rev-parse",
@@ -253,6 +281,7 @@ def _capture_snapshot(
         "--quiet",
         "HEAD",
         allowed_exit_codes=frozenset({1}),
+        liveness_fd=liveness_fd,
     )
     repository_generation_after = _generation(
         common_dir,
@@ -303,8 +332,8 @@ def _required_path(value: str | None, label: str) -> Path:
         raise GitError(f"Git reported an invalid {label}: {value}") from error
 
 
-def _require_supported_git(path: Path) -> None:
-    reported = _run_git(path, "--version")
+def _require_supported_git(path: Path, *, liveness_fd: int | None = None) -> None:
+    reported = _run_git(path, "--version", liveness_fd=liveness_fd)
     if reported is None:
         raise GitError("Cannot determine Git version; Git 2.31 or newer is required")
     match = re.match(r"git version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", reported)
@@ -431,6 +460,7 @@ def _create_generation_marker(
     *,
     marker_name: str = GENERATION_MARKER_NAME,
     identity: str = "worktree",
+    expected_generation: str | None = None,
 ) -> str:
     marker = directory / marker_name
     pending_name = f".{marker_name}.pending"
@@ -459,6 +489,11 @@ def _create_generation_marker(
             directory_descriptor=directory_descriptor,
         )
         if winner is not None:
+            if expected_generation is not None and winner != expected_generation:
+                raise GitError(
+                    f"Fangorn {identity} generation marker does not match "
+                    "the planned ownership token"
+                )
             _verify_locked_directory(directory, directory_descriptor, identity=identity)
             _cleanup_pending_marker(
                 pending_name, directory_descriptor, ignore_errors=False
@@ -467,7 +502,9 @@ def _create_generation_marker(
             return winner
 
         _cleanup_pending_marker(pending_name, directory_descriptor, ignore_errors=False)
-        generation = secrets.token_hex(32)
+        generation = expected_generation or secrets.token_hex(32)
+        if not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise GitError(f"Planned Fangorn {identity} ownership token is invalid")
         payload = f"{generation}\n".encode("ascii")
         pending_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):

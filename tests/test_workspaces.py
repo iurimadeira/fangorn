@@ -62,6 +62,19 @@ def test_workspaces_adopts_through_public_python_api(
     assert not hasattr(result.workspace, "last_observation_token")
 
 
+def test_workspaces_rejects_symbolic_head_outside_local_branches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    git(repository, "tag", "release")
+    git(repository, "symbolic-ref", "HEAD", "refs/tags/release")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    with pytest.raises(WorkspaceError, match="HEAD does not reference a local branch"):
+        Workspaces.from_environment().adopt(repository)
+
+
 def test_workspaces_list_does_not_initialize_missing_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -129,7 +142,7 @@ def test_workspaces_reads_reject_newer_registry_schema_without_migrating(
     database = state_home / "fangorn" / "registry.sqlite3"
     connection = sqlite3.connect(database)
     connection.execute(
-        "INSERT INTO schema_migrations (version, applied_at) VALUES (2, 'future')"
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, 'future')"
     )
     connection.commit()
     migrations_before = connection.execute(
@@ -137,7 +150,7 @@ def test_workspaces_reads_reject_newer_registry_schema_without_migrating(
     ).fetchall()
     connection.close()
 
-    with pytest.raises(WorkspaceError, match="newer than this Fangorn version: 2"):
+    with pytest.raises(WorkspaceError, match="newer than this Fangorn version: 3"):
         workspaces.list()
 
     connection = sqlite3.connect(database)
@@ -206,7 +219,8 @@ def test_workspaces_list_waits_for_concurrent_first_bootstrap(
     state_home = tmp_path / "state"
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     database = state_home / "fangorn" / "registry.sqlite3"
-    database.parent.mkdir(parents=True)
+    state_home.mkdir(mode=0o700)
+    database.parent.mkdir(mode=0o700)
     database.touch(mode=0o600)
 
     with ThreadPoolExecutor(max_workers=1) as executor:

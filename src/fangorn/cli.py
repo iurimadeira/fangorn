@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import base64
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import click
 
 from fangorn import __version__
-from fangorn.workspaces import Workspace, WorkspaceError, Workspaces
+from fangorn.workspaces import (
+    CreateWorkspace,
+    Operation,
+    Workspace,
+    WorkspaceAggregate,
+    WorkspaceError,
+    Workspaces,
+)
 
 COMMAND_PATH = click.Path(
     path_type=Path,
@@ -19,9 +28,75 @@ COMMAND_PATH = click.Path(
 
 
 @click.group()
+@click.option("--json", "root_json", is_flag=True, help="Emit versioned JSON.")
 @click.version_option(__version__)
-def main() -> None:
-    """Worktree-native workspace families for humans and agents."""
+@click.pass_context
+def main(context: click.Context, root_json: bool) -> None:
+    """Recoverable disposable Workspaces for humans and agents."""
+    context.ensure_object(dict)
+    context.obj["json"] = root_json
+
+
+@main.group()
+def workspace() -> None:
+    """Create and manage Workspace aggregates."""
+
+
+@workspace.command(name="create")
+@click.option("--repo", "repository", required=True, help="Local path or clone URL.")
+@click.option("--branch", required=True, help="Branch for the Worktree Resource.")
+@click.option("--path", type=COMMAND_PATH, help="Target Worktree path.")
+@click.option("--base", help="Git ref resolved once as creation provenance.")
+@click.option("--config", type=COMMAND_PATH, help="Explicit fangorn.toml snapshot.")
+@click.option("--request-id", help="Caller idempotency key.")
+@click.option("--headless", is_flag=True, help="Omit a Terminal Resource.")
+@click.option("--no-start", is_flag=True, help="Provision without starting.")
+@click.option("--json", "as_json", is_flag=True, help="Emit versioned JSON.")
+@click.pass_context
+def create_workspace(
+    context: click.Context,
+    repository: str,
+    branch: str,
+    path: Path | None,
+    base: str | None,
+    config: Path | None,
+    request_id: str | None,
+    headless: bool,
+    no_start: bool,
+    as_json: bool,
+) -> None:
+    """Create a complete root Workspace."""
+    try:
+        result = Workspaces.from_environment().create(
+            CreateWorkspace(
+                repository=repository,
+                branch=branch,
+                path=path,
+                base=base,
+                config=config,
+                request_id=request_id,
+                headless=headless,
+                start=not no_start,
+            )
+        )
+    except WorkspaceError as error:
+        raise click.ClickException(_human(str(error))) from error
+
+    root_json = bool(context.find_root().obj.get("json"))
+    if as_json or root_json:
+        _echo_json(
+            {
+                "schema_version": 2,
+                "created": result.created,
+                "workspace": _aggregate_schema(result.workspace),
+                "operation": _operation_schema(result.operation),
+            }
+        )
+        return
+    action = "Created" if result.created else "Already created"
+    click.echo(f"{action} Workspace {result.workspace.definition.id}")
+    click.echo(f"State: {result.workspace.state}")
+    click.echo(f"Path: {_human(result.workspace.path)}")
 
 
 @main.command(hidden=True)
@@ -31,7 +106,8 @@ def main() -> None:
     default=".",
     type=COMMAND_PATH,
 )
-def adopt(path: Path, as_json: bool) -> None:
+@click.pass_context
+def adopt(context: click.Context, path: Path, as_json: bool) -> None:
     """Adopt an existing Git worktree without changing it."""
     try:
         result = Workspaces.from_environment().adopt(path)
@@ -39,7 +115,7 @@ def adopt(path: Path, as_json: bool) -> None:
         raise click.ClickException(_human(str(error))) from error
 
     workspace = result.workspace
-    if as_json:
+    if as_json or bool(context.find_root().obj.get("json")):
         _echo_json(
             {
                 "schema_version": 1,
@@ -60,14 +136,15 @@ def adopt(path: Path, as_json: bool) -> None:
     default=".",
     type=COMMAND_PATH,
 )
-def info(path: Path, as_json: bool) -> None:
+@click.pass_context
+def info(context: click.Context, path: Path, as_json: bool) -> None:
     """Inspect the Workspace bound to a Git worktree."""
     try:
         workspace = Workspaces.from_environment().inspect(path)
     except WorkspaceError as error:
         raise click.ClickException(_human(str(error))) from error
 
-    if as_json:
+    if as_json or bool(context.find_root().obj.get("json")):
         _echo_json({"schema_version": 1, "workspace": _workspace_schema(workspace)})
         return
     click.echo(f"Workspace {workspace.binding.id}")
@@ -82,16 +159,18 @@ def info(path: Path, as_json: bool) -> None:
     is_flag=True,
     help="Emit one versioned JSON object per Workspace.",
 )
-def list_workspaces(as_json: bool, as_ndjson: bool) -> None:
+@click.pass_context
+def list_workspaces(context: click.Context, as_json: bool, as_ndjson: bool) -> None:
     """List registered Workspaces."""
-    if as_json and as_ndjson:
+    root_json = bool(context.find_root().obj.get("json"))
+    if (as_json or root_json) and as_ndjson:
         raise click.UsageError("Choose only one of --json or --ndjson")
     try:
         workspaces = Workspaces.from_environment().list()
     except WorkspaceError as error:
         raise click.ClickException(_human(str(error))) from error
 
-    if as_json:
+    if as_json or root_json:
         _echo_json(
             {
                 "schema_version": 1,
@@ -145,6 +224,65 @@ def _workspace_schema(workspace: Workspace) -> dict[str, object]:
         "adopted_head": binding.adopted_head,
         "created_at": binding.created_at,
         "last_observed_at": facts.observed_at,
+    }
+
+
+def _aggregate_schema(workspace: WorkspaceAggregate) -> dict[str, object]:
+    definition = workspace.definition
+    return {
+        "definition": {
+            "id": definition.id,
+            "parent_id": definition.parent_id,
+            "repository_id": definition.repository_id,
+            "created_from_sha": definition.created_from_sha,
+            "configuration": {
+                "bytes_base64": base64.b64encode(definition.configuration).decode(
+                    "ascii"
+                ),
+                "value": _thaw(definition.configuration_value),
+                "digest": definition.configuration_digest,
+            },
+            "resources": [
+                {
+                    "name": resource.name,
+                    "kind": resource.kind,
+                    "adapter_id": resource.adapter_id,
+                    "adapter_api_major": resource.adapter_api_major,
+                    "configuration": _thaw(resource.configuration),
+                    "external_reference": resource.external_reference,
+                    "locator": resource.locator,
+                    "ownership_token": resource.ownership_token,
+                }
+                for resource in definition.resources
+            ],
+        },
+        "resource_states": [
+            {
+                "name": resource.name,
+                "provisioning_status": resource.provisioning_status,
+            }
+            for resource in workspace.resource_states
+        ],
+        "state": workspace.state,
+        "version": workspace.version,
+        "path": workspace.path,
+        "branch": workspace.branch,
+    }
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _operation_schema(operation: Operation) -> dict[str, object]:
+    return {
+        "id": operation.id,
+        "kind": operation.kind,
+        "status": operation.status,
     }
 
 

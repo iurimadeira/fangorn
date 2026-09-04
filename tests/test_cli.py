@@ -121,11 +121,15 @@ def run_fangorn(
 
 
 def create_repository(path: Path) -> str:
-    initialize_repository(path)
-    (path / "README.md").write_text("temporary repository\n", encoding="utf-8")
-    git(path, "add", "README.md")
-    git(path, "commit", "-m", "Initial commit")
-    return git(path, "rev-parse", "HEAD")
+    previous_umask = os.umask(0o077)
+    try:
+        initialize_repository(path)
+        (path / "README.md").write_text("temporary repository\n", encoding="utf-8")
+        git(path, "add", "README.md")
+        git(path, "commit", "-m", "Initial commit")
+        return git(path, "rev-parse", "HEAD")
+    finally:
+        os.umask(previous_umask)
 
 
 def snapshot_tree(path: Path) -> dict[str, tuple[int, int, bytes | None]]:
@@ -354,7 +358,7 @@ def test_help_exposes_reads_but_keeps_legacy_adopt_hidden() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Worktree-native workspace families" in result.stdout
+    assert "Recoverable disposable Workspaces" in result.stdout
     assert "adopt" not in result.stdout
     assert "info" in result.stdout
     assert "list" in result.stdout
@@ -517,6 +521,50 @@ def test_cli_reports_unavailable_home_without_a_traceback(tmp_path: Path) -> Non
     assert "HOME is unset" in result.stderr
     assert result.stderr.count("\n") == 1
     assert "Traceback" not in result.stderr
+
+
+def test_legacy_list_needs_only_explicit_state_home(tmp_path: Path) -> None:
+    result = run_fangorn(
+        tmp_path / "state",
+        "list",
+        "--json",
+        environment_overrides={
+            "HOME": None,
+            "XDG_DATA_HOME": None,
+            "XDG_CACHE_HOME": None,
+        },
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"schema_version": 1, "workspaces": []}
+
+
+def test_local_explicit_create_does_not_need_data_or_cache_home(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    target = tmp_path / "target"
+
+    result = run_fangorn(
+        tmp_path / "state",
+        "workspace",
+        "create",
+        "--repo",
+        str(repository),
+        "--branch",
+        "topic",
+        "--path",
+        str(target),
+        "--headless",
+        "--json",
+        environment_overrides={
+            "HOME": None,
+            "XDG_DATA_HOME": None,
+            "XDG_CACHE_HOME": None,
+        },
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["workspace"]["state"] == "ready"
 
 
 def test_git_older_than_231_fails_preflight_before_marker_creation(
@@ -888,7 +936,6 @@ def test_concurrent_adopter_retries_while_transaction_reobservation_is_slow(
     original_sleep = time.sleep
 
     monkeypatch.setattr(registry_adapter, "BUSY_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(registry_adapter, "ADOPTION_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr(registry_adapter, "ADOPTION_RETRY_DELAY_SECONDS", 0.001)
 
     def record_retry(delay: float) -> None:
@@ -1468,7 +1515,7 @@ def test_adopt_rejects_non_utf8_git_output_without_a_traceback(
     wrapper.write_text(
         """#!/bin/sh
 case "$*" in
-    *"rev-parse --show-toplevel")
+    *"--show-toplevel"*)
         printf 'repository-\\377\\n'
         exit 0
         ;;
@@ -1685,7 +1732,7 @@ def test_adopt_reports_symbolic_ref_and_subprocess_os_failures(tmp_path: Path) -
     wrapper.write_text(
         """#!/bin/sh
 case "$*" in
-    *"symbolic-ref --quiet --short HEAD")
+    *"symbolic-ref --quiet HEAD")
         echo "forced symbolic-ref failure" >&2
         exit 2
         ;;
@@ -2327,7 +2374,7 @@ def test_registry_migration_enforces_immutable_binding_and_foreign_keys(
     try:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,)]
+        ).fetchall() == [(1,), (2,)]
         repository_columns = {
             row[1]: row for row in connection.execute("PRAGMA table_info(repositories)")
         }
@@ -2531,8 +2578,22 @@ def test_read_only_list_proceeds_during_a_registry_write_transaction(
     assert elapsed < 1.5
 
 
-def test_read_only_list_does_not_repair_state_or_database_permissions(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("unsafe", "mode"),
+    (
+        ("state", 0o777),
+        ("state", 0o755),
+        ("state", 0o500),
+        ("state", 0o1700),
+        ("database", 0o666),
+        ("database", 0o644),
+        ("database", 0o400),
+        ("database", 0o700),
+        ("database", 0o1600),
+    ),
+)
+def test_read_only_list_rejects_unsafe_permissions_without_repair(
+    tmp_path: Path, unsafe: str, mode: int
 ) -> None:
     repository = tmp_path / "repository"
     create_repository(repository)
@@ -2541,14 +2602,109 @@ def test_read_only_list_does_not_repair_state_or_database_permissions(
     adopted = run_fangorn(state_home, "adopt", "--json", str(repository))
     assert adopted.returncode == 0, adopted.stderr
     database = state_directory / "registry.sqlite3"
-    state_directory.chmod(0o777)
-    database.chmod(0o666)
+    target = state_directory if unsafe == "state" else database
+    target.chmod(mode)
 
     result = run_fangorn(state_home, "list", "--json")
 
-    assert result.returncode == 0, result.stderr
-    assert stat.S_IMODE(state_directory.stat().st_mode) == 0o777
-    assert stat.S_IMODE(database.stat().st_mode) == 0o666
+    assert result.returncode != 0
+    expected = (
+        "Registry state directory unavailable"
+        if unsafe == "state"
+        else "Registry database unavailable"
+    )
+    assert expected in result.stderr
+    assert stat.S_IMODE(target.stat().st_mode) == mode
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "mode"),
+    (
+        ("state", 0o777),
+        ("state", 0o755),
+        ("state", 0o500),
+        ("state", 0o1700),
+        ("database", 0o666),
+        ("database", 0o644),
+        ("database", 0o400),
+        ("database", 0o700),
+        ("database", 0o1600),
+    ),
+)
+def test_registry_write_rejects_preexisting_unsafe_permissions(
+    tmp_path: Path, unsafe: str, mode: int
+) -> None:
+    state_directory = tmp_path / "state"
+    database = state_directory / "registry.sqlite3"
+    registry = Registry(database)
+    with registry._connection():
+        pass
+    target = state_directory if unsafe == "state" else database
+    target.chmod(mode)
+
+    with (
+        pytest.raises(RegistryError, match=r"Registry .* unavailable"),
+        registry._connection(),
+    ):
+        pass
+
+    assert stat.S_IMODE(target.stat().st_mode) == mode
+
+
+def test_registry_rejects_nonsticky_writable_ancestor(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o777)
+
+    with (
+        pytest.raises(RegistryError, match="Registry state directory unavailable"),
+        Registry(shared / "fangorn" / "registry.sqlite3")._connection(),
+    ):
+        pass
+
+
+def test_registry_accepts_sticky_writable_ancestor(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o1777)
+
+    with Registry(shared / "fangorn" / "registry.sqlite3")._connection():
+        pass
+
+
+def test_registry_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    real = tmp_path / "real-state"
+    real.mkdir()
+    linked = tmp_path / "linked-state"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with (
+        pytest.raises(RegistryError, match="symlink"),
+        Registry(linked / "fangorn" / "registry.sqlite3")._connection(),
+    ):
+        pass
+
+
+def test_registry_rejects_path_replacement_during_sqlite_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_directory = tmp_path / "state"
+    database = state_directory / "registry.sqlite3"
+    registry = Registry(database)
+    with registry._connection():
+        pass
+    real_connect = sqlite3.connect
+
+    def replace_before_connect(database: Any, **kwargs: Any) -> sqlite3.Connection:
+        state_directory.rename(tmp_path / "moved-state")
+        state_directory.mkdir(mode=0o700)
+        (state_directory / "registry.sqlite3").touch(mode=0o600)
+        return cast(sqlite3.Connection, real_connect(database, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", replace_before_connect)
+
+    with pytest.raises(RegistryError, match="identity changed"), registry._connection():
+        pass
 
 
 def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> None:
@@ -2565,7 +2721,9 @@ def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> 
 
     database_state = tmp_path / "database-state"
     database_path = database_state / "fangorn" / "registry.sqlite3"
-    database_path.mkdir(parents=True)
+    database_state.mkdir(mode=0o700)
+    database_path.parent.mkdir(mode=0o700)
+    database_path.mkdir(mode=0o700)
     database_failure = run_fangorn(database_state, "list", "--json")
     assert database_failure.returncode != 0
     assert database_failure.stdout == ""
@@ -2583,3 +2741,23 @@ def test_registry_filesystem_failures_are_concise_cli_errors(tmp_path: Path) -> 
     assert "Registry state directory unavailable" in symlink_failure.stderr
     assert "symlink" in symlink_failure.stderr
     assert "Traceback" not in symlink_failure.stderr
+
+
+@pytest.mark.parametrize("entry", ["state", "database"])
+def test_registry_write_rejects_unsafe_private_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    monkeypatch.setattr(
+        registry_adapter,
+        "_darwin_acl_allows_private_access",
+        lambda descriptor: (
+            stat.S_ISDIR(os.fstat(descriptor).st_mode) == (entry == "state")
+        ),
+        raising=False,
+    )
+
+    with (
+        pytest.raises(RegistryError, match=rf"Registry {entry}.*unavailable"),
+        Registry(tmp_path / "state" / "registry.sqlite3")._connection(),
+    ):
+        pass
