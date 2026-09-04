@@ -263,15 +263,15 @@ def _capture_snapshot(
         identity="worktree",
         create=create_worktree_generation,
     )
-    branch = _run_git(
+    branch_ref = _run_git(
         requested_path,
         "symbolic-ref",
         "--quiet",
-        "--short",
         "HEAD",
         allowed_exit_codes=frozenset({1}),
         liveness_fd=liveness_fd,
     )
+    branch = branch_ref.removeprefix("refs/heads/") if branch_ref is not None else None
     head = _run_git(
         requested_path,
         "rev-parse",

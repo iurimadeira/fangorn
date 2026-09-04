@@ -644,6 +644,8 @@ def test_clone_create_resolves_remote_branch_spellings_without_remote_head(
 def test_clone_create_resolves_remote_head_spellings(tmp_path: Path, base: str) -> None:
     repository = tmp_path / "repository"
     expected = create_repository(repository)
+    if base == "HEAD":
+        git(repository, "tag", "head")
 
     result = facade(tmp_path).create(
         CreateWorkspace(

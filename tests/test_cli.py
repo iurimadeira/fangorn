@@ -1732,7 +1732,7 @@ def test_adopt_reports_symbolic_ref_and_subprocess_os_failures(tmp_path: Path) -
     wrapper.write_text(
         """#!/bin/sh
 case "$*" in
-    *"symbolic-ref --quiet --short HEAD")
+    *"symbolic-ref --quiet HEAD")
         echo "forced symbolic-ref failure" >&2
         exit 2
         ;;
