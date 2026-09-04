@@ -271,6 +271,8 @@ def _capture_snapshot(
         allowed_exit_codes=frozenset({1}),
         liveness_fd=liveness_fd,
     )
+    if branch_ref is not None and not branch_ref.startswith("refs/heads/"):
+        raise GitError("Git HEAD does not reference a local branch")
     branch = branch_ref.removeprefix("refs/heads/") if branch_ref is not None else None
     head = _run_git(
         requested_path,

@@ -62,6 +62,19 @@ def test_workspaces_adopts_through_public_python_api(
     assert not hasattr(result.workspace, "last_observation_token")
 
 
+def test_workspaces_rejects_symbolic_head_outside_local_branches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    create_repository(repository)
+    git(repository, "tag", "release")
+    git(repository, "symbolic-ref", "HEAD", "refs/tags/release")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    with pytest.raises(WorkspaceError, match="HEAD does not reference a local branch"):
+        Workspaces.from_environment().adopt(repository)
+
+
 def test_workspaces_list_does_not_initialize_missing_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
