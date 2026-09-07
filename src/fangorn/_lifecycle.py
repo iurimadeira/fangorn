@@ -95,6 +95,8 @@ def resource_steps(
         if action == "delete":
             steps.extend(PlanStep("ownership", resource.name) for resource in ordered)
             for resource in ordered:
+                if resource.kind == "worktree" and len(resources) > 1:
+                    steps.append(PlanStep("barrier", resource.name))
                 steps.extend(
                     (
                         PlanStep("delete", resource.name),
@@ -105,6 +107,11 @@ def resource_steps(
             steps.append(PlanStep("forget", "worktree"))
         else:
             steps.extend(PlanStep(action, resource.name) for resource in ordered)
+            if len(resources) > 1 and action in {"start", "stop"}:
+                steps.extend(
+                    PlanStep(f"verify_{action}", resource.name)
+                    for resource in resources
+                )
     return tuple(steps)
 
 

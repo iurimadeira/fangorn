@@ -5,13 +5,21 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from git_helpers import git, initialize_repository
 
 from fangorn.configuration import ConsentStore
-from fangorn.resource_adapters import AdapterContext, CommandAdapter, discover_adapters
+from fangorn.git import repository_generation
+from fangorn.resource_adapters import (
+    AdapterContext,
+    CommandAdapter,
+    GitWorktreeContext,
+    discover_adapters,
+)
 from fangorn.workspaces import ResourceDefinition
 
 
@@ -25,6 +33,115 @@ def _consented_context(tmp_path: Path) -> AdapterContext:
     store = ConsentStore(tmp_path / "consent")
     store.grant("a" * 64)
     return AdapterContext("ws", None, tmp_path, "a" * 64, store, {})
+
+
+def test_discovered_git_adapter_requires_git_context(tmp_path: Path) -> None:
+    definition = ResourceDefinition(
+        "worktree",
+        "worktree",
+        "fangorn.git-worktree",
+        1,
+        {},
+        None,
+        str(tmp_path / "checkout"),
+        "a" * 64,
+    )
+    context = _consented_context(tmp_path)
+    adapter = discover_adapters()["fangorn.git-worktree"]
+    observed = adapter.inspect(definition, context)
+    assert observed.status == "unknown"
+    assert observed.error == "GitWorktreeContext is required"
+    for action in (adapter.create, adapter.start, adapter.stop, adapter.delete):
+        result = action(definition, context)
+        assert not result.success
+        assert result.error == "GitWorktreeContext is required"
+        assert result.continuation == "unsafe"
+    assert not Path(definition.locator).exists()
+
+
+def test_discovered_git_adapter_runs_owned_worktree_lifecycle(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    previous_umask = os.umask(0o077)
+    try:
+        initialize_repository(repository)
+        (repository / "tracked.txt").write_text("committed\n")
+        git(repository, "add", "tracked.txt")
+        git(repository, "commit", "-m", "Initial")
+    finally:
+        os.umask(previous_umask)
+    commit = git(repository, "rev-parse", "HEAD")
+    common_dir = repository / ".git"
+    generation = repository_generation(common_dir, create=True)
+    assert generation is not None
+    git_context = GitWorktreeContext(
+        repository, common_dir, generation, commit, "workspace"
+    )
+    target = tmp_path / "checkout"
+    definition = ResourceDefinition(
+        "worktree",
+        "worktree",
+        "fangorn.git-worktree",
+        1,
+        {},
+        None,
+        str(target),
+        "a" * 64,
+    )
+    read_fd, write_fd = os.pipe()
+    try:
+        context = AdapterContext(
+            "ws",
+            "operation",
+            target,
+            "b" * 64,
+            ConsentStore(tmp_path / "ungranted-consent"),
+            {},
+            liveness_fd=read_fd,
+            git=git_context,
+        )
+        adapter = discover_adapters()["fangorn.git-worktree"]
+        initial = adapter.inspect(definition, context)
+        assert initial.status == "absent", initial.error
+        assert not adapter.start(definition, context).success
+        assert adapter.stop(definition, context).success
+        assert not adapter.create(
+            definition, replace(context, liveness_fd=None)
+        ).success
+        assert not target.exists()
+        for _ in range(2):
+            assert adapter.create(definition, context).success
+        assert git(target, "rev-parse", "HEAD") == commit
+        assert git(target, "branch", "--show-current") == "workspace"
+        observed = adapter.inspect(definition, context)
+        assert observed.status == "ready"
+        assert observed.ownership_token == definition.ownership_token
+        git(target, "checkout", "-b", "user-branch")
+        git(target, "commit", "--allow-empty", "-m", "User commit")
+        user_commit = git(target, "rev-parse", "HEAD")
+        assert user_commit != commit
+        (target / "tracked.txt").write_text("user changes\n")
+        foreign = replace(definition, ownership_token="c" * 64)
+        assert adapter.inspect(foreign, context).status == "unknown"
+        for action in (adapter.create, adapter.start, adapter.stop, adapter.delete):
+            assert not action(foreign, context).success
+        assert adapter.start(definition, context).success
+        assert adapter.stop(definition, context).success
+        assert git(target, "rev-parse", "HEAD") == user_commit
+        assert git(target, "branch", "--show-current") == "user-branch"
+        assert (target / "tracked.txt").read_text() == "user changes\n"
+        assert adapter.inspect(definition, context).status == "ready"
+        assert not adapter.delete(definition, context).success
+        assert target.exists()
+        assert adapter.delete(definition, replace(context, force=True)).success
+        observed = adapter.inspect(definition, context)
+        assert observed.status == "absent"
+        assert observed.ownership_token is None
+        assert not target.exists()
+        assert adapter.delete(definition, context).success
+        assert git(repository, "rev-parse", "workspace") == commit
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 @pytest.mark.parametrize(

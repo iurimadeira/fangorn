@@ -92,6 +92,29 @@ ID/major, configuration, opaque external reference, locator, and ownership token
 and operation IDs, Worktree cwd, digest, consent store, verified script paths,
 optional liveness descriptor, and the force request.
 
+The built-in `fangorn.git-worktree` adapter requires `context.git` to contain a
+frozen `GitWorktreeContext(repository, common_dir, common_generation, commit,
+branch)`. The caller supplies the resolved repository path, canonical Git common
+directory, previously established repository generation, resolved creation commit,
+and creation branch. These values belong to immutable operation context; existing
+Resource definitions do not gain configuration fields. The Resource locator must
+equal `context.worktree`. Missing context produces an unknown observation or an
+unsuccessful mutation with unsafe continuation. All mutations additionally require
+the caller's live operation liveness descriptor; the caller keeps its invocation
+alive until the operation and its supervised children settle.
+
+Git create reconciles an owned interrupted create against the pinned commit and
+branch. Inspection verifies current ownership and reports ready or proven absence;
+it does not require HEAD or branch to remain at their creation values. Start
+requires a present owned checkout. Stop verifies ownership or absence and preserves
+the checkout. Git has no independently stopped process: aggregate lifecycle
+evidence supplies stopped state, while a present checkout still probes ready.
+Delete proves ownership, preserves dirty files unless `context.force` is true,
+and verifies absence; force never bypasses ownership or submodule restrictions.
+Repeated operations reconcile existing evidence. Git operations do not run command
+Service hooks or require command consent. `Workspaces` retains its existing Git
+effect path to persist the richer Git observation used by the F3 facade.
+
 `inspect` returns `AdapterObservation(status, locator, ownership_token, error)`.
 Mutations return `AdapterResult(success, error, continuation)`. Continuation is
 `safe`, `unsafe`, or `unknown` for that exact attempt, default unknown. It never
@@ -101,6 +124,20 @@ Raise `GitQuiescenceError` from `fangorn.git` if quiescence cannot be proved;
 retain the context liveness descriptor in supervision until all children stop.
 Adapters are trusted installed Python code, must keep inspection read-only, and
 must not print to machine stdout or persist resolved secrets.
+
+Unexpected adapter exceptions become attributable failed steps; their exception
+type is recorded without persisting arbitrary exception text. Explicit unknown
+quiescence retains the mutation fence. Start and stop journal fresh verification
+of every Resource after their effects. Delete journals a fresh Service absence
+barrier before removing the Worktree. If that same delete attempt is interrupted
+after Worktree removal, retry reconciles its absence using the durable barrier,
+without replaying probes that require the removed cwd.
+
+After successful deletion, inspection retains terminal `deleted` state and
+freshly observes Worktree absence. Current Service observations and aggregate
+observation remain `unknown`: their cwd no longer exists. The response labels
+successful Service absence receipts as historical `completed_delete` evidence,
+with their operation ID, rather than claiming fresh current Service absence.
 
 A separately packaged command-based Service adapter can reuse the built-in
 contract:

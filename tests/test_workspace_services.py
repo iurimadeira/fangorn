@@ -599,3 +599,176 @@ def test_service_probes_and_cleanup_do_not_use_a_foreign_worktree_cwd(
     with pytest.raises(WorkspaceError):
         workspaces.stop(created.workspace.definition.id)
     assert service.events == []
+
+
+@pytest.mark.parametrize("start", [True, False])
+def test_failed_absent_provisioning_is_reconciled_on_create_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: bool
+) -> None:
+    service, repository, config = configured(tmp_path, monkeypatch)
+    workspaces = facade(tmp_path)
+    workspaces.grant_consent(workspaces.validate_configuration(config).digest)
+    request = CreateWorkspace(
+        str(repository), "topic", tmp_path / "topic", config=config, start=start
+    )
+    service.failure = ("create", "zeta")
+    with pytest.raises(WorkspaceError):
+        workspaces.create(request)
+    service.failure = None
+    service.events.clear()
+    result = workspaces.create(request)
+    assert ("create", "zeta") in service.events
+    assert result.workspace.state == ("ready" if start else "stopped")
+
+
+@pytest.mark.parametrize("command", ["start", "restart"])
+def test_last_service_cannot_invalidate_worktree_and_commit_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    service, repository, config = configured(tmp_path, monkeypatch)
+    workspaces = facade(tmp_path)
+    workspaces.grant_consent(workspaces.validate_configuration(config).digest)
+    target = tmp_path / "topic"
+    created = workspaces.create(
+        CreateWorkspace(str(repository), "topic", target, config=config, start=False)
+    )
+    original = service._effect
+
+    def move_after_start(
+        action: str, definition: ResourceDefinition, context: AdapterContext
+    ) -> AdapterResult:
+        result = original(action, definition, context)
+        if action == "start" and definition.name == "alpha":
+            target.rename(tmp_path / "moved")
+        return result
+
+    monkeypatch.setattr(service, "_effect", move_after_start)
+    with pytest.raises(WorkspaceError):
+        getattr(workspaces, command)(created.workspace.definition.id)
+    failed = workspaces.inspect_workspace(created.workspace.definition.id)
+    assert failed.state == "start_failed"
+    assert failed.operation.status == "failed"
+    assert any(step["status"] == "failed" for step in failed.steps)
+
+
+@pytest.mark.parametrize(
+    ("callback", "exception"),
+    [
+        ("inspect", RuntimeError),
+        ("start", TypeError),
+        ("stop", KeyError),
+        ("delete", RuntimeError),
+    ],
+)
+def test_unexpected_adapter_exception_is_journaled_and_cli_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    callback: str,
+    exception: type[Exception],
+) -> None:
+    from click.testing import CliRunner
+
+    from fangorn.cli import main
+
+    service, repository, config = configured(tmp_path, monkeypatch)
+    workspaces = facade(tmp_path)
+    workspaces.grant_consent(workspaces.validate_configuration(config).digest)
+    created = workspaces.create(
+        CreateWorkspace(
+            str(repository),
+            "topic",
+            tmp_path / "topic",
+            config=config,
+            start=callback != "start",
+        )
+    )
+    workspace_id = created.workspace.definition.id
+    original = getattr(service, callback)
+
+    def fail(definition: ResourceDefinition, context: AdapterContext) -> None:
+        raise exception("unexpected adapter failure")
+
+    monkeypatch.setattr(service, callback, fail)
+    monkeypatch.setattr(Workspaces, "from_environment", lambda: workspaces)
+    command = "stop" if callback == "inspect" else callback
+    argv = ["--json", "workspace", command, "--workspace", workspace_id]
+    if command == "delete":
+        argv.append("--yes")
+    result = CliRunner().invoke(main, argv)
+    assert result.exit_code == 1
+    payload = json.loads(result.stderr)
+    assert payload["schema_version"] == 2
+    assert payload["error"]["resource"] in {"zeta", "alpha"}
+    failed = workspaces.inspect_workspace(workspace_id)
+    assert failed.state == f"{command}_failed"
+    assert failed.operation.status == "failed"
+    assert any(step["status"] == "failed" for step in failed.steps)
+    monkeypatch.setattr(service, callback, original)
+    assert (
+        getattr(workspaces, command)(workspace_id).state
+        == {"start": "ready", "stop": "stopped", "delete": "deleted"}[command]
+    )
+
+
+def test_delete_reconciles_interruption_after_worktree_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fangorn.workspaces as workspace_api
+    from fangorn.git_worktree import delete_owned_worktree
+
+    service, repository, config = configured(tmp_path, monkeypatch)
+    workspaces = facade(tmp_path)
+    workspaces.grant_consent(workspaces.validate_configuration(config).digest)
+    target = tmp_path / "topic"
+    created = workspaces.create(
+        CreateWorkspace(str(repository), "topic", target, config=config)
+    )
+    original = delete_owned_worktree
+
+    def interrupt(target: Path, **kwargs: object) -> None:
+        original(target, **kwargs)  # type: ignore[arg-type]
+        raise SystemExit("after Worktree effect")
+
+    monkeypatch.setattr(workspace_api, "delete_owned_worktree", interrupt)
+    with pytest.raises(SystemExit):
+        workspaces.delete(created.workspace.definition.id)
+    assert not target.exists()
+    interrupted = workspaces.inspect_workspace(created.workspace.definition.id)
+    assert interrupted.operation.status == "running"
+    assert any(
+        step["action"] == "barrier" and step["status"] == "completed"
+        for step in interrupted.steps
+    )
+    monkeypatch.setattr(workspace_api, "delete_owned_worktree", original)
+    service.events.clear()
+    recovered = facade(tmp_path).delete(created.workspace.definition.id)
+    assert recovered.state == "deleted"
+    assert recovered.operation.id == interrupted.operation.id
+    assert all(step["status"] == "completed" for step in recovered.steps)
+    assert service.events == []
+
+
+def test_deleted_service_inspection_reports_historical_cleanup_without_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, repository, config = configured(tmp_path, monkeypatch)
+    workspaces = facade(tmp_path)
+    digest = workspaces.validate_configuration(config).digest
+    workspaces.grant_consent(digest)
+    created = workspaces.create(
+        CreateWorkspace(str(repository), "topic", tmp_path / "topic", config=config)
+    )
+    deleted = workspaces.delete(created.workspace.definition.id)
+    workspaces.revoke_consent(digest)
+    service.events.clear()
+    before = (tmp_path / "state/registry.sqlite3").read_bytes()
+    inspected = facade(tmp_path).inspect_workspace(created.workspace.definition.id)
+    assert inspected.observed_status == "unknown"
+    assert inspected.operation == deleted.operation
+    resources = inspected.observation["resources"]
+    assert isinstance(resources, dict)
+    assert resources["zeta"]["observation"] == "unknown"
+    assert resources["zeta"]["historical_observation"] == "absent"
+    assert resources["zeta"]["evidence_source"] == "completed_delete"
+    assert service.events == []
+    assert before == (tmp_path / "state/registry.sqlite3").read_bytes()

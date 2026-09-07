@@ -11,7 +11,12 @@ from typing import Literal, Protocol, cast
 
 from fangorn.configuration import ConsentStore
 from fangorn.git import GitError, GitQuiescenceError
-from fangorn.git_worktree import _run_supervised_git
+from fangorn.git_worktree import (
+    _run_supervised_git,
+    create_worktree,
+    delete_owned_worktree,
+    observe_lifecycle_worktree,
+)
 
 ObservationStatus = Literal["absent", "stopped", "ready", "degraded", "unknown"]
 Continuation = Literal["safe", "unsafe", "unknown"]
@@ -54,6 +59,15 @@ class AdapterDescriptor:
 
 
 @dataclass(frozen=True)
+class GitWorktreeContext:
+    repository: Path
+    common_dir: Path
+    common_generation: str
+    commit: str
+    branch: str
+
+
+@dataclass(frozen=True)
 class AdapterContext:
     workspace_id: str
     operation_id: str | None
@@ -63,6 +77,7 @@ class AdapterContext:
     scripts: Mapping[str, Path]
     liveness_fd: int | None = None
     force: bool = False
+    git: GitWorktreeContext | None = None
 
 
 @dataclass(frozen=True)
@@ -238,13 +253,115 @@ class CommandAdapter:
         return result.stdout
 
 
-class GitWorktreeAdapter(CommandAdapter):
+class GitWorktreeAdapter:
     descriptor = AdapterDescriptor(
         "fangorn.git-worktree",
         1,
         frozenset({"worktree"}),
         frozenset({"dirty_worktree"}),
     )
+
+    def inspect(
+        self, definition: ResourceDefinition, context: AdapterContext
+    ) -> AdapterObservation:
+        try:
+            git = self._git_context(definition, context)
+            observed = observe_lifecycle_worktree(
+                Path(definition.locator),
+                ownership_token=definition.ownership_token,
+                common_dir=git.common_dir,
+                common_generation=git.common_generation,
+                liveness_fd=context.liveness_fd,
+            )
+            return AdapterObservation(
+                "absent" if observed is None else "ready",
+                definition.locator,
+                None if observed is None else definition.ownership_token,
+            )
+        except GitQuiescenceError:
+            raise
+        except (ValueError, OSError, GitError) as error:
+            return AdapterObservation("unknown", definition.locator, None, str(error))
+
+    def create(
+        self, definition: ResourceDefinition, context: AdapterContext
+    ) -> AdapterResult:
+        return self._mutate("create", definition, context)
+
+    def start(
+        self, definition: ResourceDefinition, context: AdapterContext
+    ) -> AdapterResult:
+        return self._mutate("start", definition, context)
+
+    def stop(
+        self, definition: ResourceDefinition, context: AdapterContext
+    ) -> AdapterResult:
+        return self._mutate("stop", definition, context)
+
+    def delete(
+        self, definition: ResourceDefinition, context: AdapterContext
+    ) -> AdapterResult:
+        return self._mutate("delete", definition, context)
+
+    def _mutate(
+        self,
+        action: Literal["create", "start", "stop", "delete"],
+        definition: ResourceDefinition,
+        context: AdapterContext,
+    ) -> AdapterResult:
+        try:
+            git = self._git_context(definition, context)
+            if context.liveness_fd is None:
+                raise ValueError("Git Worktree mutations require a liveness descriptor")
+        except ValueError as error:
+            return AdapterResult(False, str(error), "unsafe")
+        try:
+            if action == "create":
+                create_worktree(
+                    git.repository,
+                    target=Path(definition.locator),
+                    branch=git.branch,
+                    commit=git.commit,
+                    ownership_token=definition.ownership_token,
+                    reconcile=True,
+                    expected_repository_common_dir=git.common_dir,
+                    expected_repository_generation=git.common_generation,
+                    liveness_fd=context.liveness_fd,
+                )
+            elif action == "delete":
+                delete_owned_worktree(
+                    Path(definition.locator),
+                    ownership_token=definition.ownership_token,
+                    common_dir=git.common_dir,
+                    common_generation=git.common_generation,
+                    force=context.force,
+                    liveness_fd=context.liveness_fd,
+                )
+            else:
+                observed = self.inspect(definition, context)
+                if observed.status == "unknown":
+                    return AdapterResult(False, observed.error, "unsafe")
+                if action == "start" and observed.status == "absent":
+                    return AdapterResult(False, "Worktree Resource is absent", "unsafe")
+            return AdapterResult(True, continuation="safe")
+        except GitQuiescenceError:
+            raise
+        except (ValueError, OSError, GitError) as error:
+            return AdapterResult(False, str(error), "unknown")
+
+    def _git_context(
+        self, definition: ResourceDefinition, context: AdapterContext
+    ) -> GitWorktreeContext:
+        if not isinstance(context.git, GitWorktreeContext):
+            raise ValueError("GitWorktreeContext is required")
+        if (
+            definition.kind != "worktree"
+            or definition.adapter_id != self.descriptor.id
+            or definition.adapter_api_major != self.descriptor.api_major
+            or Path(definition.locator) != context.worktree
+        ):
+            raise ValueError("Git Worktree definition does not match its context")
+        return context.git
 
 
 def discover_adapters() -> Mapping[str, ResourceAdapter]:
