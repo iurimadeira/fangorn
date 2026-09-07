@@ -1447,7 +1447,10 @@ class Registry:
         scope_key: str,
         lease_epoch: int,
         result: dict[str, object],
+        status: str = "completed",
     ) -> None:
+        if status not in {"completed", "failed"}:
+            raise RegistryError("Invalid operation step outcome")
         with self._connection() as connection:
             self._migrate(connection)
             try:
@@ -1462,10 +1465,11 @@ class Registry:
                 changed = connection.execute(
                     """
                     UPDATE operation_steps
-                    SET status = 'completed', result_json = ?
+                    SET status = ?, result_json = ?
                     WHERE operation_id = ? AND position = ? AND status = 'running'
                     """,
                     (
+                        status,
                         json.dumps(result, sort_keys=True, separators=(",", ":")),
                         operation_id,
                         position,
@@ -1814,22 +1818,37 @@ class Registry:
                         state,
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO workspace_resources (
-                        workspace_id, position, name, kind, adapter_id,
-                        adapter_api_major, configuration_json,
-                        external_reference, locator, ownership_token,
-                        provisioning_status
-                    ) VALUES (?, 0, 'worktree', 'worktree',
-                        'fangorn.git-worktree', 1, '{}', NULL, ?, ?, 'created')
-                    """,
-                    (
-                        intent.workspace_id,
-                        str(observation.path),
-                        observation.git_dir_generation,
-                    ),
-                )
+                if not isinstance(resources, list):
+                    raise RegistryError(
+                        "Workspace resource definitions are unavailable"
+                    )
+                for position, declared in enumerate(resources):
+                    connection.execute(
+                        """
+                        INSERT INTO workspace_resources (
+                            workspace_id, position, name, kind, adapter_id,
+                            adapter_api_major, configuration_json,
+                            external_reference, locator, ownership_token,
+                            provisioning_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created')
+                        """,
+                        (
+                            intent.workspace_id,
+                            position,
+                            declared["name"],
+                            declared["kind"],
+                            declared["adapter_id"],
+                            declared["adapter_api_major"],
+                            json.dumps(
+                                declared["configuration"],
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            declared["external_reference"],
+                            declared["locator"],
+                            declared["ownership_token"],
+                        ),
+                    )
                 connection.execute(
                     "UPDATE operations SET status = 'completed', updated_at = ? "
                     "WHERE id = ?",
@@ -1977,7 +1996,7 @@ class Registry:
         *,
         kind: str,
         state: str,
-        actions: tuple[str, ...],
+        actions: tuple[str | tuple[str, str], ...],
         expected_operation: str,
     ) -> None:
         with self._connection() as connection:
@@ -2024,12 +2043,28 @@ class Registry:
                 "UPDATE operations SET status = 'running', updated_at = ? WHERE id = ?",
                 (now, operation_id),
             )
-            for position, action in enumerate(actions):
+            named = tuple(
+                (item, "worktree") if isinstance(item, str) else item
+                for item in actions
+            )
+            for position, (action, resource_name) in enumerate(named):
                 connection.execute(
                     "INSERT OR IGNORE INTO operation_steps "
                     "(operation_id, position, action, resource_name, status) "
-                    "VALUES (?, ?, ?, 'worktree', 'pending')",
-                    (operation_id, position, action),
+                    "VALUES (?, ?, ?, ?, 'pending')",
+                    (operation_id, position, action, resource_name),
+                )
+            recorded = tuple(
+                (str(row["action"]), str(row["resource_name"]))
+                for row in connection.execute(
+                    "SELECT action, resource_name FROM operation_steps "
+                    "WHERE operation_id = ? ORDER BY position",
+                    (operation_id,),
+                ).fetchall()
+            )
+            if recorded != named:
+                raise RegistryError(
+                    "Workspace operation plan changed; inspect and retry"
                 )
             connection.execute(
                 "INSERT INTO workspace_lifecycle "

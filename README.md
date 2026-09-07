@@ -8,9 +8,9 @@ technical Git identity shared by Worktree Resources; it is not a second
 user-managed project object.
 
 This release creates root headless Workspaces containing one built-in Git
-Worktree Resource and supports aggregate inspection, start, stop, restart,
-delete, and metadata-only forget. Terminal, Service, parent-lineage, and
-recursive deletion are not shipped yet. Existing `info`, `list`, and hidden migration
+Worktree Resource and ordered named Service Resources. It supports aggregate
+inspection, start, stop, restart, delete, and metadata-only forget. Terminal,
+parent-lineage, and recursive deletion are not shipped yet. Existing `info`, `list`, and hidden migration
 `adopt` compatibility commands retain their schema-1 meanings.
 
 ## Requirements
@@ -72,13 +72,28 @@ or world-writable parents, dangling symlinks, and symlink loops are rejected.
 An existing target is accepted only when retry evidence proves it is the
 Worktree Resource owned by the same create operation.
 
-F2 configuration accepts only `schema_version = 1` and an optional empty
-`[services]` table because Service Resources are not available yet. Without
+Configuration requires `schema_version = 1` and accepts ordered named
+`[services.NAME]` tables. Without
 `--config`, Fangorn reads `fangorn.toml` from the resolved commit; when no file
 exists, the value defaults to `schema_version = 1`. Configuration is capped at
 1 MiB, and its exact bytes, parsed value, and digest are snapshotted for retries.
 Every component of an explicit configuration path must be a real, non-symlink
-filesystem entry.
+filesystem entry. Direct local script bytes and modes join the consent digest;
+existing Workspaces execute immutable copies even after source changes.
+
+```sh
+fangorn config validate ./fangorn.toml
+fangorn consent grant DIGEST
+fangorn adapter list
+fangorn consent list
+fangorn consent revoke DIGEST
+```
+
+Every configured Service execution, including its read-only probe, requires a
+stored grant. A missing or revoked grant produces an actionable digest;
+inspection never grants consent or writes snapshots. Consent is trust, not a
+sandbox. See [Service configuration and adapter API](docs/adapters.md) for the
+schema, script coverage, environment references, and an external adapter example.
 
 Equivalent retries return the same Workspace ID, resolved `created_from_sha`,
 target path, and completed operation. Reusing a request ID or target path with
@@ -124,6 +139,13 @@ fangorn workspace start --workspace WORKSPACE_ID
 fangorn workspace restart --workspace WORKSPACE_ID
 fangorn workspace delete --workspace WORKSPACE_ID --yes
 ```
+
+Create, start, and inspect visit the Worktree then Services in declaration order.
+Stop and delete visit Services in reverse order. Restart completes stop before
+any start; ready/stopped transitions require fresh observations of every Resource.
+Failed cleanup retains each attempt's evidence. A typed safe failure may permit
+another independent Service cleanup (with `--force` for deletion), but the
+Worktree remains until every Service is freshly proven absent.
 
 Inspect, start, stop, and restart default to the registered Workspace containing
 the current directory. Worktree start/stop verify ownership without changing

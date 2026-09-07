@@ -3236,7 +3236,7 @@ def test_create_rejects_unsupported_definition_before_state(
         ),
         (
             "schema_version = 1\n[services.app]\nadapter = 'fangorn.command'\n",
-            "Service Resources are not available",
+            "inspect requires a nonempty argv array",
         ),
         (
             "schema_version = 1\nrelease_date = 2026-09-02\n",
@@ -3246,7 +3246,7 @@ def test_create_rejects_unsupported_definition_before_state(
         ("schema_version = 1\nlimit = nan\n", "unsupported top-level key: limit"),
     ],
 )
-def test_create_rejects_configuration_outside_f2_scope(
+def test_create_rejects_invalid_configuration(
     tmp_path: Path, configuration: str, message: str
 ) -> None:
     source = tmp_path / "repository"
