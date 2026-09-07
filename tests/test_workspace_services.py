@@ -12,6 +12,7 @@ from git_helpers import git
 from test_workspace_create import create_repository, facade
 
 import fangorn.resource_adapters as discovery
+from fangorn.git import GitError
 from fangorn.resource_adapters import (
     AdapterContext,
     AdapterDescriptor,
@@ -655,6 +656,9 @@ def test_last_service_cannot_invalidate_worktree_and_commit_ready(
     ("callback", "exception"),
     [
         ("inspect", RuntimeError),
+        ("inspect", ValueError),
+        ("inspect", OSError),
+        ("inspect", GitError),
         ("start", TypeError),
         ("stop", KeyError),
         ("delete", RuntimeError),
@@ -699,10 +703,13 @@ def test_unexpected_adapter_exception_is_journaled_and_cli_json(
     payload = json.loads(result.stderr)
     assert payload["schema_version"] == 2
     assert payload["error"]["resource"] in {"zeta", "alpha"}
+    assert "unexpected adapter failure" not in result.stderr
     failed = workspaces.inspect_workspace(workspace_id)
     assert failed.state == f"{command}_failed"
     assert failed.operation.status == "failed"
     assert any(step["status"] == "failed" for step in failed.steps)
+    assert "unexpected adapter failure" not in (failed.error or "")
+    assert "unexpected adapter failure" not in json.dumps(failed.steps)
     monkeypatch.setattr(service, callback, original)
     assert (
         getattr(workspaces, command)(workspace_id).state

@@ -416,7 +416,18 @@ class Workspaces:
         try:
             self._consent.require(context.configuration_digest)
             adapters_api.validate_resources((resource,), adapters)
-            observation = adapters[resource.adapter_id].inspect(resource, context)
+            try:
+                observation = adapters[resource.adapter_id].inspect(resource, context)
+            except GitQuiescenceError:
+                raise
+            except Exception as error:
+                return AdapterObservation(
+                    "unknown",
+                    resource.locator,
+                    None,
+                    f"Adapter {resource.adapter_id} inspect "
+                    f"raised {type(error).__name__}",
+                )
             if (
                 not isinstance(observation, AdapterObservation)
                 or observation.status
