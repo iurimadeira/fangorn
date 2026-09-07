@@ -76,3 +76,40 @@ def finish_create(
     if expected:
         return "ready" if start else "stopped"
     return "create_failed"
+
+
+@dataclass(frozen=True)
+class LifecyclePlan:
+    actions: tuple[str, ...]
+    success_state: str
+
+
+def plan_lifecycle(command: str, state: str) -> LifecyclePlan:
+    """Plan one whole headless aggregate operation without external effects."""
+    if command == "delete":
+        return LifecyclePlan(() if state == "deleted" else ("delete",), "deleted")
+    allowed = {
+        "start": {"stopped", "start_failed", "ready", "starting"},
+        "stop": {
+            "ready",
+            "starting",
+            "start_failed",
+            "stop_failed",
+            "stopped",
+            "stopping",
+        },
+        "restart": {
+            "ready",
+            "starting",
+            "start_failed",
+            "stop_failed",
+            "stopped",
+            "stopping",
+        },
+    }
+    if command not in allowed or state not in allowed[command]:
+        raise ValueError(f"Cannot {command} Workspace in {state}; inspect before retry")
+    return LifecyclePlan(
+        ("stop", "start") if command == "restart" else (command,),
+        "stopped" if command == "stop" else "ready",
+    )

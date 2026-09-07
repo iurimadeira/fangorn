@@ -14,6 +14,8 @@ from fangorn.workspaces import (
     Workspace,
     WorkspaceAggregate,
     WorkspaceError,
+    WorkspaceInspection,
+    WorkspaceOperationError,
     Workspaces,
 )
 
@@ -97,6 +99,143 @@ def create_workspace(
     click.echo(f"{action} Workspace {result.workspace.definition.id}")
     click.echo(f"State: {result.workspace.state}")
     click.echo(f"Path: {_human(result.workspace.path)}")
+
+
+def _register_lifecycle_command(name: str) -> None:
+    @workspace.command(name=name)
+    @click.option("--workspace", "workspace_id")
+    @click.option("--path", type=COMMAND_PATH)
+    @click.option("--json", "as_json", is_flag=True)
+    @click.pass_context
+    def command(
+        context: click.Context,
+        workspace_id: str | None,
+        path: Path | None,
+        as_json: bool,
+    ) -> None:
+        application = Workspaces.from_environment()
+        operation = {
+            "inspect": application.inspect_workspace,
+            "start": application.start,
+            "stop": application.stop,
+            "restart": application.restart,
+        }[name]
+        try:
+            result = operation(workspace_id, path=path)
+        except WorkspaceError as error:
+            _lifecycle_error(context, as_json, error)
+        else:
+            _echo_inspection(context, as_json, result)
+
+
+for _command_name in ("inspect", "start", "stop", "restart"):
+    _register_lifecycle_command(_command_name)
+
+
+@workspace.command(name="delete")
+@click.option("--workspace", "workspace_id", required=True)
+@click.option("--force", is_flag=True, help="Allow dirty Worktree removal.")
+@click.option("--yes", is_flag=True, help="Confirm deletion for automation.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def delete_workspace(
+    context: click.Context,
+    workspace_id: str,
+    force: bool,
+    yes: bool,
+    as_json: bool,
+) -> None:
+    """Delete a childless Workspace after proving Resource ownership."""
+    if not yes:
+        if as_json or context.find_root().obj.get("json"):
+            raise click.UsageError("Machine deletion requires --yes")
+        click.confirm(f"Delete Workspace {_human(workspace_id)}?", abort=True)
+    try:
+        result = Workspaces.from_environment().delete(workspace_id, force=force)
+    except WorkspaceError as error:
+        _lifecycle_error(context, as_json, error)
+    else:
+        _echo_inspection(context, as_json, result)
+
+
+@workspace.command(name="forget")
+@click.option("--workspace", "workspace_id", required=True)
+@click.option("--acknowledge-orphans", is_flag=True, required=True)
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def forget_workspace(
+    context: click.Context,
+    workspace_id: str,
+    acknowledge_orphans: bool,
+    as_json: bool,
+) -> None:
+    """Forget metadata; leave external Resources and retain an audit receipt."""
+    try:
+        result = Workspaces.from_environment().forget(
+            workspace_id,
+            acknowledge_orphans=acknowledge_orphans,
+        )
+    except WorkspaceError as error:
+        _lifecycle_error(context, as_json, error)
+    else:
+        _echo_inspection(context, as_json, result)
+
+
+def _lifecycle_error(
+    context: click.Context,
+    as_json: bool,
+    error: WorkspaceError,
+) -> None:
+    if as_json or context.find_root().obj.get("json"):
+        details = (
+            error.details
+            if isinstance(error, WorkspaceOperationError)
+            else {
+                "message": str(error),
+                "next_action": "Inspect selector and retry",
+            }
+        )
+        click.echo(
+            json.dumps({"schema_version": 2, "error": details}, sort_keys=True),
+            err=True,
+        )
+        context.exit(1)
+    raise click.ClickException(_human(str(error))) from error
+
+
+def _echo_inspection(
+    context: click.Context,
+    as_json: bool,
+    result: WorkspaceInspection,
+) -> None:
+    if as_json or context.find_root().obj.get("json"):
+        _echo_json(
+            {
+                "schema_version": 2,
+                "workspace_id": result.workspace_id,
+                "workspace": _aggregate_schema(result.workspace)
+                if result.workspace
+                else None,
+                "state": result.state,
+                "operation": _operation_schema(result.operation),
+                "steps": list(result.steps),
+                "history": list(result.history),
+                "operations": list(result.operations),
+                "observed_status": result.observed_status,
+                "observation": result.observation,
+                "forgotten": result.forgotten,
+                "error": result.error,
+            }
+        )
+        return
+    click.echo(f"Workspace {result.workspace_id}")
+    if result.forgotten:
+        click.echo("Forgotten; external cleanup was not proven.")
+    else:
+        click.echo(f"State: {result.state}")
+        click.echo(f"Observed: {result.observed_status}")
+    if result.error:
+        click.echo(_human(result.error))
 
 
 @main.command(hidden=True)

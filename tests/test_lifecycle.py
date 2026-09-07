@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 from fangorn._lifecycle import (
     Observation,
     PlanStep,
     Resource,
     finish_create,
     plan_create,
+    plan_lifecycle,
 )
 
 
@@ -99,3 +102,34 @@ def test_create_never_guesses_success_from_unknown_observation() -> None:
         )
         == "create_failed"
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "state", "actions", "success"),
+    [
+        ("start", "stopped", ("start",), "ready"),
+        ("start", "start_failed", ("start",), "ready"),
+        ("stop", "start_failed", ("stop",), "stopped"),
+        ("restart", "stop_failed", ("stop", "start"), "ready"),
+        ("delete", "create_failed", ("delete",), "deleted"),
+        ("delete", "deleted", (), "deleted"),
+    ],
+)
+def test_headless_command_plans(
+    command: str,
+    state: str,
+    actions: tuple[str, ...],
+    success: str,
+) -> None:
+    plan = plan_lifecycle(command, state)
+    assert plan.actions == actions
+    assert plan.success_state == success
+
+
+@pytest.mark.parametrize("command", ["start", "stop", "restart"])
+@pytest.mark.parametrize(
+    "state", ["creating", "create_failed", "deleting", "deleted", "delete_failed"]
+)
+def test_headless_commands_refuse_incompatible_states(command: str, state: str) -> None:
+    with pytest.raises(ValueError, match="inspect before retry"):
+        plan_lifecycle(command, state)

@@ -59,13 +59,17 @@ def test_ci_exposes_one_stable_aggregate_result() -> None:
         "${{ github.event.pull_request.number || github.run_id }}" in workflow
     )
     assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
-    assert re.search(r"^  quality:\n(?:.*\n)*?    timeout-minutes: 15$", workflow, re.M)
     assert re.search(
-        r"^  compatibility:\n(?:.*\n)*?    timeout-minutes: 25$", workflow, re.M
+        r"^  quality:\n(?:    .*\n)*?    timeout-minutes: 25$", workflow, re.M
+    )
+    assert re.search(
+        r"^  compatibility:\n(?:    .*\n)*?    timeout-minutes: 25$", workflow, re.M
     )
     assert re.search(r"^  ci:\n(?:.*\n)*?    name: CI$", workflow, re.M)
+    assert re.search(r"^  ci:\n(?:    .*\n)*?    timeout-minutes: 15$", workflow, re.M)
     assert "needs: [quality, compatibility]" in workflow
-    assert workflow.count("timeout-minutes: 15") == 2
+    assert workflow.count("timeout-minutes: 25") == 2
+    assert workflow.count("timeout-minutes: 15") == 1
     assert "if: ${{ always() }}" in workflow
     assert "[[ \"${{ needs.quality.result }}\" == 'success' ]]" in workflow
     assert "[[ \"${{ needs.compatibility.result }}\" == 'success' ]]" in workflow

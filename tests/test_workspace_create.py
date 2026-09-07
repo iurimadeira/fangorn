@@ -392,7 +392,7 @@ def test_created_workspace_remains_visible_through_schema_1_reads(
     with sqlite3.connect(tmp_path / "state" / "registry.sqlite3") as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
 
 
 def test_create_from_clone_url_uses_journaled_shared_cache(tmp_path: Path) -> None:
