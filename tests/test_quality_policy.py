@@ -63,12 +63,13 @@ def test_ci_exposes_one_stable_aggregate_result() -> None:
         r"^  quality:\n(?:    .*\n)*?    timeout-minutes: 25$", workflow, re.M
     )
     assert re.search(
-        r"^  compatibility:\n(?:    .*\n)*?    timeout-minutes: 25$", workflow, re.M
+        r"^  compatibility:\n(?:    .*\n)*?    timeout-minutes: 35$", workflow, re.M
     )
     assert re.search(r"^  ci:\n(?:.*\n)*?    name: CI$", workflow, re.M)
     assert re.search(r"^  ci:\n(?:    .*\n)*?    timeout-minutes: 15$", workflow, re.M)
     assert "needs: [quality, compatibility]" in workflow
-    assert workflow.count("timeout-minutes: 25") == 2
+    assert workflow.count("timeout-minutes: 25") == 1
+    assert workflow.count("timeout-minutes: 35") == 1
     assert workflow.count("timeout-minutes: 15") == 1
     assert "if: ${{ always() }}" in workflow
     assert "[[ \"${{ needs.quality.result }}\" == 'success' ]]" in workflow

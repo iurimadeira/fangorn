@@ -221,6 +221,40 @@ def read_configuration(
     raise GitError(_git_error(result))
 
 
+def read_committed_script(
+    repository: Path,
+    commit: str,
+    name: str,
+    *,
+    liveness_fd: int | None = None,
+) -> tuple[bytes, int]:
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise GitError("Direct local script must remain beneath its source root")
+    relative = path.as_posix()
+    entry = _run_git_process(
+        repository, "ls-tree", "-z", commit, "--", relative, liveness_fd=liveness_fd
+    )
+    records = entry.stdout.rstrip(b"\0").split(b"\0")
+    if entry.returncode or len(records) != 1:
+        raise GitError("Direct local script is unavailable at resolved commit")
+    metadata, separator, found = records[0].partition(b"\t")
+    fields = metadata.split()
+    if (
+        not separator
+        or found != relative.encode()
+        or len(fields) != 3
+        or fields[0] not in {b"100644", b"100755"}
+    ):
+        raise GitError("Direct local script must be a regular non-symlink file")
+    content = _run_git_process(
+        repository, "show", f"{commit}:{relative}", liveness_fd=liveness_fd
+    )
+    if content.returncode or len(content.stdout) > CONFIGURATION_LIMIT:
+        raise GitError("Direct local script is unavailable or exceeds 1 MiB")
+    return content.stdout, int(fields[0], 8) & 0o777
+
+
 def _open_configuration_file(path: Path) -> int:
     if not path.is_absolute():
         raise GitError("Configuration is unavailable")
@@ -1694,6 +1728,8 @@ def _run_supervised_git(
     finish_on_parent_exit: bool,
     extra_fds: tuple[int, ...],
     working_directory_fd: int | None,
+    timeout_seconds: int | None = None,
+    capture_limit: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
         raise GitError("Cannot supervise Git while SIGCHLD is ignored")
@@ -1708,7 +1744,9 @@ def _run_supervised_git(
     process: subprocess.Popen[bytes] | None = None
     process_group: int | None = None
     settled = False
-    deadline = time.monotonic() + GIT_EFFECT_TIMEOUT_SECONDS + 5
+    timeout_seconds = timeout_seconds or GIT_EFFECT_TIMEOUT_SECONDS
+    capture_limit = capture_limit or GIT_CAPTURE_LIMIT
+    deadline = time.monotonic() + timeout_seconds + 5
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             interrupt_command = b"f" if finish_on_parent_exit else b"c"
@@ -1729,7 +1767,7 @@ def _run_supervised_git(
                                     str(Path(__file__).with_name("_git_anchor.py")),
                                     str(anchor_control_read),
                                     str(liveness_fd),
-                                    str(GIT_EFFECT_TIMEOUT_SECONDS),
+                                    str(timeout_seconds + 5),
                                 ],
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -1761,8 +1799,8 @@ def _run_supervised_git(
                                 else -1
                             ),
                             "finish" if finish_on_parent_exit else "cancel",
-                            str(GIT_EFFECT_TIMEOUT_SECONDS),
-                            str(GIT_CAPTURE_LIMIT),
+                            str(timeout_seconds),
+                            str(capture_limit),
                             *command,
                         ]
                         process = subprocess.Popen(  # noqa: S603
@@ -1847,8 +1885,8 @@ def _run_supervised_git(
             return subprocess.CompletedProcess(
                 command,
                 returncode,
-                _read_capture(stdout, GIT_CAPTURE_LIMIT),
-                _read_capture(stderr, GIT_CAPTURE_LIMIT),
+                _read_capture(stdout, capture_limit),
+                _read_capture(stderr, capture_limit),
             )
     finally:
         for descriptor in (

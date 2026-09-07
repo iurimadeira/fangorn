@@ -56,8 +56,8 @@ their required files and checks exist on the default branch.
   and source-distribution smoke tests.
 - Compatibility jobs run tests only on Ubuntu Python 3.13 and 3.14 and macOS
   Python 3.12, 3.13, and 3.14.
-- Quality and compatibility jobs have a 25-minute timeout so full coverage
-  and platform suites can finish; aggregate CI has a 15-minute timeout. Superseded
+- Quality has a 25-minute timeout; compatibility jobs have a 35-minute timeout
+  so platform suites can finish; aggregate CI has a 15-minute timeout. Superseded
   pull-request runs are cancelled without cancelling default-branch runs.
 - One terminal job named exactly `CI` always runs after quality and
   compatibility and succeeds only when both dependencies finish successfully;

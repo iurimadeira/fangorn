@@ -40,6 +40,119 @@ def main(context: click.Context, root_json: bool) -> None:
 
 
 @main.group()
+def config() -> None:
+    """Validate Repository Configuration and its covered scripts."""
+
+
+@config.command(name="validate")
+@click.argument("path", type=COMMAND_PATH, default="fangorn.toml")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def validate_configuration(context: click.Context, path: Path, as_json: bool) -> None:
+    try:
+        snapshot = Workspaces.from_environment().validate_configuration(path)
+    except WorkspaceError as error:
+        _lifecycle_error(context, as_json, error)
+        return
+    payload: dict[str, object] = {
+        "schema_version": 2,
+        "digest": snapshot.digest,
+        "configuration_schema_version": 1,
+        "scripts": [
+            {"name": script.name, "mode": script.mode} for script in snapshot.scripts
+        ],
+    }
+    if as_json or context.find_root().obj.get("json"):
+        _echo_json(payload)
+    else:
+        click.echo(f"Valid configuration: {snapshot.digest}")
+
+
+@main.group()
+def adapter() -> None:
+    """Inspect installed Resource adapters."""
+
+
+@adapter.command(name="list")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def list_adapters(context: click.Context, as_json: bool) -> None:
+    try:
+        descriptors = Workspaces.from_environment().list_adapters()
+    except WorkspaceError as error:
+        _lifecycle_error(context, as_json, error)
+        return
+    if as_json or context.find_root().obj.get("json"):
+        _echo_json(
+            {
+                "schema_version": 2,
+                "adapters": [
+                    {
+                        "id": descriptor.id,
+                        "api_major": descriptor.api_major,
+                        "kinds": sorted(descriptor.kinds),
+                        "capabilities": sorted(descriptor.capabilities),
+                    }
+                    for descriptor in descriptors
+                ],
+            }
+        )
+    else:
+        for descriptor in descriptors:
+            click.echo(f"{_human(descriptor.id)} (API {descriptor.api_major})")
+
+
+@main.group()
+def consent() -> None:
+    """Manage trust in exact configuration and direct script digests."""
+
+
+@consent.command(name="list")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def list_consents(context: click.Context, as_json: bool) -> None:
+    try:
+        digests = Workspaces.from_environment().list_consents()
+    except WorkspaceError as error:
+        _lifecycle_error(context, as_json, error)
+        return
+    if as_json or context.find_root().obj.get("json"):
+        _echo_json({"schema_version": 2, "digests": list(digests)})
+    else:
+        for digest in digests:
+            click.echo(digest)
+
+
+def _register_consent_command(action: str) -> None:
+    @consent.command(name=action)
+    @click.argument("digest")
+    @click.option("--json", "as_json", is_flag=True)
+    @click.pass_context
+    def command(context: click.Context, digest: str, as_json: bool) -> None:
+        try:
+            workspaces = Workspaces.from_environment()
+            if action == "grant":
+                workspaces.grant_consent(digest)
+            else:
+                workspaces.revoke_consent(digest)
+        except WorkspaceError as error:
+            _lifecycle_error(context, as_json, error)
+            return
+        if as_json or context.find_root().obj.get("json"):
+            _echo_json(
+                {"schema_version": 2, "digest": digest, "granted": action == "grant"}
+            )
+        else:
+            click.echo(
+                f"Consent {'granted' if action == 'grant' else 'revoked'}: {digest}"
+            )
+
+
+for _consent_action in ("grant", "revoke"):
+    _register_consent_command(_consent_action)
+
+
+@main.group()
 def workspace() -> None:
     """Create and manage Workspace aggregates."""
 
@@ -82,7 +195,8 @@ def create_workspace(
             )
         )
     except WorkspaceError as error:
-        raise click.ClickException(_human(str(error))) from error
+        _lifecycle_error(context, as_json, error)
+        return
 
     root_json = bool(context.find_root().obj.get("json"))
     if as_json or root_json:

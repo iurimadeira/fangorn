@@ -22,7 +22,7 @@ class Observation:
 
 @dataclass(frozen=True)
 class PlanStep:
-    action: Literal["create", "start", "inspect"]
+    action: str
     resource_name: str
     enter_state: Literal["starting"] | None = None
 
@@ -82,6 +82,37 @@ def finish_create(
 class LifecyclePlan:
     actions: tuple[str, ...]
     success_state: str
+
+
+def resource_steps(
+    actions: tuple[str, ...], resources: tuple[Resource, ...]
+) -> tuple[PlanStep, ...]:
+    steps: list[PlanStep] = []
+    for action in actions:
+        ordered = (
+            tuple(reversed(resources)) if action in {"stop", "delete"} else resources
+        )
+        if action == "delete":
+            steps.extend(PlanStep("ownership", resource.name) for resource in ordered)
+            for resource in ordered:
+                if resource.kind == "worktree" and len(resources) > 1:
+                    steps.append(PlanStep("barrier", resource.name))
+                steps.extend(
+                    (
+                        PlanStep("delete", resource.name),
+                        PlanStep("absence", resource.name),
+                    )
+                )
+        elif action == "forget":
+            steps.append(PlanStep("forget", "worktree"))
+        else:
+            steps.extend(PlanStep(action, resource.name) for resource in ordered)
+            if len(resources) > 1 and action in {"start", "stop"}:
+                steps.extend(
+                    PlanStep(f"verify_{action}", resource.name)
+                    for resource in resources
+                )
+    return tuple(steps)
 
 
 def plan_lifecycle(command: str, state: str) -> LifecyclePlan:

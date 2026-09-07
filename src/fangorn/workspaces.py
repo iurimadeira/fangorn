@@ -22,16 +22,24 @@ from types import MappingProxyType
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+from fangorn import resource_adapters as adapters_api
 from fangorn._lifecycle import (
     LifecyclePlan,
     Observation,
     finish_create,
     plan_create,
     plan_lifecycle,
+    resource_steps,
 )
 from fangorn._lifecycle import Resource as LifecycleResource
 from fangorn._permissions import (
     descriptor_has_writable_acl as _darwin_acl_allows_write,
+)
+from fangorn.configuration import (
+    ConfigurationSnapshot,
+    ConsentStore,
+    parse_configuration,
+    snapshot_configuration,
 )
 from fangorn.git import (
     GitError,
@@ -49,6 +57,7 @@ from fangorn.git_worktree import (
     materialize_cache,
     normalize_repository_source,
     observe_lifecycle_worktree,
+    read_committed_script,
     read_configuration,
     resolve_commit,
     validate_branch_name,
@@ -64,6 +73,11 @@ from fangorn.registry import (
     _open_registry_state_directory,
 )
 from fangorn.registry import WorkspaceRecord as _WorkspaceRecord
+from fangorn.resource_adapters import (
+    AdapterContext,
+    AdapterObservation,
+    ResourceAdapter,
+)
 
 ADOPTION_ATTEMPTS = 3
 _ACTIVE_INVOCATIONS: dict[str, tuple[int, Path]] = {}
@@ -145,6 +159,12 @@ def _defer_invocation_marker_cleanup(descriptor: int, marker: Path) -> None:
 
 class WorkspaceError(RuntimeError):
     """Workspace lifecycle operation failed."""
+
+
+class _ServiceFailure(WorkspaceError):
+    def __init__(self, message: str, continuation: str) -> None:
+        super().__init__(message)
+        self.continuation = continuation
 
 
 @dataclass(frozen=True)
@@ -276,12 +296,13 @@ class WorkspaceOperationError(WorkspaceError):
         operation_id: str,
         step: str,
         command: str,
+        resource: str = "worktree",
     ) -> None:
         super().__init__(message)
         self.details: dict[str, object] = {
             "workspace_id": workspace_id,
             "operation_id": operation_id,
-            "resource": "worktree",
+            "resource": resource,
             "step": step,
             "message": message,
             "next_action": f"Inspect Workspace and retry {command}",
@@ -304,6 +325,7 @@ class Workspaces:
         self._cache_home = cache_home
         self._process_identity = process_identity
         self._invocation_root = registry.path.parent / "invocations"
+        self._consent = ConsentStore(registry.path.parent / "consent")
 
     @classmethod
     def from_environment(cls) -> Workspaces:
@@ -311,6 +333,225 @@ class Workspaces:
             return cls(Registry.from_environment())
         except RegistryError as error:
             raise WorkspaceError(str(error)) from error
+
+    def validate_configuration(self, path: Path) -> ConfigurationSnapshot:
+        try:
+            absolute = _configuration_identity(path)
+            content = read_configuration(Path("."), "", absolute)
+            snapshot = snapshot_configuration(content, absolute.parent)
+            declared = _service_definitions("validation", snapshot.value)
+            adapters_api.validate_resources(
+                tuple(ResourceDefinition(**item) for item in declared),
+                adapters_api.discover_adapters(),
+            )
+            return snapshot
+        except (ValueError, OSError, GitError, RegistryError) as error:
+            raise WorkspaceError(str(error)) from error
+
+    def list_adapters(self) -> tuple[adapters_api.AdapterDescriptor, ...]:
+        try:
+            return tuple(
+                adapter.descriptor
+                for adapter in adapters_api.discover_adapters().values()
+            )
+        except ValueError as error:
+            raise WorkspaceError(str(error)) from error
+
+    def list_consents(self) -> tuple[str, ...]:
+        try:
+            return self._consent.list()
+        except (ValueError, OSError, GitError, RegistryError) as error:
+            raise WorkspaceError(str(error)) from error
+
+    def grant_consent(self, digest: str) -> None:
+        try:
+            self._consent.grant(digest)
+        except (ValueError, OSError, GitError, RegistryError) as error:
+            raise WorkspaceError(str(error)) from error
+
+    def revoke_consent(self, digest: str) -> None:
+        try:
+            self._consent.revoke(digest)
+        except (ValueError, OSError, GitError, RegistryError) as error:
+            raise WorkspaceError(str(error)) from error
+
+    def _adapter_context(
+        self,
+        workspace_id: str,
+        operation_id: str | None,
+        path: Path,
+        resolved: Mapping[str, object],
+        *,
+        owner: ProcessIdentity | None = None,
+        materialize: bool = False,
+        force: bool = False,
+    ) -> AdapterContext:
+        record = resolved.get("snapshot")
+        scripts: Mapping[str, Path] = {}
+        if isinstance(record, Mapping):
+            snapshot = ConfigurationSnapshot.from_record(record)
+            if snapshot.digest != resolved["configuration_digest"]:
+                raise WorkspaceError("Stored configuration snapshot digest differs")
+            root = self._registry.path.parent / "snapshots"
+            scripts = (
+                snapshot.materialize(root) if materialize else snapshot.paths(root)
+            )
+        return AdapterContext(
+            workspace_id,
+            operation_id,
+            path,
+            str(resolved["configuration_digest"]),
+            self._consent,
+            scripts,
+            self._invocation_descriptor(owner) if owner is not None else None,
+            force,
+        )
+
+    def _service_observation(
+        self,
+        resource: ResourceDefinition,
+        context: AdapterContext,
+        adapters: Mapping[str, ResourceAdapter],
+    ) -> AdapterObservation:
+        try:
+            self._consent.require(context.configuration_digest)
+            adapters_api.validate_resources((resource,), adapters)
+            try:
+                observation = adapters[resource.adapter_id].inspect(resource, context)
+            except GitQuiescenceError:
+                raise
+            except Exception as error:
+                return AdapterObservation(
+                    "unknown",
+                    resource.locator,
+                    None,
+                    f"Adapter {resource.adapter_id} inspect "
+                    f"raised {type(error).__name__}",
+                )
+            if (
+                not isinstance(observation, AdapterObservation)
+                or observation.status
+                not in {"absent", "stopped", "ready", "degraded", "unknown"}
+                or observation.locator != resource.locator
+            ):
+                raise WorkspaceError(
+                    "Resource observation is malformed or locator differs"
+                )
+            if observation.status == "absent":
+                if observation.ownership_token is not None:
+                    raise WorkspaceError("Absent Resource carries ownership evidence")
+            elif (
+                observation.status != "unknown"
+                and observation.ownership_token != resource.ownership_token
+            ):
+                raise WorkspaceError("Resource ownership does not match")
+            return observation
+        except GitQuiescenceError:
+            raise
+        except (WorkspaceError, ValueError, OSError, GitError, RegistryError) as error:
+            return AdapterObservation("unknown", resource.locator, None, str(error))
+        except Exception as error:
+            return AdapterObservation(
+                "unknown",
+                resource.locator,
+                None,
+                f"Adapter {resource.adapter_id} inspect raised {type(error).__name__}",
+            )
+
+    def _service_step(
+        self,
+        action: str,
+        resource: ResourceDefinition,
+        context: AdapterContext,
+        adapters: Mapping[str, ResourceAdapter],
+        *,
+        previous: str = "pending",
+    ) -> dict[str, object]:
+        observed = self._service_observation(resource, context, adapters)
+        if observed.status == "unknown":
+            raise _ServiceFailure(
+                observed.error or "Resource observation unknown", "unknown"
+            )
+        if action == "ownership":
+            return _service_evidence(observed)
+        if action in {"inspect", "absence"}:
+            if action == "absence" and observed.status != "absent":
+                raise _ServiceFailure("Resource absence is unproven", "unknown")
+            return _service_evidence(observed)
+        expected = {
+            "create": {"stopped", "absent"},
+            "start": {"ready"},
+            "stop": {"stopped", "absent"},
+            "delete": {"absent"},
+        }[action]
+        reconciled = observed.status in expected and (
+            action != "create" or previous != "pending"
+        )
+        if (
+            action == "create"
+            and observed.status == "absent"
+            and previous != "completed"
+        ):
+            reconciled = False
+        if action == "create" and previous != "pending" and observed.status == "ready":
+            reconciled = True
+        if not reconciled:
+            self._consent.require(context.configuration_digest)
+            try:
+                result = getattr(adapters[resource.adapter_id], action)(
+                    resource, context
+                )
+            except GitQuiescenceError:
+                raise
+            except Exception as error:
+                raise _ServiceFailure(
+                    f"Adapter {resource.adapter_id} {action} "
+                    f"raised {type(error).__name__}",
+                    "unknown",
+                ) from error
+            if (
+                not isinstance(result, adapters_api.AdapterResult)
+                or type(result.success) is not bool
+                or result.continuation not in {"safe", "unsafe", "unknown"}
+            ):
+                raise _ServiceFailure(
+                    "Resource mutation result is malformed", "unknown"
+                )
+            if not result.success:
+                raise _ServiceFailure(
+                    result.error or "Resource mutation failed", result.continuation
+                )
+            observed = self._service_observation(resource, context, adapters)
+            if observed.status not in expected:
+                raise _ServiceFailure(
+                    observed.error or f"Resource did not reach {sorted(expected)}",
+                    "unknown",
+                )
+        return _service_evidence(observed)
+
+    def _fresh_services(
+        self,
+        workspace: WorkspaceAggregate,
+        context: AdapterContext,
+        adapters: Mapping[str, ResourceAdapter],
+        *,
+        state: str,
+    ) -> dict[str, object]:
+        evidence: dict[str, object] = {}
+        expected = (
+            {"ready"}
+            if state == "ready"
+            else ({"absent"} if state == "deleted" else {"stopped", "absent"})
+        )
+        for resource in workspace.definition.resources[1:]:
+            observed = self._service_observation(resource, context, adapters)
+            evidence[resource.name] = _service_evidence(observed)
+            if observed.status not in expected:
+                raise WorkspaceError(
+                    f"Resource {resource.name}: {observed.error or observed.status}; "
+                    f"expected {sorted(expected)}"
+                )
+        return evidence
 
     def adopt(self, path: Path) -> AdoptionResult:
         try:
@@ -441,6 +682,25 @@ class Workspaces:
                 )
                 configuration_value = _configuration_value(loaded_configuration)
                 configuration = loaded_configuration or b""
+                snapshot = snapshot_configuration(
+                    loaded_configuration,
+                    config.parent if config else repository,
+                    script_reader=(
+                        None
+                        if config
+                        else lambda name: read_committed_script(
+                            repository,
+                            str(commit),
+                            name,
+                            liveness_fd=self._invocation_descriptor(owner),
+                        )
+                    ),
+                )
+                services = _service_definitions(intent.workspace_id, snapshot.value)
+                adapters_api.validate_resources(
+                    tuple(ResourceDefinition(**item) for item in services),
+                    adapters_api.discover_adapters(),
+                )
                 resource_token = secrets.token_hex(32)
                 common_dir = (
                     source.normalized
@@ -455,18 +715,26 @@ class Workspaces:
                     raise WorkspaceError("Repository generation marker is unavailable")
                 repository_id = self._registry.repository_id_for_common_dir(common_dir)
                 lifecycle = plan_create(
-                    (LifecycleResource("worktree", "worktree"),),
+                    (
+                        LifecycleResource("worktree", "worktree"),
+                        *(
+                            LifecycleResource(str(item["name"]), "service")
+                            for item in services
+                        ),
+                    ),
                     start=request.start,
                 )
                 resolved: dict[str, object] = {
                     "configuration": configuration.hex(),
-                    "configuration_digest": hashlib.sha256(configuration).hexdigest(),
+                    "configuration_digest": snapshot.digest,
                     "configuration_value": configuration_value,
                     "created_from_sha": commit,
                     "ownership_token": resource_token,
                     "repository_common_dir": str(repository_common_dir),
                     "repository_generation": expected_repository_generation,
                     "repository_id": repository_id,
+                    "services": services,
+                    "snapshot": snapshot.serialize(),
                 }
                 resolved = self._registry.enrich_create_intent(
                     intent.operation_id,
@@ -489,9 +757,29 @@ class Workspaces:
                 definition=_create_definition(intent, target, resolved),
             )
 
-            lifecycle = plan_create(
-                (LifecycleResource("worktree", "worktree"),), start=request.start
+            definitions = tuple(
+                ResourceDefinition(**item)
+                for item in cast(
+                    list[dict[str, Any]],
+                    _create_definition(intent, target, resolved)["resources"],
+                )
             )
+            adapters = adapters_api.discover_adapters()
+            adapters_api.validate_resources(definitions, adapters)
+            if len(definitions) > 1:
+                self._consent.require(str(resolved["configuration_digest"]))
+            context = self._adapter_context(
+                intent.workspace_id,
+                intent.operation_id,
+                target,
+                resolved,
+                owner=owner,
+                materialize=True,
+            )
+            lifecycle_resources = tuple(
+                LifecycleResource(r.name, r.kind) for r in definitions
+            )
+            lifecycle = plan_create(lifecycle_resources, start=request.start)
             position = 1 if source.clone_url is not None else 0
             ownership_token = str(resolved["ownership_token"])
             commit = str(resolved["created_from_sha"])
@@ -517,8 +805,36 @@ class Workspaces:
                     scope_key=intent.workspace_id,
                     lease_epoch=lease_epoch,
                     enter_state=step.enter_state,
-                    reconcile_completed=step.action == "create",
+                    reconcile_completed=step.action == "create"
+                    or step.resource_name != "worktree",
                 )
+                if step.resource_name != "worktree":
+                    resource = next(
+                        r for r in definitions if r.name == step.resource_name
+                    )
+                    try:
+                        evidence = self._service_step(
+                            step.action, resource, context, adapters, previous=previous
+                        )
+                    except WorkspaceError as error:
+                        raise WorkspaceOperationError(
+                            f"Resource {resource.name}; step {step.action}: {error}",
+                            intent.workspace_id,
+                            intent.operation_id,
+                            step.action,
+                            "create",
+                            resource.name,
+                        ) from error
+                    self._registry.finish_operation_step(
+                        intent.operation_id,
+                        position=position,
+                        scope_kind="workspace",
+                        scope_key=intent.workspace_id,
+                        lease_epoch=lease_epoch,
+                        result=evidence,
+                    )
+                    position += 1
+                    continue
                 if step.action == "create":
                     observation = create_worktree(
                         repository,
@@ -560,11 +876,21 @@ class Workspaces:
                 expected_repository_generation=expected_repository_generation,
                 liveness_fd=self._invocation_descriptor(owner),
             )
+            observations = {"worktree": Observation("ready")}
+            for resource in definitions[1:]:
+                observed_service = self._service_observation(
+                    resource, context, adapters
+                )
+                observations[resource.name] = Observation(observed_service.status)
             state = finish_create(
-                (LifecycleResource("worktree", "worktree"),),
-                {"worktree": Observation("ready")},
+                lifecycle_resources,
+                observations,
                 start=request.start,
             )
+            if state == "create_failed":
+                raise WorkspaceError(
+                    "Resource observations do not prove the requested create state"
+                )
             configuration = bytes.fromhex(str(resolved["configuration"]))
             stored_configuration_value = resolved["configuration_value"]
             if not isinstance(stored_configuration_value, dict):
@@ -742,6 +1068,74 @@ class Workspaces:
             except (GitError, OSError) as error:
                 status = "degraded"
                 evidence = {"status": "unknown", "error": str(error)}
+            if len(workspace.definition.resources) > 1:
+                resource_evidence: dict[str, object] = {"worktree": dict(evidence)}
+                service_statuses: list[str] = []
+                cleanup = (
+                    _service_cleanup_receipt(
+                        workspace,
+                        tuple(cast(list[dict[str, object]], snapshot["steps"])),
+                    )
+                    if workspace.state == "deleted"
+                    and operation.kind == "delete"
+                    and operation.status == "completed"
+                    and evidence.get("status") == "absent"
+                    else None
+                )
+                try:
+                    if evidence.get("status") != "ready":
+                        raise WorkspaceError(
+                            "Owned Worktree recovery cwd is unavailable"
+                        )
+                    adapters = adapters_api.discover_adapters()
+                    context = self._adapter_context(
+                        workspace_id, None, Path(workspace.path), resolved
+                    )
+                    for declared in workspace.definition.resources[1:]:
+                        seen = self._service_observation(declared, context, adapters)
+                        resource_evidence[declared.name] = _service_evidence(seen)
+                        service_statuses.append(seen.status)
+                except (
+                    WorkspaceError,
+                    ValueError,
+                    GitError,
+                    OSError,
+                    RegistryError,
+                ) as error:
+                    for declared in workspace.definition.resources[1:]:
+                        resource_evidence[declared.name] = {
+                            "observation": "unknown",
+                            "error": str(error),
+                        }
+                    service_statuses = ["unknown"]
+                expected = (
+                    {"ready"}
+                    if workspace.state == "ready"
+                    else (
+                        {"absent"}
+                        if workspace.state == "deleted"
+                        else {"absent", "stopped"}
+                    )
+                )
+                if any(item not in expected for item in service_statuses):
+                    status = "degraded"
+                if cleanup is not None:
+                    status = "unknown"
+                    evidence["cleanup_completed"] = True
+                    for declared in workspace.definition.resources[1:]:
+                        resource_evidence[declared.name] = {
+                            "observation": "unknown",
+                            "locator": declared.locator,
+                            "historical_observation": "absent",
+                            "evidence_source": "completed_delete",
+                            "operation_id": operation.id,
+                            "receipt": cleanup[declared.name],
+                            "reason": (
+                                "Current Service state is unobservable "
+                                "after Worktree removal"
+                            ),
+                        }
+                evidence["resources"] = resource_evidence
         return WorkspaceInspection(
             workspace_id,
             workspace,
@@ -765,8 +1159,8 @@ class Workspaces:
     ) -> WorktreeObservation:
         resolved = json.loads(str(intent["resolved_json"]))
         resource = workspace.definition.resources[0]
-        if len(workspace.definition.resources) != 1 or resource.kind != "worktree":
-            raise WorkspaceError("Only headless Worktree-only lifecycle is supported")
+        if resource.kind != "worktree":
+            raise WorkspaceError("Workspace requires a Worktree Resource first")
         validate_target_path(Path(resource.locator))
         return inspect_owned_worktree(
             Path(resource.locator),
@@ -796,6 +1190,7 @@ class Workspaces:
         operation_id = str(uuid4())
         begun = False
         action = "stop" if command == "restart" else command
+        resource_name = "worktree"
         quiescence_unknown = False
         try:
             initial = self._inspect_lifecycle(workspace_id, observe=False)
@@ -810,6 +1205,14 @@ class Workspaces:
                 plan = LifecyclePlan(("forget",), state)
             else:
                 plan = plan_lifecycle(command, state)
+            adapters: Mapping[str, ResourceAdapter] = {}
+            if command != "forget" and state != "deleted" and workspace is not None:
+                adapters = adapters_api.discover_adapters()
+                adapters_api.validate_resources(
+                    workspace.definition.resources, adapters
+                )
+                if len(workspace.definition.resources) > 1:
+                    self._consent.require(workspace.definition.configuration_digest)
             if initial.operation.kind == command and initial.operation.status in {
                 "running",
                 "failed",
@@ -832,6 +1235,24 @@ class Workspaces:
                 dict[str, object],
                 self._registry.lifecycle_snapshot(workspace_id)["intent"],
             )
+            resolved = (
+                json.loads(str(intent["resolved_json"]))
+                if intent["resolved_json"]
+                else {}
+            )
+            context = (
+                self._adapter_context(
+                    workspace_id,
+                    operation_id,
+                    Path(str(intent["target_path"])),
+                    resolved,
+                    owner=owner,
+                    materialize=command != "forget",
+                    force=force,
+                )
+                if workspace is not None and command != "forget" and state != "deleted"
+                else None
+            )
             if (
                 state == plan.success_state
                 and command != "forget"
@@ -847,9 +1268,13 @@ class Workspaces:
                             intent,
                             liveness_fd=self._invocation_descriptor(owner),
                         )
+                        if context is not None:
+                            self._fresh_services(
+                                workspace, context, adapters, state=plan.success_state
+                            )
                 except GitQuiescenceError:
                     raise
-                except GitError:
+                except (GitError, WorkspaceError):
                     pass  # The journal below retains the failed reconciliation.
                 else:
                     current_workspace = current.workspace
@@ -875,10 +1300,14 @@ class Workspaces:
                     )
                     epoch = None
                     return receipt
-            actions = (
-                ("ownership", "delete", "absence")
-                if command == "delete"
-                else plan.actions
+            steps = resource_steps(
+                plan.actions,
+                tuple(
+                    LifecycleResource(r.name, r.kind)
+                    for r in workspace.definition.resources
+                )
+                if workspace is not None
+                else (LifecycleResource("worktree", "worktree"),),
             )
             enter_state = {
                 "stop": "stopping",
@@ -892,11 +1321,55 @@ class Workspaces:
                 epoch,
                 kind=command,
                 state=enter_state,
-                actions=actions,
+                actions=tuple((step.action, step.resource_name) for step in steps),
                 expected_operation=initial.operation.id,
             )
             begun = True
-            for position, action in enumerate(actions):
+            failures: list[str] = []
+            failed_resources: set[str] = set()
+            first_failure: tuple[str, str] | None = None
+            observed: WorktreeObservation | None = None
+            evidence: dict[str, object] = {}
+            resume_removed_worktree = False
+            if (
+                command == "delete"
+                and workspace is not None
+                and initial.operation.id == operation_id
+                and _service_cleanup_receipt(workspace, initial.steps) is not None
+                and any(
+                    recorded["resource_name"] == "worktree"
+                    and recorded["action"] == "delete"
+                    and recorded["status"] != "pending"
+                    for recorded in initial.steps
+                )
+            ):
+                worktree = workspace.definition.resources[0]
+                resume_removed_worktree = (
+                    inspect_delete_worktree(
+                        Path(worktree.locator),
+                        ownership_token=worktree.ownership_token,
+                        common_dir=Path(resolved["repository_common_dir"]),
+                        common_generation=resolved["repository_generation"],
+                        liveness_fd=self._invocation_descriptor(owner),
+                    )
+                    is None
+                )
+            for position, step in enumerate(steps):
+                action, resource_name = (
+                    step.action.removeprefix("verify_"),
+                    step.resource_name,
+                )
+                verification = step.action.startswith("verify_")
+                if resume_removed_worktree and (
+                    resource_name != "worktree" or action == "barrier"
+                ):
+                    continue
+                if failures and (action == "start" or resource_name == "worktree"):
+                    if first_failure is not None:
+                        action, resource_name = first_failure
+                    raise WorkspaceError("; ".join(failures))
+                if resource_name in failed_resources:
+                    continue
                 self._registry.start_operation_step(
                     operation_id,
                     position=position,
@@ -906,10 +1379,61 @@ class Workspaces:
                     reconcile_completed=True,
                     enter_state="starting" if action == "start" else None,
                 )
-                evidence: dict[str, object]
                 if position == 0 and command in {"delete", "forget"}:
                     self._registry.require_childless(workspace_id)
-                if action == "forget":
+                if resource_name != "worktree":
+                    if workspace is None or context is None:
+                        raise WorkspaceError("Resource context is unavailable")
+                    self._observe_lifecycle(
+                        workspace,
+                        intent,
+                        liveness_fd=self._invocation_descriptor(owner),
+                    )
+                    resource = next(
+                        r
+                        for r in workspace.definition.resources
+                        if r.name == resource_name
+                    )
+                    try:
+                        evidence = self._service_step(
+                            "inspect" if verification else action,
+                            resource,
+                            context,
+                            adapters,
+                        )
+                        if verification and evidence["observation"] not in (
+                            {"ready"} if action == "start" else {"stopped", "absent"}
+                        ):
+                            raise _ServiceFailure(
+                                f"Resource failed final {action} verification",
+                                "unknown",
+                            )
+                    except _ServiceFailure as error:
+                        message = f"Resource {resource.name}; step {action}: {error}"
+                        self._registry.finish_operation_step(
+                            operation_id,
+                            position=position,
+                            scope_kind="workspace",
+                            scope_key=workspace_id,
+                            lease_epoch=epoch,
+                            result={
+                                "error": message,
+                                "continuation": error.continuation,
+                            },
+                            status="failed",
+                        )
+                        failures.append(message)
+                        if first_failure is None:
+                            first_failure = (action, resource_name)
+                        failed_resources.add(resource.name)
+                        if (
+                            action not in {"stop", "delete"}
+                            or error.continuation != "safe"
+                            or (command == "delete" and not force)
+                        ):
+                            raise WorkspaceError("; ".join(failures)) from error
+                        continue
+                elif action == "forget":
                     evidence = {"cleanup_proven": False, "acknowledge_orphans": True}
                 elif command == "delete":
                     if workspace is None:
@@ -932,6 +1456,23 @@ class Workspaces:
                             common_generation=resolved["repository_generation"],
                             liveness_fd=self._invocation_descriptor(owner),
                         )
+                        if action == "barrier":
+                            if context is None:
+                                raise WorkspaceError("Resource context is unavailable")
+                            evidence = {
+                                "resources": self._fresh_services(
+                                    workspace, context, adapters, state="deleted"
+                                )
+                            }
+                            self._registry.finish_operation_step(
+                                operation_id,
+                                position=position,
+                                scope_kind="workspace",
+                                scope_key=workspace_id,
+                                lease_epoch=epoch,
+                                result=evidence,
+                            )
+                            continue
                         if action == "delete":
                             delete_owned_worktree(
                                 Path(resource.locator), force=force, **arguments
@@ -973,6 +1514,10 @@ class Workspaces:
                     lease_epoch=epoch,
                     result=evidence,
                 )
+            if failures:
+                if first_failure is not None:
+                    action, resource_name = first_failure
+                raise WorkspaceError("; ".join(failures))
             completed = self._registry.finish_lifecycle(
                 workspace_id,
                 operation_id,
@@ -1009,7 +1554,7 @@ class Workspaces:
             quiescence_unknown = isinstance(error, GitQuiescenceError)
             message = (
                 f"Workspace {workspace_id}; operation {operation_id}; "
-                f"Resource worktree; step {action}: {error}; "
+                f"Resource {resource_name}; step {action}: {error}; "
                 f"inspect and retry {command}"
             )
             if epoch is not None and begun and not quiescence_unknown:
@@ -1023,7 +1568,7 @@ class Workspaces:
                 )
                 epoch = None
             raise WorkspaceOperationError(
-                message, workspace_id, operation_id, action, command
+                message, workspace_id, operation_id, action, command, resource_name
             ) from error
         finally:
             if owner is not None:
@@ -1213,6 +1758,19 @@ class Workspaces:
             expected_branch=None,
             ownership_token=aggregate.definition.resources[0].ownership_token,
         )
+        if len(aggregate.definition.resources) > 1:
+            snapshot = self._registry.lifecycle_snapshot(workspace_id)
+            intent = cast(dict[str, object], snapshot["intent"])
+            resolved = json.loads(str(intent["resolved_json"]))
+            context = self._adapter_context(
+                workspace_id, None, Path(aggregate.path), resolved
+            )
+            self._fresh_services(
+                aggregate,
+                context,
+                adapters_api.discover_adapters(),
+                state=aggregate.state,
+            )
         current = self._registry.inspect_worktree(observation)
         aggregate = replace(aggregate, path=current.path, branch=current.branch)
         return CreateWorkspaceResult(aggregate, operation, created=created)
@@ -1416,6 +1974,87 @@ def _safe_invocation_descriptor(descriptor: int, *, directory: bool) -> bool:
         return False
 
 
+def _service_definitions(
+    workspace_id: str, value: Mapping[str, object]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "kind": "service",
+            "adapter_id": service["adapter"],
+            "adapter_api_major": service.get("adapter_api_major", 1),
+            "configuration": _json_value(service),
+            "external_reference": service.get("external_reference"),
+            "locator": f"fangorn:{workspace_id}:service:{name}",
+            "ownership_token": secrets.token_hex(32),
+        }
+        for name, service in cast(
+            Mapping[str, Mapping[str, object]], value.get("services", {})
+        ).items()
+    ]
+
+
+def _json_value(value: object) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _service_cleanup_receipt(
+    workspace: WorkspaceAggregate, steps: tuple[dict[str, object], ...]
+) -> dict[str, object] | None:
+    barrier = next(
+        (
+            step
+            for step in steps
+            if step["action"] == "barrier"
+            and step["resource_name"] == "worktree"
+            and step["status"] == "completed"
+        ),
+        None,
+    )
+    if barrier is None:
+        return None
+    try:
+        record = json.loads(str(barrier["result_json"]))
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or not isinstance(record.get("resources"), dict):
+        return None
+    receipts = cast(dict[str, object], record["resources"])
+    services = workspace.definition.resources[1:]
+    if receipts.keys() != {resource.name for resource in services}:
+        return None
+    for resource in services:
+        proof = receipts[resource.name]
+        if (
+            not isinstance(proof, dict)
+            or proof.get("observation") != "absent"
+            or proof.get("locator") != resource.locator
+            or not any(
+                step["action"] == "absence"
+                and step["resource_name"] == resource.name
+                and step["status"] == "completed"
+                for step in steps
+            )
+        ):
+            return None
+    return receipts
+
+
+def _service_evidence(observation: AdapterObservation) -> dict[str, object]:
+    value: dict[str, object] = {
+        "observation": observation.status,
+        "locator": observation.locator,
+        "ownership_token": observation.ownership_token,
+    }
+    if observation.error:
+        value["error"] = observation.error
+    return value
+
+
 def _create_definition(
     intent: CreateIntentRecord, target: Path, resolved: dict[str, object]
 ) -> dict[str, object]:
@@ -1437,7 +2076,8 @@ def _create_definition(
                 "external_reference": None,
                 "locator": str(target),
                 "ownership_token": str(resolved["ownership_token"]),
-            }
+            },
+            *cast(list[dict[str, object]], resolved.get("services", [])),
         ],
     }
 
@@ -1552,9 +2192,7 @@ def _configuration_value(content: bytes | None) -> dict[str, object]:
     services = value.get("services")
     if services is not None and not isinstance(services, dict):
         raise WorkspaceError("fangorn.toml services must be a table")
-    if services:
-        raise WorkspaceError("Service Resources are not available in this release")
-    return value
+    return parse_configuration(content)
 
 
 def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
